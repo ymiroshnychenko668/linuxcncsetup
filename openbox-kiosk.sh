@@ -16,13 +16,13 @@ xset s noblank
 xset -dpms
 
 # Launch LinuxCNC with specific QT Dragon configuration
-linuxcnc ~/linuxcnc/configs/qtdragon/qtdragon.ini &
+linuxcnc /home/user/linuxcnc/configs/sim.qtdragon_hd.qtdragon_hd_xyz/qtdragon_hd_xyzab.ini
 
 # Launch Visual Studio Code
 code &
 
 # Launch Firefox in kiosk mode
-firefox --kiosk --new-window "https://www.linuxcnc.org" &
+firefox-esr --kiosk --new-window "https://www.linuxcnc.org" &
 
 # Launch terminal emulator
 xterm &
