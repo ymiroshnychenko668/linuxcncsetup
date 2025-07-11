@@ -2,7 +2,7 @@
 
 # Update and install required packages
 sudo apt update
-sudo apt install -y openbox obconf firefox code xterm
+sudo apt install -y openbox obconf firefox-esr code xterm
 
 # Create Openbox autostart file
 autostart_file="$HOME/.config/openbox/autostart"
