@@ -13,6 +13,9 @@ sudo apt install -y syncthing
 systemctl --user enable syncthing
 systemctl --user start syncthing
 
+# Enable Syncthing to start automatically on system boot
+sudo loginctl enable-linger $(whoami)
+
 # Add Visual Studio Code repository and install
 sudo apt install -y wget gpg
 wget -qO- https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor > packages.microsoft.gpg
