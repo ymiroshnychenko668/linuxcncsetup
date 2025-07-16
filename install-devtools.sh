@@ -6,6 +6,10 @@ sudo apt update
 # Install Git
 sudo apt install -y git
 
+git config --global user.name "cnc"
+git config --global user.email cnc@cnc.com
+
+
 sudo apt install -y mc
 
 sudo apt install -y terminator
