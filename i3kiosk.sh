@@ -37,18 +37,21 @@ content = "🚀 Launch Apps"
 click-left = rofi -show drun
 EOL
 
-# Setup i3 default configuration and increment changes
+# Setup i3 default configuration
 mkdir -p ~/.config/i3
 cp /etc/i3/config ~/.config/i3/config
 
+# Fix duplicate binding ($mod+space)
+sed -i 's/^bindsym $mod+space focus mode_toggle/# bindsym $mod+space focus mode_toggle/' ~/.config/i3/config
+
 # Increment customizations into i3 config
-cat >> ~/.config/i3/config <<EOL
+cat >> ~/.config/i3/config <<'EOL'
 
 # ---- Custom incremental changes ----
 
 # Keybindings for Rofi
-bindsym \$mod+Tab exec --no-startup-id rofi -show window
-bindsym \$mod+space exec --no-startup-id rofi -show run
+bindsym $mod+Tab exec --no-startup-id rofi -show window
+bindsym $mod+space exec --no-startup-id rofi -show run
 
 # Autostart Polybar
 exec_always --no-startup-id polybar kiosk &
