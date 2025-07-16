@@ -6,6 +6,9 @@ sudo apt update
 # Install Git
 sudo apt install -y git
 
+sudo apt install -y mc
+
+sudo apt install -y terminator
 # Install Syncthing
 sudo apt install -y syncthing
 
