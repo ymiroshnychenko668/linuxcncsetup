@@ -20,7 +20,7 @@ sudo sed -i '/^\[Seat:\*\]/a autologin-user='"$(whoami)"'\nautologin-user-timeou
 echo "exec i3" > ~/.xsession
 chmod +x ~/.xsession
 
-# Setup Polybar configuration
+# Setup Polybar default minimal configuration
 mkdir -p ~/.config/polybar
 cat > ~/.config/polybar/config.ini <<EOL
 [bar/kiosk]
@@ -37,39 +37,9 @@ content = "🚀 Launch Apps"
 click-left = rofi -show drun
 EOL
 
-# Setup i3 default configuration and explicitly set $mod to Win key (Mod4)
+# Copy default i3 configuration WITHOUT modifications
 mkdir -p ~/.config/i3
 cp /etc/i3/config ~/.config/i3/config
 
-# Replace default mod key (Mod1) with Win key (Mod4)
-sed -i 's/set \$mod Mod1/set \$mod Mod4/g' ~/.config/i3/config
-
-# Fix duplicate binding by commenting it out
-sed -i 's/^bindsym \$mod+space focus mode_toggle/# bindsym \$mod+space focus mode_toggle/' ~/.config/i3/config
-
-# Increment customizations into i3 config
-cat >> ~/.config/i3/config <<'EOL'
-
-# ---- Custom incremental changes ----
-
-# Keybindings for Rofi using Win key explicitly
-bindsym $mod+Tab exec --no-startup-id rofi -show window
-bindsym $mod+space exec --no-startup-id rofi -show run
-
-# Autostart Polybar
-exec_always --no-startup-id polybar kiosk &
-
-# Autostart applications
-exec --no-startup-id firefox-esr
-exec --no-startup-id linuxcnc ~/linuxcnc/configs/qtdragon/qtdragon.ini
-exec --no-startup-id code
-
-# Disable screen blanking/power saving
-exec --no-startup-id xset s off
-exec --no-startup-id xset s noblank
-exec --no-startup-id xset -dpms
-
-EOL
-
 # Confirmation
-printf "\ni3 kiosk setup complete. Reboot the system to apply changes.\n"
+printf "\ni3 setup completed with default config (no modifications). Reboot the system to apply changes.\n"
