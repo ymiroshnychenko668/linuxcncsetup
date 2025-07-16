@@ -189,3 +189,14 @@ bindsym $mod+r mode "resize"
 bar {
         status_command i3status
 }
+# Keybindings for Rofi using Win key explicitly
+bindsym $mod+Tab exec --no-startup-id rofi -show window
+bindsym $mod+space exec --no-startup-id rofi -show run
+
+# Autostart Polybar
+exec_always --no-startup-id polybar kiosk &
+
+# Autostart applications
+exec --no-startup-id firefox-esr
+exec --no-startup-id linuxcnc ~/linuxcnc/configs/qtdragon/qtdragon.ini
+exec --no-startup-id code
