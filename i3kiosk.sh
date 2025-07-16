@@ -45,4 +45,43 @@ EOL
 mkdir -p ~/.config/i3
 cat > ~/.config/i3/config <<EOL
 # Set mod key to Super (Win key)
-set
+set \$mod Mod4
+
+# Launch polybar
+exec_always --no-startup-id polybar kiosk
+
+# Launch startup applications
+exec --no-startup-id firefox-esr
+exec --no-startup-id linuxcnc ~/linuxcnc/configs/qtdragon/qtdragon.ini
+exec --no-startup-id code
+
+# Disable screen blanking
+exec --no-startup-id xset s off
+exec --no-startup-id xset s noblank
+exec --no-startup-id xset -dpms
+
+# Set default layout to tabbed
+workspace_layout tabbed
+
+# Basic i3 settings
+workspace_auto_back_and_forth yes
+focus_follows_mouse no
+mouse_warping none
+floating_modifier \$mod
+
+# Rofi launcher
+bindsym \$mod+d exec rofi -show drun
+bindsym \$mod+space exec rofi -show run
+
+# Switch windows
+bindsym \$mod+Tab focus right
+
+# Simple window management
+for_window [class=".*"] border none, fullscreen enable
+
+# Ensure i3 starts on workspace 1
+exec --no-startup-id i3-msg workspace 1
+EOL
+
+# Confirmation
+printf "\ni3 kiosk setup complete. Reboot the system to apply changes.\n"
