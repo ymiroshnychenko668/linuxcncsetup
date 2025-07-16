@@ -39,7 +39,9 @@ EOL
 
 # Copy default i3 configuration WITHOUT modifications
 mkdir -p ~/.config/i3
-cp /etc/i3/config ~/.config/i3/config
+cp config ~/.config/i3/config
 
+mkdir -p ~/.config/polybar
+cp config.ini ~/.config/polybar/config.ini
 # Confirmation
 printf "\ni3 setup completed with default config (no modifications). Reboot the system to apply changes.\n"
