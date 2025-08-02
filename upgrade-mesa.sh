@@ -4,7 +4,7 @@ set -e
 
 # Install dependencies
 sudo apt update
-sudo apt install -y build-essential git python3 python3-distutils python3-setuptools pkg-config libpci
+sudo apt install -y build-essential git python3 python3-distutils python3-setuptools pkg-config libpci-dev
 # Clone and build mesaflash
 cd "$HOME"
 if [ ! -d "$HOME/mesaflash" ]; then
