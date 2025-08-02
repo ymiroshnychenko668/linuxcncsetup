@@ -13,12 +13,7 @@ git config --global user.email cnc@cnc.com
 sudo apt install -y mc
 
 sudo apt install -y terminator
-# Install Syncthing
-sudo apt install -y syncthing
 
-# Enable and start Syncthing service for the current user
-systemctl --user enable syncthing
-systemctl --user start syncthing
 
 # Enable Syncthing to start automatically on system boot
 sudo loginctl enable-linger $(whoami)
@@ -35,4 +30,4 @@ sudo apt update
 sudo apt install -y code
 
 # Final message
-echo "Syncthing, Git, and Visual Studio Code installation complete."
+echo "Git, and Visual Studio Code installation complete."
