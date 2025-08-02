@@ -4,8 +4,7 @@ set -e
 
 # Install dependencies
 sudo apt update
-sudo apt install -y build-essential git python3 python3-distutils python3-setuptools pkg-config libpci-dev libmd-dev automake autoconf libtool libmodbus-dev libusb-1.0-0-dev yapps2 intltool libboost-all-dev tk-dev libeditreadline-dev libxmu-dev asciidoc asciidoctor dblatex
-
+sudo apt install -y build-essential git python3 python3-distutils python3-setuptools pkg-config
 # Clone and build mesaflash
 cd "$HOME"
 if [ ! -d "$HOME/mesaflash" ]; then
@@ -24,13 +23,13 @@ else
     cd "$HOME/hostmot2-firmware" && git pull
 fi
 
-# Clone and build latest LinuxCNC drivers (hm2_eth) into linuxcnc-sources
-cd "$HOME"
-if [ ! -d "$HOME/linuxcnc-sources" ]; then
-    git clone https://github.com/LinuxCNC/linuxcnc.git "$HOME/linuxcnc-sources"
-else
-    cd "$HOME/linuxcnc-sources" && git pull
-fi
+# # Clone and build latest LinuxCNC drivers (hm2_eth) into linuxcnc-sources
+# cd "$HOME"
+# if [ ! -d "$HOME/linuxcnc-sources" ]; then
+#     git clone https://github.com/LinuxCNC/linuxcnc.git "$HOME/linuxcnc-sources"
+# else
+#     cd "$HOME/linuxcnc-sources" && git pull
+# fi
 
 cd "$HOME/linuxcnc-sources/src"
 ./autogen.sh
