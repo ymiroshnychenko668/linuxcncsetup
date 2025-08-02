@@ -4,7 +4,7 @@ set -e
 
 # Install dependencies
 sudo apt update
-sudo apt install -y build-essential git python3 python3-distutils python3-setuptools pkg-config libpci-dev
+sudo apt install -y build-essential git python3 python3-distutils python3-setuptools pkg-config libpci-dev libmd-dev
 # Clone and build mesaflash
 cd "$HOME"
 if [ ! -d "$HOME/mesaflash" ]; then
@@ -31,11 +31,11 @@ fi
 #     cd "$HOME/linuxcnc-sources" && git pull
 # fi
 
-cd "$HOME/linuxcnc-sources/src"
-./autogen.sh
-./configure --with-realtime=uspace
-make
-sudo make setuid
+# cd "$HOME/linuxcnc-sources/src"
+# ./autogen.sh
+# ./configure --with-realtime=uspace
+# make
+# sudo make setuid
 
 # Use non-root username
 NON_ROOT_USER=$(logname)
