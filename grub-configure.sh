@@ -6,7 +6,7 @@ sudo cp /etc/default/grub /etc/default/grub.backup.$(date +%Y%m%d%H%M%S)
 echo "Updating GRUB_CMDLINE_LINUX_DEFAULT for LinuxCNC..."
 
 # Define the new GRUB parameters
-NEW_PARAMS='GRUB_CMDLINE_LINUX_DEFAULT="quiet isolcpus=2,3 nohz_full=2,3 rcu_nocbs=2,3 irqaffinity=0-1 kthread_cpus=0-1 splash"'
+NEW_PARAMS='GRUB_CMDLINE_LINUX_DEFAULT="quiet isolcpus=2,3 nohz_full=2,3 rcu_nocbs=2,3 irqaffinity=0-1 kthread_cpus=0-1 processor.max_cstate=1 intel_idle.max_cstate=0 idle=poll mitigations=off nosoftlockup tsc=reliable clocksource=tsc nmi_watchdog=0 splash"'
 
 # Use sed to replace the existing GRUB_CMDLINE_LINUX_DEFAULT line
 sudo sed -i 's/^GRUB_CMDLINE_LINUX_DEFAULT=.*/'"$NEW_PARAMS"'/g' /etc/default/grub
