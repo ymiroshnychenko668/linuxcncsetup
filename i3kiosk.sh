@@ -26,7 +26,7 @@ chmod +x ~/.xsession
 # Setup Polybar minimal default configuration
 mkdir -p ~/.config/polybar
 
-
+#TODO copy config.ini to ~/.config/polybar
 # Copy default i3 configuration WITHOUT modifications
 mkdir -p ~/.config/i3
 if [ -f "./config" ]; then
