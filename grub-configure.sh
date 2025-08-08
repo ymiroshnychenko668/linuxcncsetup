@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Backup the existing grub configuration
-sudo cp /etc/default/grub /etc/default/grub.backup.$(date +%Y%m%d%H%M%S)
+sudo cp /etc/default/grub "/etc/default/grub.backup.$(date +%Y%m%d%H%M%S)"
 
 echo "Updating GRUB_CMDLINE_LINUX_DEFAULT for LinuxCNC..."
 
@@ -27,6 +27,9 @@ sudo update-initramfs -u
 
 # Update GRUB
 sudo update-grub
+
+# Configure LightDM for autologin
+sudo sed -i '/^\[Seat:\*\]/a autologin-user='"$(whoami)"'\\nautologin-user-timeout=0' /etc/lightdm/lightdm.conf
 
 # Confirmation message
 echo "GRUB and splash screen updated successfully. Please reboot your system."
