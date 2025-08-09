@@ -54,11 +54,12 @@ RTIRQ_NAME_LIST="$RTIRQ_NAME_LIST parport_pc parport"
 # Serial ports (for some controller communications)
 RTIRQ_NAME_LIST="$RTIRQ_NAME_LIST serial"
 
-# USB (for USB-based controllers)
+# USB (for USB-based controllers and WiFi adapters) - Higher priority
+# Note: USB WiFi adapters are handled by xhci_hcd, so they get higher priority
 RTIRQ_NAME_LIST="$RTIRQ_NAME_LIST uhci_hcd ohci_hcd ehci_hcd xhci_hcd"
 
-# Network (lower priority)
-RTIRQ_NAME_LIST="$RTIRQ_NAME_LIST eth0 eth1 wlan0"
+# Network (lower priority for wired, WiFi handled by USB above)
+RTIRQ_NAME_LIST="$RTIRQ_NAME_LIST eth0 eth1"
 
 # Sound (lowest priority for RT systems)
 RTIRQ_NAME_LIST="$RTIRQ_NAME_LIST snd"
@@ -72,6 +73,36 @@ EOF
 
 # Set proper permissions
 sudo chmod 644 /etc/default/rtirq
+
+# Disable hardware watchdog to prevent RT conflicts
+echo "Disabling hardware watchdog for RT stability..."
+
+# Remove watchdog modules if currently loaded
+echo "Removing iTCO watchdog modules..."
+sudo modprobe -r iTCO_wdt iTCO_vendor_support 2>/dev/null || true
+
+# Create blacklist configuration to prevent watchdog loading
+echo "Creating watchdog blacklist configuration..."
+sudo tee /etc/modprobe.d/blacklist-watchdog.conf > /dev/null << 'WDEOF'
+# Blacklist iTCO watchdog to prevent hardware reboots during LinuxCNC operation
+# The hardware watchdog conflicts with real-time LinuxCNC operation
+# causing system reboots when RT tasks monopolize CPU time
+blacklist iTCO_wdt
+blacklist iTCO_vendor_support
+WDEOF
+
+# Configure systemd to not use hardware watchdog
+echo "Configuring systemd watchdog settings..."
+sudo mkdir -p /etc/systemd/system.conf.d
+sudo tee /etc/systemd/system.conf.d/disable-watchdog.conf > /dev/null << 'SDEOF'
+[Manager]
+# Disable systemd hardware watchdog to prevent conflicts with LinuxCNC RT operation
+# RT tasks can starve watchdog feeding, causing unwanted reboots
+RuntimeWatchdogSec=0
+ShutdownWatchdogSec=0
+SDEOF
+
+echo "✓ Hardware watchdog disabled for RT stability"
 
 # Enable and start rtirq service
 echo "Enabling rtirq service..."
@@ -123,11 +154,17 @@ echo "✓ rtirq installed and configured for LinuxCNC"
 echo "✓ RT interrupt priorities set"
 echo "✓ IRQ affinity configured for cores 0-1"
 echo "✓ Cores 2-3 reserved for RT tasks"
+echo "✓ Hardware watchdog disabled to prevent RT conflicts"
+echo "✓ systemd watchdog configuration updated"
 echo ""
 echo "To verify RT performance, run:"
 echo "  sudo rtirq status"
 echo "  cat /proc/interrupts | head -20"
 echo "  cyclictest -m -p99 -t4 -i200 -d0 -q"
+echo ""
+echo "To verify watchdog is disabled:"
+echo "  lsmod | grep iTCO  # Should return nothing"
+echo "  ls /dev/watchdog*  # May still exist but inactive"
 echo ""
 echo "Reboot recommended to ensure all settings take effect."
 echo "rtirq installation and setup complete."

@@ -127,14 +127,55 @@ echo ""
 echo "=== Recommendations ==="
 echo ""
 echo "To test real-time performance:"
-echo "  cyclictest -m -p99 -t4 -i200 -d0 -q"
+echo ""
+echo "1. Quick 10-second test:"
+echo "   sudo cyclictest -m -p99 -t4 -i200 -d0 -q -D 10s"
+echo ""
+echo "2. LinuxCNC-specific test on isolated cores:"
+echo "   sudo cyclictest -m -p99 -t2 -a 2,3 -i200 -d0 -q -D 60s"
+echo ""
+echo "3. Longer comprehensive test:"
+echo "   sudo cyclictest -m -p99 -t4 -i200 -d500 -q -D 5m"
 echo ""
 echo "To monitor IRQ activity:"
 echo "  watch -n 1 'cat /proc/interrupts | head -20'"
 echo ""
 echo "To check rtirq status:"
-echo "  sudo rtirq status"
+echo "  sudo /etc/init.d/rtirq status"
 echo ""
 echo "For LinuxCNC latency test:"
 echo "  latency-histogram --nobase --sbindir /usr/bin"
 echo ""
+echo "=== Interactive Test Options ==="
+echo ""
+echo "Run a latency test now?"
+echo "1) Quick test (10s)    2) LinuxCNC test (60s)    3) Long test (5m)    4) Skip"
+read -p "Choose option [1-4]: " -t 10 choice
+echo ""
+
+case "$choice" in
+    1)
+        echo "Running quick 10-second test..."
+        sudo cyclictest -m -p99 -t4 -i200 -d0 -q -D 10s
+        echo ""
+        echo "✓ Quick test completed. Max latency should be <500μs for good RT performance."
+        ;;
+    2)
+        echo "Running LinuxCNC-specific test on isolated cores (60s)..."
+        sudo cyclictest -m -p99 -t2 -a 2,3 -i200 -d0 -q -D 60s
+        echo ""
+        echo "✓ LinuxCNC test completed. This tests cores 2-3 specifically reserved for RT tasks."
+        ;;
+    3)
+        echo "Running comprehensive 5-minute test..."
+        sudo cyclictest -m -p99 -t4 -i200 -d500 -q -D 5m
+        echo ""
+        echo "✓ Long test completed. This provides the most thorough latency analysis."
+        ;;
+    4|"")
+        echo "Skipping tests. You can run them manually using the commands above."
+        ;;
+    *)
+        echo "Invalid option. Skipping tests."
+        ;;
+esac
