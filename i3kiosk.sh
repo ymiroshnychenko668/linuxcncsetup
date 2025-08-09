@@ -44,6 +44,19 @@ else
     cp /etc/i3/config ~/.config/i3/config
 fi
 
+# Enable LightDM for graphical login
+
+sudo systemctl enable lightdm
+
+
+
+
+# Configure LightDM for autologin
+
+
+sudo sed -i '/^\[Seat:\*\]/a autologin-user='"$(whoami)"'\nautologin-user-timeout=0' /etc/lightdm/lightdm.conf
+
+
 # Confirmation
 printf "\ni3 setup completed with default config (no modifications). Reboot the system to apply changes.\n"
 
