@@ -28,6 +28,8 @@ sudo update-initramfs -u
 # Update GRUB
 sudo update-grub
 
+sudo apt install lightdm -y
+
 # Enable LightDM for graphical login
 
 sudo systemctl enable lightdm
