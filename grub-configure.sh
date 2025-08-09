@@ -28,8 +28,16 @@ sudo update-initramfs -u
 # Update GRUB
 sudo update-grub
 
+# Enable LightDM for graphical login
+
+sudo systemctl enable lightdm
+
+
+
+
 # Configure LightDM for autologin
-sudo sed -i '/^\[Seat:\*\]/a autologin-user='"$(whoami)"'\\nautologin-user-timeout=0' /etc/lightdm/lightdm.conf
+sudo sed -i '/^\[Seat:\*\]/a autologin-user='"$(whoami)"'\nautologin-user-timeout=0' /etc/lightdm/lightdm.conf
+
 
 # Confirmation message
 echo "GRUB and splash screen updated successfully. Please reboot your system."
