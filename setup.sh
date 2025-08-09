@@ -1,22 +1,33 @@
 #!/bin/bash
 
-set -euo pipefail
-IFS=$'\n\t'
+set -e
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SCRIPT_NAME="$(basename "$0")"
+# Collect executable scripts in this directory excluding setup.sh
+shopt -s nullglob
+scripts=()
+for file in *.sh; do
+  [ "$file" = "setup.sh" ] && continue
+  scripts+=("$file")
+done
 
-echo "📁 Running scripts in: $SCRIPT_DIR"
-echo "⚙️  Ignoring: $SCRIPT_NAME"
-echo
+if [ ${#scripts[@]} -eq 0 ]; then
+  echo "No scripts available."
+  exit 0
+fi
 
-for file in "$SCRIPT_DIR"/*.sh; do
-  fname="$(basename "$file")"
-  [[ "$fname" == "$SCRIPT_NAME" ]] && continue
-
-  echo "🚀 Executing $fname..."
-  chmod +x "$file"
-  "$file"
-  echo "✅ Finished $fname"
-  echo
+PS3="Select a script to execute (or choose Quit to exit): "
+select script in "${scripts[@]}" "Quit"; do
+  case $script in
+    "Quit")
+      echo "Exiting."
+      break
+      ;;
+    "")
+      echo "Invalid selection."
+      ;;
+    *)
+      chmod +x "$script"
+      bash "$script"
+      ;;
+  esac
 done
