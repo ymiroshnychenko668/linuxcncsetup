@@ -16,18 +16,22 @@ if [ ${#scripts[@]} -eq 0 ]; then
 fi
 
 PS3="Select a script to execute (or choose Quit to exit): "
-select script in "${scripts[@]}" "Quit"; do
-  case $script in
-    "Quit")
-      echo "Exiting."
-      break
-      ;;
-    "")
-      echo "Invalid selection."
-      ;;
-    *)
-      chmod +x "$script"
-      bash "$script"
-      ;;
-  esac
+while true; do
+  select script in "${scripts[@]}" "Quit"; do
+    case $script in
+      "Quit")
+        echo "Exiting."
+        exit 0
+        ;;
+      "")
+        echo "Invalid selection."
+        break
+        ;;
+      *)
+        chmod +x "$script"
+        bash "$script"
+        break
+        ;;
+    esac
+  done
 done

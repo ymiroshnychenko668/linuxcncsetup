@@ -15,6 +15,7 @@ if [ ! -f "$HOME/.ssh/id_ed25519.pub" ]; then
 fi
 echo "GitHub SSH public key:"
 cat "$HOME/.ssh/id_ed25519.pub"
+echo "Add this key to your GitHub account: https://github.com/settings/keys"
 
 
 sudo apt install -y mc
