@@ -13,22 +13,26 @@ BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 # Function to print colored output
-print_info() { echo -e "${BLUE}ℹ $1${NC}"; }
-print_success() { echo -e "${GREEN}✓ $1${NC}"; }
-print_warning() { echo -e "${YELLOW}⚠ $1${NC}"; }
-print_error() { echo -e "${RED}✗ $1${NC}"; }
+print_info() { echo -e "${BLUE}[INFO] $1${NC}"; }
+print_success() { echo -e "${GREEN}[SUCCESS] $1${NC}"; }
+print_warning() { echo -e "${YELLOW}[WARNING] $1${NC}"; }
+print_error() { echo -e "${RED}[ERROR] $1${NC}"; }
 
 echo -e "${BLUE}=== Interactive i3 Kiosk Setup with LinuxCNC ===${NC}"
 echo "This script will set up i3 window manager with polybar and LinuxCNC integration"
 echo ""
 
+# Global arrays for LinuxCNC configurations
+declare -a LINUXCNC_PATHS
+declare -a LINUXCNC_NAMES
+
 # Function to find LinuxCNC configurations
 find_linuxcnc_configs() {
     print_info "Searching for LinuxCNC configurations..."
     
-    local config_files=()
-    local config_names=()
-    local config_paths=()
+    # Clear global arrays
+    LINUXCNC_PATHS=()
+    LINUXCNC_NAMES=()
     
     # Search in common LinuxCNC configuration directories
     local search_dirs=(
@@ -39,47 +43,64 @@ find_linuxcnc_configs() {
         "/usr/local/share/linuxcnc/configs"
     )
     
+    # Search for LinuxCNC configurations
     for dir in "${search_dirs[@]}"; do
         if [ -d "$dir" ]; then
             while IFS= read -r -d '' ini_file; do
-                config_files+=("$ini_file")
-                # Extract config name from path
-                local config_name=$(basename "$(dirname "$ini_file")").$(basename "$ini_file" .ini)
-                config_names+=("$config_name")
-                config_paths+=("$ini_file")
+                # Extract config name using folder name
+                local config_name=$(basename "$(dirname "$ini_file")")
+                LINUXCNC_PATHS+=("$ini_file")
+                LINUXCNC_NAMES+=("$config_name")
             done < <(find "$dir" -name "*.ini" -type f -print0 2>/dev/null)
         fi
     done
     
-    # Also search current directory and subdirectories for any .ini files that might be LinuxCNC configs
+    # Also search current directory for LinuxCNC configs
     while IFS= read -r -d '' ini_file; do
-        # Check if it's likely a LinuxCNC config by looking for LinuxCNC-specific content
         if grep -q -i -E "(EMC|DISPLAY.*axis|HAL|TRAJ)" "$ini_file" 2>/dev/null; then
-            config_files+=("$ini_file")
-            local config_name=$(basename "$(dirname "$ini_file")").$(basename "$ini_file" .ini)
-            config_names+=("$config_name")
-            config_paths+=("$ini_file")
+            local config_name=$(basename "$(dirname "$ini_file")")
+            LINUXCNC_PATHS+=("$ini_file")
+            LINUXCNC_NAMES+=("$config_name")
         fi
     done < <(find "$PWD" -name "*.ini" -type f -print0 2>/dev/null)
-    
-    echo "${#config_files[@]} ${config_files[*]} ${config_names[*]} ${config_paths[*]}"
 }
 
-# Function to select LinuxCNC configuration
-select_linuxcnc_config() {
-    local count=$1
-    shift
-    local configs=($@)
+# Function to display LinuxCNC configuration options
+display_linuxcnc_options() {
+    local count=${#LINUXCNC_PATHS[@]}
     
     if [ $count -eq 0 ]; then
         print_warning "No LinuxCNC configurations found."
-        print_info "You can manually specify a config path or skip LinuxCNC integration."
         echo ""
-        echo "Options:"
+        echo "Available options:"
         echo "  1) Skip LinuxCNC integration"
         echo "  2) Enter custom config path"
-        read -p "Select option (1-2): " choice
-        
+        echo ""
+        return
+    fi
+    
+    print_success "Found $count LinuxCNC configuration(s):"
+    echo ""
+    
+    # Display all configurations with numbers
+    for i in "${!LINUXCNC_PATHS[@]}"; do
+        echo "  $((i + 1))) ${LINUXCNC_NAMES[$i]}"
+        echo "      Path: ${LINUXCNC_PATHS[$i]}"
+        echo ""
+    done
+    
+    echo "  $((count + 1))) Skip LinuxCNC integration"
+    echo "  $((count + 2))) Enter custom config path"
+    echo ""
+}
+
+# Function to process LinuxCNC selection
+process_linuxcnc_selection() {
+    local choice=$1
+    local count=${#LINUXCNC_PATHS[@]}
+    
+    if [ $count -eq 0 ]; then
+        # Handle no configs found case
         case $choice in
             1)
                 echo "SKIP"
@@ -104,45 +125,14 @@ select_linuxcnc_config() {
         esac
     fi
     
-    print_success "Found $count LinuxCNC configuration(s):"
-    echo ""
-    
-    # Split the combined array back into separate arrays
-    local files=()
-    local names=()
-    local paths=()
-    
-    for i in $(seq 1 $count); do
-        files+=("${configs[$i]}")
-    done
-    
-    for i in $(seq $((count + 1)) $((count * 2))); do
-        names+=("${configs[$i]}")
-    done
-    
-    for i in $(seq $((count * 2 + 1)) $((count * 3))); do
-        paths+=("${configs[$i]}")
-    done
-    
-    # Display options
-    for i in $(seq 0 $((count - 1))); do
-        echo "  $((i + 1))) ${names[$i]}"
-        echo "      Path: ${paths[$i]}"
-        echo ""
-    done
-    
-    echo "  $((count + 1))) Skip LinuxCNC integration"
-    echo "  $((count + 2))) Enter custom config path"
-    
-    echo ""
-    read -p "Select LinuxCNC configuration (1-$((count + 2))): " choice
-    
+    # Validate input
     if [[ ! "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt $((count + 2)) ]; then
         print_error "Invalid selection"
         echo "SKIP"
         return
     fi
     
+    # Handle selection
     if [ "$choice" -eq $((count + 1)) ]; then
         echo "SKIP"
         return
@@ -157,8 +147,9 @@ select_linuxcnc_config() {
             return
         fi
     else
+        # Return the selected configuration path
         local selected_index=$((choice - 1))
-        echo "${paths[$selected_index]}"
+        echo "${LINUXCNC_PATHS[$selected_index]}"
         return
     fi
 }
@@ -186,11 +177,10 @@ chmod +x ~/.xsession
 
 # Find and select LinuxCNC configuration
 print_info "Setting up LinuxCNC integration..."
-configs_result=$(find_linuxcnc_configs)
-config_data=($configs_result)
-config_count=${config_data[0]}
-
-selected_config=$(select_linuxcnc_config $config_count "${config_data[@]:1}")
+find_linuxcnc_configs
+display_linuxcnc_options
+read -p "Select LinuxCNC configuration: " selected_choice
+selected_config=$(process_linuxcnc_selection "$selected_choice")
 
 if [ "$selected_config" != "SKIP" ]; then
     print_success "Selected LinuxCNC configuration: $selected_config"
