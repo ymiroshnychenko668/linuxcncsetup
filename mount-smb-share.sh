@@ -13,20 +13,32 @@ if ! dpkg -s cifs-utils >/dev/null 2>&1; then
     sudo apt install -y cifs-utils
 fi
 
-# Check if script is run as root
-if [ "$EUID" -ne 0 ]; then
-    echo "This script must be run as root (use sudo)"
-    exit 1
-fi
-
-# Check argument
+# Get mount point from argument or prompt user
 if [ -z "$1" ]; then
-    echo "Usage: sudo $0 /mount/point/path"
-    echo "Example: sudo $0 /mnt/smb_share"
-    exit 1
+    echo "No mount point specified. Please enter the mount point path:"
+    echo "Example: /mnt/smb_share"
+    read -p "Mount point: " MOUNT_POINT
+    
+    # Validate user input
+    if [ -z "$MOUNT_POINT" ]; then
+        echo "Error: Mount point cannot be empty"
+        exit 1
+    fi
+    
+    # Ensure mount point starts with /
+    if [[ ! "$MOUNT_POINT" =~ ^/ ]]; then
+        echo "Error: Mount point must be an absolute path (starting with /)"
+        exit 1
+    fi
+else
+    MOUNT_POINT="$1"
 fi
 
-MOUNT_POINT="$1"
+# Check if script is run as root, if not re-run with sudo
+if [ "$EUID" -ne 0 ]; then
+    echo "This script requires root privileges. Re-running with sudo..."
+    exec sudo "$0" "$MOUNT_POINT"
+fi
 SMB_PATH="//10.0.1.26/share"
 
 # Get the user who invoked sudo (or current user if run directly as root)

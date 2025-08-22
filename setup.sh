@@ -16,22 +16,38 @@ if [ ${#scripts[@]} -eq 0 ]; then
 fi
 
 PS3="Select a script to execute (or choose Quit to exit): "
-while true; do
-  select script in "${scripts[@]}" "Quit"; do
-    case $script in
-      "Quit")
-        echo "Exiting."
-        exit 0
-        ;;
-      "")
-        echo "Invalid selection."
-        break
-        ;;
-      *)
-        chmod +x "$script"
-        bash "$script"
-        break
-        ;;
-    esac
-  done
+select script in "${scripts[@]}" "Quit"; do
+  case $script in
+    "Quit")
+      echo "Exiting."
+      exit 0
+      ;;
+    "")
+      echo "Invalid selection. Please try again."
+      ;;
+    *)
+      chmod +x "$script"
+      echo "Executing: $script"
+      # Handle special scripts that need different execution
+      case "$script" in
+        "mount-smb-share.sh")
+          # Execute directly to preserve $0 for sudo re-execution
+          "./mount-smb-share.sh"
+          ;;
+        *)
+          bash "$script"
+          ;;
+      esac
+      echo ""
+      echo "Script completed. Select another script or quit."
+      echo ""
+      # Re-display the menu options
+      echo "Available scripts:"
+      for i in "${!scripts[@]}"; do
+        printf "%2d) %s\n" $((i+1)) "${scripts[$i]}"
+      done
+      printf "%2d) %s\n" $((${#scripts[@]}+1)) "Quit"
+      echo ""
+      ;;
+  esac
 done
