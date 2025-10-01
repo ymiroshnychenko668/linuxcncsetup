@@ -1,10 +1,9 @@
 #!/bin/bash
-# Launcher script for LinuxCNC CPU affinity setup
+# Launcher script for LinuxCNC CPU affinity configuration
 
-if [ ! -f /usr/local/bin/linuxcnc-cpu-setup.sh ]; then
-    echo "Error: /usr/local/bin/linuxcnc-cpu-setup.sh not found"
-    echo "Please run grub-configure-multicore.sh first to create the CPU setup script"
+if [ ! -f ./configure-cpu-affinity.sh ]; then
+    echo "Error: configure-cpu-affinity.sh not found in current directory"
     exit 1
 fi
 
-sudo /usr/local/bin/linuxcnc-cpu-setup.sh
+sudo ./configure-cpu-affinity.sh
