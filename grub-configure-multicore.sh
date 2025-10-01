@@ -1,10 +1,13 @@
 #!/bin/bash
 
 # Backup the existing grub configuration
-sudo cp /etc/default/grub "/etc/default/grub.backup.$(date +%Y%m%d%H%M%S)" > /dev/null 2>&1
+sudo cp /etc/default/grub "/etc/default/grub.backup.$(date +%Y%m%d%H%M%S)"
+
+echo "Updating GRUB configuration for LinuxCNC..."
 
 # Detect number of CPU cores
 CPU_CORES=$(nproc)
+echo "Detected $CPU_CORES CPU cores"
 
 # Calculate CPU isolation strategy for dual-processor systems
 if [ "$CPU_CORES" -ge 8 ]; then
@@ -50,17 +53,20 @@ echo "GRUB_RECORDFAIL_TIMEOUT=0" | sudo tee -a /etc/default/grub > /dev/null 2>&
 sudo sed -i 's/^#GRUB_DISABLE_RECOVERY=.*/GRUB_DISABLE_RECOVERY="true"/' /etc/default/grub
 
 # Install Plymouth (splash screen manager)
-sudo apt update > /dev/null 2>&1
-sudo apt install -y plymouth plymouth-themes > /dev/null 2>&1
+echo "Installing Plymouth splash screen..."
+sudo apt update
+sudo apt install -y plymouth plymouth-themes
 
 # Select Plymouth theme
-sudo plymouth-set-default-theme -R spinner > /dev/null 2>&1
+sudo plymouth-set-default-theme -R spinner
 
 # Configure CPU frequency governor for performance
-echo 'GOVERNOR="performance"' | sudo tee /etc/default/cpufrequtils > /dev/null 2>&1
+echo "Configuring CPU governor..."
+echo 'GOVERNOR="performance"' | sudo tee /etc/default/cpufrequtils
 
 # Create CPU affinity script for LinuxCNC
-cat << 'EOF' | sudo tee /usr/local/bin/linuxcnc-cpu-setup.sh > /dev/null 2>&1
+echo "Creating CPU affinity setup script..."
+cat << 'EOF' | sudo tee /usr/local/bin/linuxcnc-cpu-setup.sh
 #!/bin/bash
 # LinuxCNC CPU affinity setup for dual-processor systems
 
@@ -134,28 +140,6 @@ if [[ "$configure_irq" =~ ^[Yy]$ ]]; then
     echo "Current Interrupt Assignments"
     echo "============================================"
     cat /proc/interrupts
-    echo ""
-    echo "============================================"
-    echo "Available IRQs for configuration:"
-    echo "============================================"
-
-    # List all IRQ directories
-    for irq_dir in /proc/irq/[0-9]*; do
-        irq=$(basename "$irq_dir")
-        if [ -f "$irq_dir/smp_affinity_list" ]; then
-            current_affinity=$(cat "$irq_dir/smp_affinity_list" 2>/dev/null | tr -d '\n')
-            # Get IRQ name from /proc/interrupts
-            irq_info=$(grep "^ *$irq:" /proc/interrupts 2>/dev/null)
-            if [ -n "$irq_info" ]; then
-                irq_name=$(echo "$irq_info" | sed 's/^[^:]*://' | awk '{for(i=NF;i>=1;i--) if($i !~ /^[0-9]+$/) {print $i; exit}}')
-            else
-                irq_name="(no name)"
-            fi
-            [ -z "$irq_name" ] && irq_name="(no name)"
-            printf "IRQ %3s: %-30s (CPUs: %s)\n" "$irq" "$irq_name" "$current_affinity"
-        fi
-    done
-
     echo ""
     echo "============================================"
     echo "IRQ Affinity Configuration"
@@ -241,22 +225,27 @@ EOF
 sudo chmod +x /usr/local/bin/linuxcnc-cpu-setup.sh
 
 # Update initramfs to apply the changes
-sudo update-initramfs -u > /dev/null 2>&1
+echo "Updating initramfs..."
+sudo update-initramfs -u
 
 # Update GRUB
-sudo update-grub > /dev/null 2>&1
+echo "Updating GRUB..."
+sudo update-grub
 
 # Install and configure LightDM
-sudo apt install lightdm -y > /dev/null 2>&1
+echo "Installing LightDM..."
+sudo apt install lightdm -y
 
 # Enable LightDM for graphical login
-sudo systemctl enable lightdm > /dev/null 2>&1
+sudo systemctl enable lightdm
 
 # Configure LightDM for autologin
-sudo sed -i '/^\\[Seat:\\*\\]/a autologin-user='"$(whoami)"'\\nautologin-user-timeout=0' /etc/lightdm/lightdm.conf 2>/dev/null
+echo "Configuring LightDM autologin..."
+sudo sed -i '/^\\[Seat:\\*\\]/a autologin-user='"$(whoami)"'\\nautologin-user-timeout=0' /etc/lightdm/lightdm.conf
 
 # Create systemd service to run CPU setup on boot
-cat << EOF | sudo tee /etc/systemd/system/linuxcnc-cpu-setup.service > /dev/null 2>&1
+echo "Creating systemd service..."
+cat << EOF | sudo tee /etc/systemd/system/linuxcnc-cpu-setup.service
 [Unit]
 Description=LinuxCNC CPU Setup for Dual-Processor Systems
 After=multi-user.target
@@ -270,6 +259,16 @@ RemainAfterExit=yes
 WantedBy=multi-user.target
 EOF
 
-sudo systemctl enable linuxcnc-cpu-setup.service > /dev/null 2>&1
+sudo systemctl enable linuxcnc-cpu-setup.service
 
-echo "GRUB configuration completed. Please reboot."
+echo ""
+echo "============================================"
+echo "Configuration Summary"
+echo "============================================"
+echo "CPU cores: $CPU_CORES"
+echo "Isolated CPUs: $ISOLCPUS"
+echo "System CPUs: $IRQ_AFFINITY"
+echo ""
+echo "GRUB configuration completed successfully."
+echo "Please reboot to apply changes."
+echo ""
