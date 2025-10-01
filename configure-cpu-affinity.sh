@@ -22,33 +22,7 @@ echo "Total CPU cores: $CPU_CORES"
 echo "Default IRQ affinity: CPUs $DEFAULT_IRQ_AFFINITY_CPUS (mask: 0x$DEFAULT_IRQ_AFFINITY_MASK)"
 echo ""
 
-# Set CPU governor to performance mode
-echo "Setting CPU governor to performance mode..."
-for cpu in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
-    [ -f "$cpu" ] && echo performance | sudo tee "$cpu" > /dev/null 2>&1
-done
 
-# Disable CPU frequency scaling
-echo "Configuring CPU frequency scaling..."
-for cpu in /sys/devices/system/cpu/cpu*/cpufreq/scaling_max_freq; do
-    if [ -f "$cpu" ]; then
-        max_freq=$(cat "$cpu")
-        echo $max_freq | sudo tee ${cpu/scaling_max_freq/scaling_min_freq} > /dev/null 2>&1
-    fi
-done
-
-# Configure CPU frequency governor for performance
-echo "Configuring CPU governor..."
-echo 'GOVERNOR="performance"' | sudo tee /etc/default/cpufrequtils > /dev/null 2>&1
-
-# Set default IRQ affinity (must use hex bitmask)
-echo "Setting default IRQ affinity to CPUs $DEFAULT_IRQ_AFFINITY_CPUS (0x$DEFAULT_IRQ_AFFINITY_MASK)..."
-if [ -f /proc/irq/default_smp_affinity ]; then
-    echo "$DEFAULT_IRQ_AFFINITY_MASK" | sudo tee /proc/irq/default_smp_affinity > /dev/null 2>&1
-    echo "✓ Default IRQ affinity set to CPUs $DEFAULT_IRQ_AFFINITY_CPUS"
-else
-    echo "⚠ /proc/irq/default_smp_affinity not found"
-fi
 
 # Apply affinity to all existing IRQs using smp_affinity_list
 echo "Applying affinity to all existing IRQs..."
