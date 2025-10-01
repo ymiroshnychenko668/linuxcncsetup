@@ -35,13 +35,13 @@ elif [ "$CPU_CORES" -ge 4 ]; then
     KTHREAD_CPUS="0-1"
     echo "Quad-core configuration: Isolating CPUs $ISOLCPUS for real-time tasks"
 else
-    # For 2-3 cores: Reserve first core, isolate the rest
-    ISOLCPUS="1-$((CPU_CORES-1))"
-    NOHZ_FULL="1-$((CPU_CORES-1))"
-    RCU_NOCBS="1-$((CPU_CORES-1))"
+    # For 2-3 cores: Reserve first core (CPU 0), isolate only one processor (CPU 1)
+    ISOLCPUS="1"
+    NOHZ_FULL="1"
+    RCU_NOCBS="1"
     IRQ_AFFINITY="0"
     KTHREAD_CPUS="0"
-    echo "Dual-core configuration: Isolating CPUs $ISOLCPUS for real-time tasks"
+    echo "Dual-core configuration: Isolating CPU $ISOLCPUS for real-time tasks"
 fi
 
 # Define the new GRUB parameters with dynamic CPU isolation
@@ -72,24 +72,23 @@ sudo apt install -y plymouth plymouth-themes
 # Select Plymouth theme
 sudo plymouth-set-default-theme -R spinner
 
-# Configure CPU frequency governor for performance
-echo "Configuring CPU governor for maximum performance..."
-echo 'GOVERNOR="performance"' | sudo tee /etc/default/cpufrequtils
+# Update GRUB configuration
+echo "Updating GRUB..."
+sudo update-grub
 
-# Create CPU affinity script for LinuxCNC
-cat << EOF | sudo tee /usr/local/bin/linuxcnc-cpu-setup.sh
-#!/bin/bash
-# LinuxCNC CPU affinity setup for dual-processor systems
-
-# Set CPU governor to performance mode
-for cpu in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
-    [ -f "\$cpu" ] && echo performance | sudo tee "\$cpu" > /dev/null
-done
-
-# Disable CPU frequency scaling
-for cpu in /sys/devices/system/cpu/cpu*/cpufreq/scaling_max_freq; do
-    if [ -f "\$cpu" ]; then
-        max_freq=\$(cat "\$cpu")
-        echo \$max_freq | sudo tee \${cpu/scaling_max_freq/scaling_min_freq} > /dev/null
-    fi
-done
+echo ""
+echo "============================================"
+echo "GRUB Configuration Complete"
+echo "============================================"
+echo "CPU isolation parameters have been applied:"
+echo "  - isolcpus=$ISOLCPUS"
+echo "  - nohz_full=$NOHZ_FULL"
+echo "  - rcu_nocbs=$RCU_NOCBS"
+echo "  - irqaffinity=$IRQ_AFFINITY"
+echo "  - kthread_cpus=$KTHREAD_CPUS"
+echo ""
+echo "GRUB timeout disabled for faster boot."
+echo "Plymouth splash screen configured."
+echo ""
+echo "Next step: Run ./configure-cpu-affinity.sh to configure CPU governor, frequency scaling, and IRQ affinities."
+echo ""
