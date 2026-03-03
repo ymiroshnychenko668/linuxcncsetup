@@ -12,7 +12,8 @@ echo "======================================"
 echo ""
 
 # Detect number of CPU cores
-NUM_CPUS=$(nproc)
+# Use lscpu for more reliable detection (nproc can be affected by existing CPU affinity)
+NUM_CPUS=$(lscpu -p=CPU | grep -v '^#' | wc -l)
 echo "Detected $NUM_CPUS CPU cores (numbered 0-$((NUM_CPUS-1)))"
 echo ""
 
