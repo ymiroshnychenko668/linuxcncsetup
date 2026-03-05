@@ -39,7 +39,7 @@ if [ "$EUID" -ne 0 ]; then
     echo "This script requires root privileges. Re-running with sudo..."
     exec sudo "$0" "$MOUNT_POINT"
 fi
-SMB_PATH="//10.0.1.26/share"
+SMB_PATH="//10.0.1.246/share"
 
 # Get the user who invoked sudo (or current user if run directly as root)
 if [ -n "$SUDO_USER" ]; then
