@@ -93,10 +93,9 @@ echo "$FSTAB_LINE" >> /etc/fstab
 echo "Reloading systemd daemon..."
 systemctl daemon-reload
 
-# 5. Enable and start the automount unit
+# 5. Start the automount unit (no need to enable - x-systemd.automount in fstab handles that)
 MOUNT_UNIT=$(systemd-escape --path "$MOUNT_POINT").automount
-echo "Enabling systemd automount unit: $MOUNT_UNIT"
-systemctl enable "$MOUNT_UNIT" || true
+echo "Starting systemd automount unit: $MOUNT_UNIT"
 systemctl start "$MOUNT_UNIT" || true
 
 # 6. Test the mount
