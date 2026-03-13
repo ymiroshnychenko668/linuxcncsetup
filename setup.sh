@@ -2,13 +2,20 @@
 #
 # LinuxCNC Setup Manager
 # Launches the interactive TUI for system configuration.
-# Falls back to a basic menu if Python/Textual are not available.
+# Re-launches with sudo if not already root, so scripts that need
+# root privileges work without prompting for a password mid-run.
 #
 
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
+
+# Re-launch as root if needed (preserves DISPLAY/XAUTHORITY for GUI)
+if [ "$(id -u)" -ne 0 ]; then
+    echo "Some scripts require root. Requesting sudo..."
+    exec sudo --preserve-env=DISPLAY,XAUTHORITY,HOME,USER,TERM bash "$0" "$@"
+fi
 
 # ---------------------------------------------------------------------------
 # Try launching the Textual TUI
@@ -40,7 +47,7 @@ if [[ ! "$install_choice" =~ ^[Nn]$ ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Fallback: basic bash menu (original behaviour)
+# Fallback: basic bash menu
 # ---------------------------------------------------------------------------
 echo ""
 echo "Running in fallback mode (basic menu)..."
@@ -71,22 +78,9 @@ select script in "${scripts[@]}" "Quit"; do
         *)
             chmod +x "$script"
             echo "Executing: $script"
-            case "$script" in
-                "mount-smb-share.sh")
-                    "./$script"
-                    ;;
-                *)
-                    bash "$script"
-                    ;;
-            esac
+            bash "$script"
             echo ""
             echo "Script completed. Select another script or quit."
-            echo ""
-            echo "Available scripts:"
-            for i in "${!scripts[@]}"; do
-                printf "%2d) %s\n" $((i+1)) "${scripts[$i]}"
-            done
-            printf "%2d) %s\n" $((${#scripts[@]}+1)) "Quit"
             echo ""
             ;;
     esac

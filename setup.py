@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """LinuxCNC Setup Manager - Interactive TUI for system configuration."""
 
+import multiprocessing
 import os
+import re
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -64,16 +66,17 @@ CATEGORIES: dict[str, list[ScriptInfo]] = {
     ],
     "CPU & Real-Time Tuning": [
         ScriptInfo(
-            "grub-configure-multicore.sh",
+            "grub-rt-config",
             "GRUB RT Configuration",
-            "Configure GRUB with full real-time kernel parameters for multi-core systems",
-            "The most comprehensive GRUB setup. Dynamically detects CPU count and applies: "
-            "isolcpus, nohz_full, rcu_nocbs, irqaffinity, kthread_cpus, "
+            "Interactive GRUB real-time kernel configuration with CPU detection",
+            "Opens an interactive panel to configure GRUB for real-time LinuxCNC operation. "
+            "Detects CPU cores via lscpu, isolates the last 1-2 cores for RT "
+            "(1 core if <=5 total, 2 cores if >=6), gives the rest to the OS. "
+            "Applies: isolcpus, nohz_full, rcu_nocbs, irqaffinity, kthread_cpus, "
             "processor.max_cstate=1, intel_idle.max_cstate=0, idle=poll, "
-            "mitigations=off, nosoftlockup, tsc=reliable, and more. "
-            "Also disables GRUB timeout for instant boot, installs Plymouth "
-            "splash screen, and sets GRUB_DISABLE_RECOVERY. "
-            "Creates a backup of /etc/default/grub before changes.",
+            "mitigations=off, nosoftlockup, tsc=reliable, nmi_watchdog=0, rcu_nocb_poll. "
+            "Previews changes before applying. Backs up /etc/default/grub, "
+            "sets instant boot, and runs update-grub.",
             needs_sudo=True,
         ),
         ScriptInfo(
@@ -342,8 +345,6 @@ class RunScriptScreen(ModalScreen[None]):
             return
 
         cmd = ["bash", str(script_path)]
-        if self.script.filename == "mount-smb-share.sh":
-            cmd = [str(script_path)]
 
         env = os.environ.copy()
         env["TERM"] = "dumb"
@@ -385,62 +386,6 @@ class RunScriptScreen(ModalScreen[None]):
     def on_close_pressed(self) -> None:
         self.action_close()
 
-
-# ---------------------------------------------------------------------------
-# Confirm screen
-# ---------------------------------------------------------------------------
-
-class ConfirmScreen(ModalScreen[bool]):
-    """Ask for confirmation before running a script."""
-
-    CSS = """
-    ConfirmScreen {
-        align: center middle;
-    }
-    ConfirmScreen > Vertical {
-        width: 70;
-        height: auto;
-        max-height: 20;
-        border: thick $warning;
-        background: $surface;
-        padding: 1 2;
-    }
-    ConfirmScreen Label {
-        width: 100%;
-        margin-bottom: 1;
-    }
-    ConfirmScreen Horizontal {
-        height: 3;
-        align: center middle;
-    }
-    ConfirmScreen Button {
-        margin: 0 2;
-    }
-    """
-
-    def __init__(self, script: ScriptInfo) -> None:
-        super().__init__()
-        self.script = script
-
-    def compose(self) -> ComposeResult:
-        with Vertical():
-            yield Label(f"[bold]Run {self.script.name}?[/]")
-            if self.script.needs_sudo:
-                yield Label("[yellow]This script requires sudo privileges.[/]")
-            if self.script.status == "experimental":
-                yield Label("[yellow]This script is marked EXPERIMENTAL and may not work correctly.[/]")
-            yield Label(f"\n{self.script.description}")
-            with Horizontal():
-                yield Button("Run", variant="success", id="confirm-yes")
-                yield Button("Cancel", variant="error", id="confirm-no")
-
-    @on(Button.Pressed, "#confirm-yes")
-    def on_yes(self) -> None:
-        self.dismiss(True)
-
-    @on(Button.Pressed, "#confirm-no")
-    def on_no(self) -> None:
-        self.dismiss(False)
 
 
 # ---------------------------------------------------------------------------
@@ -637,6 +582,360 @@ class SMBManagerScreen(ModalScreen[None]):
 
 
 # ---------------------------------------------------------------------------
+# GRUB RT Configuration screen
+# ---------------------------------------------------------------------------
+
+def _detect_total_cores() -> int:
+    """Detect total CPU cores using lscpu (not nproc, which respects affinity)."""
+    try:
+        out = subprocess.check_output(["lscpu"], text=True)
+        for line in out.splitlines():
+            if line.startswith("CPU(s):"):
+                return int(line.split(":")[1].strip())
+    except Exception:
+        pass
+    # Fallback to multiprocessing (physical count, ignores taskset)
+    return multiprocessing.cpu_count() or 2
+
+
+def _compute_rt_isolation(total_cores: int) -> dict[str, str]:
+    """Compute kernel params: isolate last 1-2 cores for RT, OS gets the rest.
+
+    <=5 cores  → 1 RT core  (last)
+    >=6 cores  → 2 RT cores (last two)
+    """
+    if total_cores < 2:
+        total_cores = 2
+
+    if total_cores >= 6:
+        rt_count = 2
+    else:
+        rt_count = 1
+
+    rt_first = total_cores - rt_count
+    rt_last = total_cores - 1
+    os_last = rt_first - 1
+
+    if rt_first == rt_last:
+        isolcpus = str(rt_first)
+    else:
+        isolcpus = f"{rt_first}-{rt_last}"
+
+    os_range = f"0-{os_last}" if os_last > 0 else "0"
+
+    return {
+        "total": str(total_cores),
+        "rt_cores": isolcpus,
+        "os_cores": os_range,
+        "isolcpus": isolcpus,
+        "nohz_full": isolcpus,
+        "rcu_nocbs": isolcpus,
+        "irqaffinity": os_range,
+        "kthread_cpus": os_range,
+    }
+
+
+def _build_grub_cmdline(params: dict[str, str]) -> str:
+    """Build the full GRUB_CMDLINE_LINUX_DEFAULT value."""
+    return (
+        f"quiet isolcpus={params['isolcpus']}"
+        f" nohz_full={params['nohz_full']}"
+        f" rcu_nocbs={params['rcu_nocbs']}"
+        f" irqaffinity={params['irqaffinity']}"
+        f" kthread_cpus={params['kthread_cpus']}"
+        " processor.max_cstate=1"
+        " intel_idle.max_cstate=0"
+        " idle=poll"
+        " mitigations=off"
+        " nosoftlockup"
+        " tsc=reliable"
+        " clocksource=tsc"
+        " nmi_watchdog=0"
+        " rcu_nocb_poll"
+    )
+
+
+class GRUBConfigScreen(ModalScreen[None]):
+    """Interactive GRUB real-time configuration for LinuxCNC."""
+
+    BINDINGS = [
+        Binding("escape", "close", "Close", show=True),
+        Binding("q", "close", "Close"),
+    ]
+
+    CSS = """
+    GRUBConfigScreen {
+        align: center middle;
+    }
+    GRUBConfigScreen > Vertical {
+        width: 95%;
+        height: 90%;
+        border: thick $accent;
+        background: $surface;
+        padding: 1 2;
+    }
+    GRUBConfigScreen #grub-header {
+        height: 3;
+        content-align: center middle;
+        text-style: bold;
+        color: $text;
+        background: $primary-background;
+        margin-bottom: 1;
+    }
+    GRUBConfigScreen #grub-buttons {
+        height: 3;
+        margin-bottom: 1;
+    }
+    GRUBConfigScreen #grub-buttons Button {
+        margin: 0 1;
+    }
+    GRUBConfigScreen RichLog {
+        height: 1fr;
+        border: solid $primary;
+        scrollbar-size: 1 1;
+    }
+    GRUBConfigScreen #grub-status {
+        height: 1;
+        margin-top: 1;
+        text-align: center;
+    }
+    GRUBConfigScreen #grub-close-btn {
+        dock: bottom;
+        width: 100%;
+        margin-top: 1;
+    }
+    """
+
+    GRUB_FILE = "/etc/default/grub"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._process: subprocess.Popen | None = None
+        self._params: dict[str, str] | None = None
+
+    def compose(self) -> ComposeResult:
+        with Vertical():
+            yield Label("GRUB RT Configuration", id="grub-header")
+            with Horizontal(id="grub-buttons"):
+                yield Button("Detect CPUs", id="grub-detect", variant="primary")
+                yield Button("Show Current", id="grub-show", variant="default")
+                yield Button("Preview", id="grub-preview", variant="default")
+                yield Button("Apply", id="grub-apply", variant="warning")
+            yield RichLog(highlight=True, markup=True, wrap=True, id="grub-log")
+            yield Label("Press 'Detect CPUs' to start.", id="grub-status")
+            yield Button("Close  [Esc]", id="grub-close-btn", variant="primary")
+
+    def on_mount(self) -> None:
+        self._do_detect()
+
+    # -- Detect CPUs -----------------------------------------------------------
+
+    @on(Button.Pressed, "#grub-detect")
+    def on_detect(self) -> None:
+        self._do_detect()
+
+    @work(exclusive=True, thread=True)
+    def _do_detect(self) -> None:
+        log = self.query_one("#grub-log", RichLog)
+        status = self.query_one("#grub-status", Label)
+        self.app.call_from_thread(log.clear)
+        self.app.call_from_thread(status.update, "[yellow]Detecting CPUs...[/]")
+
+        total = _detect_total_cores()
+        params = _compute_rt_isolation(total)
+        self._params = params
+        cmdline = _build_grub_cmdline(params)
+
+        self.app.call_from_thread(log.write, "[bold]CPU Detection (lscpu)[/]")
+        self.app.call_from_thread(log.write, f"  Total cores:   {params['total']}")
+        self.app.call_from_thread(log.write, f"  OS cores:      {params['os_cores']}")
+        self.app.call_from_thread(log.write, f"  RT cores:      {params['rt_cores']}")
+        self.app.call_from_thread(log.write, "")
+        self.app.call_from_thread(log.write, "[bold]Kernel parameters:[/]")
+        self.app.call_from_thread(log.write, f"  isolcpus       = {params['isolcpus']}")
+        self.app.call_from_thread(log.write, f"  nohz_full      = {params['nohz_full']}")
+        self.app.call_from_thread(log.write, f"  rcu_nocbs      = {params['rcu_nocbs']}")
+        self.app.call_from_thread(log.write, f"  irqaffinity    = {params['irqaffinity']}")
+        self.app.call_from_thread(log.write, f"  kthread_cpus   = {params['kthread_cpus']}")
+        self.app.call_from_thread(log.write, "")
+        self.app.call_from_thread(log.write, "[bold]Full GRUB_CMDLINE_LINUX_DEFAULT:[/]")
+        self.app.call_from_thread(log.write, f"  {cmdline}")
+        self.app.call_from_thread(
+            status.update,
+            f"[green]Detected {total} cores — RT: {params['rt_cores']}, OS: {params['os_cores']}[/]",
+        )
+
+    # -- Show current GRUB config ---------------------------------------------
+
+    @on(Button.Pressed, "#grub-show")
+    def on_show(self) -> None:
+        self._do_show()
+
+    @work(exclusive=True, thread=True)
+    def _do_show(self) -> None:
+        log = self.query_one("#grub-log", RichLog)
+        status = self.query_one("#grub-status", Label)
+        self.app.call_from_thread(log.clear)
+
+        grub = Path(self.GRUB_FILE)
+        if not grub.exists():
+            self.app.call_from_thread(log.write, f"[red]{self.GRUB_FILE} not found[/]")
+            self.app.call_from_thread(status.update, "[red]GRUB config not found[/]")
+            return
+
+        self.app.call_from_thread(log.write, f"[bold]{self.GRUB_FILE}[/]\n")
+        try:
+            content = grub.read_text()
+            for line in content.splitlines():
+                self.app.call_from_thread(log.write, line)
+        except PermissionError:
+            self.app.call_from_thread(log.write, "[red]Permission denied — try running the TUI with sudo.[/]")
+
+        # Also show current boot cmdline
+        cmdline_path = Path("/proc/cmdline")
+        if cmdline_path.exists():
+            self.app.call_from_thread(log.write, "")
+            self.app.call_from_thread(log.write, "[bold]/proc/cmdline (active boot params):[/]")
+            self.app.call_from_thread(log.write, cmdline_path.read_text().strip())
+
+        self.app.call_from_thread(status.update, "[green]Current GRUB configuration shown[/]")
+
+    # -- Preview ---------------------------------------------------------------
+
+    @on(Button.Pressed, "#grub-preview")
+    def on_preview(self) -> None:
+        self._do_preview()
+
+    @work(exclusive=True, thread=True)
+    def _do_preview(self) -> None:
+        log = self.query_one("#grub-log", RichLog)
+        status = self.query_one("#grub-status", Label)
+        self.app.call_from_thread(log.clear)
+
+        if self._params is None:
+            self.app.call_from_thread(log.write, "[yellow]Run 'Detect CPUs' first.[/]")
+            self.app.call_from_thread(status.update, "[yellow]No detection done yet[/]")
+            return
+
+        cmdline = _build_grub_cmdline(self._params)
+
+        self.app.call_from_thread(log.write, "[bold]Changes that will be applied to /etc/default/grub:[/]\n")
+        self.app.call_from_thread(log.write, f'  GRUB_CMDLINE_LINUX_DEFAULT="{cmdline}"')
+        self.app.call_from_thread(log.write, "  GRUB_TIMEOUT=0")
+        self.app.call_from_thread(log.write, "  GRUB_TIMEOUT_STYLE=hidden")
+        self.app.call_from_thread(log.write, "  GRUB_RECORDFAIL_TIMEOUT=0")
+        self.app.call_from_thread(log.write, '  GRUB_DISABLE_RECOVERY="true"')
+        self.app.call_from_thread(log.write, "")
+        self.app.call_from_thread(log.write, "[dim]A timestamped backup will be created before changes.[/]")
+        self.app.call_from_thread(log.write, "[dim]update-grub will run after applying.[/]")
+        self.app.call_from_thread(status.update, "[green]Preview ready — press 'Apply' to write changes[/]")
+
+    # -- Apply -----------------------------------------------------------------
+
+    @on(Button.Pressed, "#grub-apply")
+    def on_apply(self) -> None:
+        self._do_apply()
+
+    @work(exclusive=True, thread=True)
+    def _do_apply(self) -> None:
+        log = self.query_one("#grub-log", RichLog)
+        status = self.query_one("#grub-status", Label)
+        self.app.call_from_thread(log.clear)
+
+        if self._params is None:
+            self.app.call_from_thread(log.write, "[yellow]Run 'Detect CPUs' first.[/]")
+            self.app.call_from_thread(status.update, "[yellow]No detection done yet[/]")
+            return
+
+        if os.geteuid() != 0:
+            self.app.call_from_thread(log.write, "[red]Root privileges required.[/]")
+            self.app.call_from_thread(log.write, "Run the TUI with: [bold]sudo python3 setup.py[/]")
+            self.app.call_from_thread(status.update, "[red]Not running as root[/]")
+            return
+
+        grub = Path(self.GRUB_FILE)
+        if not grub.exists():
+            self.app.call_from_thread(log.write, f"[red]{self.GRUB_FILE} not found[/]")
+            self.app.call_from_thread(status.update, "[red]GRUB config not found[/]")
+            return
+
+        self.app.call_from_thread(status.update, "[yellow]Applying GRUB configuration...[/]")
+
+        # Backup
+        import shutil
+        from datetime import datetime
+
+        backup = f"{self.GRUB_FILE}.backup.{datetime.now().strftime('%Y%m%d%H%M%S')}"
+        shutil.copy2(self.GRUB_FILE, backup)
+        self.app.call_from_thread(log.write, f"[green]Backup saved:[/] {backup}")
+
+        # Read and modify
+        content = grub.read_text()
+        cmdline = _build_grub_cmdline(self._params)
+
+        content = re.sub(
+            r'^GRUB_CMDLINE_LINUX_DEFAULT=.*$',
+            f'GRUB_CMDLINE_LINUX_DEFAULT="{cmdline}"',
+            content,
+            flags=re.MULTILINE,
+        )
+        content = re.sub(
+            r'^GRUB_TIMEOUT=.*$', 'GRUB_TIMEOUT=0', content, flags=re.MULTILINE
+        )
+        content = re.sub(
+            r'^GRUB_TIMEOUT_STYLE=.*$', 'GRUB_TIMEOUT_STYLE=hidden', content, flags=re.MULTILINE
+        )
+        content = re.sub(
+            r'^#?GRUB_DISABLE_RECOVERY=.*$',
+            'GRUB_DISABLE_RECOVERY="true"',
+            content,
+            flags=re.MULTILINE,
+        )
+
+        if "GRUB_RECORDFAIL_TIMEOUT=" not in content:
+            content += "\nGRUB_RECORDFAIL_TIMEOUT=0\n"
+
+        grub.write_text(content)
+        self.app.call_from_thread(log.write, "[green]GRUB config written.[/]")
+
+        # Run update-grub
+        self.app.call_from_thread(log.write, "\n[bold]Running update-grub...[/]")
+        try:
+            self._process = subprocess.Popen(
+                ["update-grub"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+            for line in self._process.stdout:
+                self.app.call_from_thread(log.write, line.rstrip("\n"))
+            self._process.wait()
+            rc = self._process.returncode
+            if rc == 0:
+                self.app.call_from_thread(log.write, "\n[green bold]GRUB updated successfully.[/]")
+                self.app.call_from_thread(log.write, "[bold]Reboot to apply changes.[/]")
+                self.app.call_from_thread(status.update, "[green]Applied — reboot to activate[/]")
+            else:
+                self.app.call_from_thread(log.write, f"\n[red]update-grub exited with code {rc}[/]")
+                self.app.call_from_thread(status.update, f"[red]update-grub failed (exit {rc})[/]")
+        except Exception as e:
+            self.app.call_from_thread(log.write, f"[red]Error running update-grub: {e}[/]")
+            self.app.call_from_thread(status.update, "[red]update-grub failed[/]")
+
+    # -- Close -----------------------------------------------------------------
+
+    def action_close(self) -> None:
+        if self._process and self._process.poll() is None:
+            self._process.terminate()
+        self.dismiss(None)
+
+    @on(Button.Pressed, "#grub-close-btn")
+    def on_close_pressed(self) -> None:
+        self.action_close()
+
+
+# ---------------------------------------------------------------------------
 # Detail panel widget
 # ---------------------------------------------------------------------------
 
@@ -661,12 +960,17 @@ class DetailPanel(Static):
         status_label, _ = STATUS_STYLES.get(script.status, ("[white]UNKNOWN[/]", "white"))
         sudo_badge = "  [red bold]SUDO[/]" if script.needs_sudo else ""
         path = find_script(script.filename)
-        exists = "[green]found[/]" if path else "[red]NOT FOUND[/]"
+        if path:
+            file_line = f"[bold]File:[/]   {script.filename}  ([green]found[/])\n\n"
+        elif script.filename.startswith(("grub-rt-config", "smb-mount-manager")):
+            file_line = f"[bold]Type:[/]   [cyan]Interactive TUI screen[/]\n\n"
+        else:
+            file_line = f"[bold]File:[/]   {script.filename}  ([red]NOT FOUND[/])\n\n"
 
         text = (
             f"[bold underline]{script.name}[/]\n\n"
             f"[bold]Status:[/] {status_label}{sudo_badge}\n"
-            f"[bold]File:[/]   {script.filename}  ({exists})\n\n"
+            f"{file_line}"
             f"[bold]Summary[/]\n{script.description}\n\n"
             f"[bold]Details[/]\n{script.long_description}\n"
         )
@@ -786,9 +1090,13 @@ class LinuxCNCSetup(App):
 
         script = self._selected_script
 
-        # Open dedicated SMB Manager screen instead of running the raw script
+        # Open dedicated screens for interactive tools
         if script.filename == "smb-mount-manager.sh":
             self.push_screen(SMBManagerScreen())
+            return
+
+        if script.filename == "grub-rt-config":
+            self.push_screen(GRUBConfigScreen())
             return
 
         path = find_script(script.filename)
@@ -796,11 +1104,7 @@ class LinuxCNCSetup(App):
             self.notify(f"Script not found: {script.filename}", severity="error")
             return
 
-        def on_confirm(result: bool | None) -> None:
-            if result:
-                self.push_screen(RunScriptScreen(script))
-
-        self.push_screen(ConfirmScreen(script), on_confirm)
+        self.push_screen(RunScriptScreen(script))
 
 
 def main() -> None:
