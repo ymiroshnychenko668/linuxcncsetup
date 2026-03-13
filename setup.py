@@ -14,6 +14,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
+from textual.widget import Widget
 from textual.widgets import (
     Button,
     Footer,
@@ -635,46 +636,88 @@ def _compute_rt_isolation(total_cores: int) -> dict[str, str]:
     }
 
 
-def _build_grub_cmdline(params: dict[str, str]) -> str:
-    """Build the full GRUB_CMDLINE_LINUX_DEFAULT value."""
-    return (
-        f"quiet isolcpus={params['isolcpus']}"
-        f" nohz_full={params['nohz_full']}"
-        f" rcu_nocbs={params['rcu_nocbs']}"
-        f" irqaffinity={params['irqaffinity']}"
-        f" kthread_cpus={params['kthread_cpus']}"
-        " processor.max_cstate=1"
-        " intel_idle.max_cstate=0"
-        " idle=poll"
-        " mitigations=off"
-        " nosoftlockup"
-        " tsc=reliable"
-        " clocksource=tsc"
-        " nmi_watchdog=0"
-        " rcu_nocb_poll"
+def _build_rt_params(params: dict[str, str]) -> dict[str, str | None]:
+    """Build the RT kernel parameters as a dict.  None value = bare flag."""
+    return {
+        "isolcpus": params["isolcpus"],
+        "nohz_full": params["nohz_full"],
+        "rcu_nocbs": params["rcu_nocbs"],
+        "irqaffinity": params["irqaffinity"],
+        "kthread_cpus": params["kthread_cpus"],
+        "processor.max_cstate": "1",
+        "intel_idle.max_cstate": "0",
+        "idle": "poll",
+        "mitigations": "off",
+        "nosoftlockup": None,
+        "tsc": "reliable",
+        "clocksource": "tsc",
+        "nmi_watchdog": "0",
+        "rcu_nocb_poll": None,
+    }
+
+
+def _rt_params_str(rt_params: dict[str, str | None]) -> str:
+    """Format RT params dict as a cmdline string (for display)."""
+    return " ".join(
+        k if v is None else f"{k}={v}" for k, v in rt_params.items()
     )
 
 
-class GRUBConfigScreen(ModalScreen[None]):
-    """Interactive GRUB real-time configuration for LinuxCNC."""
+def _merge_cmdline(existing: str, rt_params: dict[str, str | None]) -> str:
+    """Merge RT params into an existing cmdline, preserving unmanaged params."""
+    result = []
+    seen: set[str] = set()
 
-    BINDINGS = [
-        Binding("escape", "close", "Close", show=True),
-        Binding("q", "close", "Close"),
-    ]
+    for token in existing.split():
+        key = token.split("=", 1)[0]
+        if key in rt_params:
+            # Replace with our value
+            value = rt_params[key]
+            result.append(key if value is None else f"{key}={value}")
+            seen.add(key)
+        else:
+            result.append(token)
+
+    # Append RT params that weren't already in the cmdline
+    for key, value in rt_params.items():
+        if key not in seen:
+            result.append(key if value is None else f"{key}={value}")
+
+    return " ".join(result)
+
+
+def _set_grub_var(content: str, key: str, value: str) -> str:
+    """Set a GRUB variable in config, adding it if not present."""
+    pattern = rf'^#?\s*{re.escape(key)}=.*$'
+    new_content, count = re.subn(
+        pattern, f"{key}={value}", content, flags=re.MULTILINE
+    )
+    if count == 0:
+        new_content = new_content.rstrip("\n") + f"\n{key}={value}\n"
+    return new_content
+
+
+def _read_grub_cmdline(content: str) -> str:
+    """Extract the current GRUB_CMDLINE_LINUX_DEFAULT value."""
+    match = re.search(
+        r'^GRUB_CMDLINE_LINUX_DEFAULT="(.*)"', content, re.MULTILINE
+    )
+    return match.group(1) if match else "quiet"
+
+
+class GRUBConfigPanel(Widget):
+    """Right-pane GRUB RT configuration for LinuxCNC."""
 
     CSS = """
-    GRUBConfigScreen {
-        align: center middle;
-    }
-    GRUBConfigScreen > Vertical {
-        width: 95%;
-        height: 90%;
-        border: thick $accent;
-        background: $surface;
+    GRUBConfigPanel {
+        layout: vertical;
+        width: 1fr;
+        height: 100%;
         padding: 1 2;
+        border-left: solid $primary;
+        display: none;
     }
-    GRUBConfigScreen #grub-header {
+    GRUBConfigPanel #grub-header {
         height: 3;
         content-align: center middle;
         text-style: bold;
@@ -682,48 +725,41 @@ class GRUBConfigScreen(ModalScreen[None]):
         background: $primary-background;
         margin-bottom: 1;
     }
-    GRUBConfigScreen #grub-buttons {
+    GRUBConfigPanel #grub-buttons {
         height: 3;
         margin-bottom: 1;
     }
-    GRUBConfigScreen #grub-buttons Button {
+    GRUBConfigPanel #grub-buttons Button {
         margin: 0 1;
     }
-    GRUBConfigScreen RichLog {
+    GRUBConfigPanel RichLog {
         height: 1fr;
         border: solid $primary;
         scrollbar-size: 1 1;
     }
-    GRUBConfigScreen #grub-status {
+    GRUBConfigPanel #grub-status {
         height: 1;
         margin-top: 1;
         text-align: center;
-    }
-    GRUBConfigScreen #grub-close-btn {
-        dock: bottom;
-        width: 100%;
-        margin-top: 1;
     }
     """
 
     GRUB_FILE = "/etc/default/grub"
 
-    def __init__(self) -> None:
-        super().__init__()
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
         self._process: subprocess.Popen | None = None
         self._params: dict[str, str] | None = None
 
     def compose(self) -> ComposeResult:
-        with Vertical():
-            yield Label("GRUB RT Configuration", id="grub-header")
-            with Horizontal(id="grub-buttons"):
-                yield Button("Detect CPUs", id="grub-detect", variant="primary")
-                yield Button("Show Current", id="grub-show", variant="default")
-                yield Button("Preview", id="grub-preview", variant="default")
-                yield Button("Apply", id="grub-apply", variant="warning")
-            yield RichLog(highlight=True, markup=True, wrap=True, id="grub-log")
-            yield Label("Press 'Detect CPUs' to start.", id="grub-status")
-            yield Button("Close  [Esc]", id="grub-close-btn", variant="primary")
+        yield Label("GRUB RT Configuration", id="grub-header")
+        with Horizontal(id="grub-buttons"):
+            yield Button("Detect CPUs", id="grub-detect", variant="primary")
+            yield Button("Show Current", id="grub-show", variant="default")
+            yield Button("Preview", id="grub-preview", variant="default")
+            yield Button("Apply", id="grub-apply", variant="warning")
+        yield RichLog(highlight=True, markup=True, wrap=True, id="grub-log")
+        yield Label("Press 'Detect CPUs' to start.", id="grub-status")
 
     def on_mount(self) -> None:
         self._do_detect()
@@ -744,22 +780,19 @@ class GRUBConfigScreen(ModalScreen[None]):
         total = _detect_total_cores()
         params = _compute_rt_isolation(total)
         self._params = params
-        cmdline = _build_grub_cmdline(params)
+        rt = _build_rt_params(params)
 
         self.app.call_from_thread(log.write, "[bold]CPU Detection (lscpu)[/]")
         self.app.call_from_thread(log.write, f"  Total cores:   {params['total']}")
         self.app.call_from_thread(log.write, f"  OS cores:      {params['os_cores']}")
         self.app.call_from_thread(log.write, f"  RT cores:      {params['rt_cores']}")
         self.app.call_from_thread(log.write, "")
-        self.app.call_from_thread(log.write, "[bold]Kernel parameters:[/]")
-        self.app.call_from_thread(log.write, f"  isolcpus       = {params['isolcpus']}")
-        self.app.call_from_thread(log.write, f"  nohz_full      = {params['nohz_full']}")
-        self.app.call_from_thread(log.write, f"  rcu_nocbs      = {params['rcu_nocbs']}")
-        self.app.call_from_thread(log.write, f"  irqaffinity    = {params['irqaffinity']}")
-        self.app.call_from_thread(log.write, f"  kthread_cpus   = {params['kthread_cpus']}")
+        self.app.call_from_thread(log.write, "[bold]RT kernel parameters to apply:[/]")
+        for key, value in rt.items():
+            display = key if value is None else f"{key}={value}"
+            self.app.call_from_thread(log.write, f"  {display}")
         self.app.call_from_thread(log.write, "")
-        self.app.call_from_thread(log.write, "[bold]Full GRUB_CMDLINE_LINUX_DEFAULT:[/]")
-        self.app.call_from_thread(log.write, f"  {cmdline}")
+        self.app.call_from_thread(log.write, "[dim]Existing params in GRUB_CMDLINE_LINUX_DEFAULT will be preserved.[/]")
         self.app.call_from_thread(
             status.update,
             f"[green]Detected {total} cores — RT: {params['rt_cores']}, OS: {params['os_cores']}[/]",
@@ -768,11 +801,11 @@ class GRUBConfigScreen(ModalScreen[None]):
     # -- Show current GRUB config ---------------------------------------------
 
     @on(Button.Pressed, "#grub-show")
-    def on_show(self) -> None:
-        self._do_show()
+    def on_show_current(self) -> None:
+        self._do_show_current()
 
     @work(exclusive=True, thread=True)
-    def _do_show(self) -> None:
+    def _do_show_current(self) -> None:
         log = self.query_one("#grub-log", RichLog)
         status = self.query_one("#grub-status", Label)
         self.app.call_from_thread(log.clear)
@@ -817,14 +850,34 @@ class GRUBConfigScreen(ModalScreen[None]):
             self.app.call_from_thread(status.update, "[yellow]No detection done yet[/]")
             return
 
-        cmdline = _build_grub_cmdline(self._params)
+        rt = _build_rt_params(self._params)
 
-        self.app.call_from_thread(log.write, "[bold]Changes that will be applied to /etc/default/grub:[/]\n")
-        self.app.call_from_thread(log.write, f'  GRUB_CMDLINE_LINUX_DEFAULT="{cmdline}"')
-        self.app.call_from_thread(log.write, "  GRUB_TIMEOUT=0")
-        self.app.call_from_thread(log.write, "  GRUB_TIMEOUT_STYLE=hidden")
-        self.app.call_from_thread(log.write, "  GRUB_RECORDFAIL_TIMEOUT=0")
-        self.app.call_from_thread(log.write, '  GRUB_DISABLE_RECOVERY="true"')
+        # Read existing GRUB file and build the full preview
+        grub = Path(self.GRUB_FILE)
+        if not grub.exists():
+            self.app.call_from_thread(log.write, f"[red]{self.GRUB_FILE} not found[/]")
+            self.app.call_from_thread(status.update, "[red]GRUB config not found[/]")
+            return
+
+        try:
+            content = grub.read_text()
+        except PermissionError:
+            self.app.call_from_thread(log.write, "[red]Permission denied — try running the TUI with sudo.[/]")
+            self.app.call_from_thread(status.update, "[red]Permission denied[/]")
+            return
+
+        # Apply the same transformations as _do_apply to show the result
+        existing_cmdline = _read_grub_cmdline(content)
+        merged = _merge_cmdline(existing_cmdline, rt)
+        preview = _set_grub_var(content, "GRUB_CMDLINE_LINUX_DEFAULT", f'"{merged}"')
+        preview = _set_grub_var(preview, "GRUB_TIMEOUT", "0")
+        preview = _set_grub_var(preview, "GRUB_TIMEOUT_STYLE", "hidden")
+        preview = _set_grub_var(preview, "GRUB_RECORDFAIL_TIMEOUT", "0")
+        preview = _set_grub_var(preview, "GRUB_DISABLE_RECOVERY", '"true"')
+
+        self.app.call_from_thread(log.write, f"[bold]{self.GRUB_FILE} after applying:[/]\n")
+        for line in preview.splitlines():
+            self.app.call_from_thread(log.write, line)
         self.app.call_from_thread(log.write, "")
         self.app.call_from_thread(log.write, "[dim]A timestamped backup will be created before changes.[/]")
         self.app.call_from_thread(log.write, "[dim]update-grub will run after applying.[/]")
@@ -869,31 +922,17 @@ class GRUBConfigScreen(ModalScreen[None]):
         shutil.copy2(self.GRUB_FILE, backup)
         self.app.call_from_thread(log.write, f"[green]Backup saved:[/] {backup}")
 
-        # Read and modify
+        # Read and merge
         content = grub.read_text()
-        cmdline = _build_grub_cmdline(self._params)
+        rt = _build_rt_params(self._params)
+        existing_cmdline = _read_grub_cmdline(content)
+        merged = _merge_cmdline(existing_cmdline, rt)
 
-        content = re.sub(
-            r'^GRUB_CMDLINE_LINUX_DEFAULT=.*$',
-            f'GRUB_CMDLINE_LINUX_DEFAULT="{cmdline}"',
-            content,
-            flags=re.MULTILINE,
-        )
-        content = re.sub(
-            r'^GRUB_TIMEOUT=.*$', 'GRUB_TIMEOUT=0', content, flags=re.MULTILINE
-        )
-        content = re.sub(
-            r'^GRUB_TIMEOUT_STYLE=.*$', 'GRUB_TIMEOUT_STYLE=hidden', content, flags=re.MULTILINE
-        )
-        content = re.sub(
-            r'^#?GRUB_DISABLE_RECOVERY=.*$',
-            'GRUB_DISABLE_RECOVERY="true"',
-            content,
-            flags=re.MULTILINE,
-        )
-
-        if "GRUB_RECORDFAIL_TIMEOUT=" not in content:
-            content += "\nGRUB_RECORDFAIL_TIMEOUT=0\n"
+        content = _set_grub_var(content, "GRUB_CMDLINE_LINUX_DEFAULT", f'"{merged}"')
+        content = _set_grub_var(content, "GRUB_TIMEOUT", "0")
+        content = _set_grub_var(content, "GRUB_TIMEOUT_STYLE", "hidden")
+        content = _set_grub_var(content, "GRUB_RECORDFAIL_TIMEOUT", "0")
+        content = _set_grub_var(content, "GRUB_DISABLE_RECOVERY", '"true"')
 
         grub.write_text(content)
         self.app.call_from_thread(log.write, "[green]GRUB config written.[/]")
@@ -923,16 +962,6 @@ class GRUBConfigScreen(ModalScreen[None]):
             self.app.call_from_thread(log.write, f"[red]Error running update-grub: {e}[/]")
             self.app.call_from_thread(status.update, "[red]update-grub failed[/]")
 
-    # -- Close -----------------------------------------------------------------
-
-    def action_close(self) -> None:
-        if self._process and self._process.poll() is None:
-            self._process.terminate()
-        self.dismiss(None)
-
-    @on(Button.Pressed, "#grub-close-btn")
-    def on_close_pressed(self) -> None:
-        self.action_close()
 
 
 # ---------------------------------------------------------------------------
@@ -1044,6 +1073,7 @@ class LinuxCNCSetup(App):
                 yield self._build_tree()
             with VerticalScroll(id="detail-pane"):
                 yield DetailPanel(id="detail")
+            yield GRUBConfigPanel(id="grub-panel")
         yield Footer()
 
     def _build_tree(self) -> Tree:
@@ -1068,9 +1098,15 @@ class LinuxCNCSetup(App):
         key = event.node.data
         if key and key in self._script_map:
             self._selected_script = self._script_map[key]
-            self.query_one("#detail", DetailPanel).update_script(self._selected_script)
+            is_grub = self._selected_script.filename == "grub-rt-config"
+            self.query_one("#detail-pane").display = not is_grub
+            self.query_one("#grub-panel").display = is_grub
+            if not is_grub:
+                self.query_one("#detail", DetailPanel).update_script(self._selected_script)
         else:
             self._selected_script = None
+            self.query_one("#detail-pane").display = True
+            self.query_one("#grub-panel").display = False
             self.query_one("#detail", DetailPanel).update_script(None)
 
     @on(Tree.NodeSelected)
@@ -1096,7 +1132,6 @@ class LinuxCNCSetup(App):
             return
 
         if script.filename == "grub-rt-config":
-            self.push_screen(GRUBConfigScreen())
             return
 
         path = find_script(script.filename)
