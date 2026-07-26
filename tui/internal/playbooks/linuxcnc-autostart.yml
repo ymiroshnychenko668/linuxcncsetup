@@ -143,20 +143,66 @@
           This Sway implementation currently requires QtVCP so it can place
           the delayed XWayland window on workspace 1 deterministically.
 
-    - name: Validate the existing Sway configuration before changing it
-      ansible.builtin.command:
-        argv:
-          - /usr/bin/sway
-          - --validate
-          - --config
-          - "{{ linuxcnc_autostart_home }}/.config/sway/config"
-      become: true
-      become_user: "{{ target_user }}"
-      environment:
-        HOME: "{{ linuxcnc_autostart_home }}"
-        XDG_RUNTIME_DIR: "/run/user/{{ linuxcnc_autostart_uid }}"
-      changed_when: false
-      check_mode: false
+    - name: Validate the existing Sway configuration in an isolated runtime
+      block:
+        - name: Create a private preflight Sway validation runtime
+          ansible.builtin.tempfile:
+            state: directory
+            prefix: linuxcncsetup-linuxcnc-pre-sway-
+          become: true
+          become_user: "{{ target_user }}"
+          register: linuxcnc_autostart_preflight_runtime
+          check_mode: false
+          changed_when: false
+
+        - name: Enforce private preflight runtime permissions
+          ansible.builtin.file:
+            path: "{{ linuxcnc_autostart_preflight_runtime.path }}"
+            state: directory
+            mode: "0700"
+          become: true
+          become_user: "{{ target_user }}"
+          changed_when: false
+
+        - name: Validate the existing Sway configuration before changing it
+          ansible.builtin.command:
+            argv:
+              - /usr/bin/sway
+              - --validate
+              - --config
+              - "{{ linuxcnc_autostart_home }}/.config/sway/config"
+          become: true
+          become_user: "{{ target_user }}"
+          environment:
+            HOME: "{{ linuxcnc_autostart_home }}"
+            XDG_RUNTIME_DIR: "{{ linuxcnc_autostart_preflight_runtime.path }}"
+            WLR_BACKENDS: headless
+            WLR_RENDERER: pixman
+            WLR_LIBINPUT_NO_DEVICES: "1"
+            WAYLAND_DISPLAY: ""
+            DISPLAY: ""
+            SWAYSOCK: ""
+          register: linuxcnc_autostart_preflight_validation
+          changed_when: false
+          check_mode: false
+          failed_when: >-
+            linuxcnc_autostart_preflight_validation.rc != 0 or
+            "Error(s) loading config!" in
+            (
+              (linuxcnc_autostart_preflight_validation.stdout | default("")) +
+              (linuxcnc_autostart_preflight_validation.stderr | default(""))
+            )
+      always:
+        - name: Remove the private preflight Sway validation runtime
+          ansible.builtin.file:
+            path: "{{ linuxcnc_autostart_preflight_runtime.path }}"
+            state: absent
+          become: true
+          when:
+            - linuxcnc_autostart_preflight_runtime is defined
+            - linuxcnc_autostart_preflight_runtime.path is defined
+          check_mode: false
+          changed_when: false
 
   tasks:
     - name: Persist LinuxCNC autostart for the next Sway session

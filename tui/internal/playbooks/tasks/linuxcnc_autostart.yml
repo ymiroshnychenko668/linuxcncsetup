@@ -1,56 +1,134 @@
 ---
-- name: Create user autostart directories
-  ansible.builtin.file:
-    path: "{{ linuxcnc_autostart_home }}/{{ item }}"
-    state: directory
-    owner: "{{ target_user }}"
-    group: "{{ linuxcnc_autostart_group.stdout }}"
-    mode: "0755"
-  loop:
-    - .local
-    - .local/bin
-    - .config/sway/config.d
+- name: Install and validate the LinuxCNC Sway autostart configuration
+  block:
+    - name: Create a private runtime for Sway snippet validation
+      ansible.builtin.tempfile:
+        state: directory
+        prefix: linuxcncsetup-linuxcnc-snippet-sway-
+      register: linuxcnc_autostart_snippet_runtime
+      check_mode: false
+      changed_when: false
 
-- name: Install the LinuxCNC autostart wrapper
-  ansible.builtin.template:
-    src: templates/linuxcnc-autostart.sh.j2
-    dest: "{{ linuxcnc_autostart_home }}/.local/bin/linuxcnc-autostart"
-    owner: "{{ target_user }}"
-    group: "{{ linuxcnc_autostart_group.stdout }}"
-    mode: "0755"
-    backup: true
+    - name: Enforce private snippet-validation runtime permissions
+      ansible.builtin.file:
+        path: "{{ linuxcnc_autostart_snippet_runtime.path }}"
+        state: directory
+        mode: "0700"
+      changed_when: false
 
-- name: Install the LinuxCNC Sway autostart snippet
-  ansible.builtin.template:
-    src: templates/linuxcnc-autostart-sway.conf.j2
-    dest: "{{ linuxcnc_autostart_home }}/.config/sway/config.d/90-linuxcnc-autostart.conf"
-    owner: "{{ target_user }}"
-    group: "{{ linuxcnc_autostart_group.stdout }}"
-    mode: "0644"
-    backup: true
-    validate: /usr/bin/sway --validate --config %s
+    - name: Create a private target-user Sway validation runtime
+      ansible.builtin.tempfile:
+        state: directory
+        prefix: linuxcncsetup-linuxcnc-final-sway-
+      become_user: "{{ target_user }}"
+      register: linuxcnc_autostart_final_runtime
+      check_mode: false
+      changed_when: false
 
-- name: Include user-managed Sway configuration snippets
-  ansible.builtin.lineinfile:
-    path: "{{ linuxcnc_autostart_home }}/.config/sway/config"
-    line: "include ~/.config/sway/config.d/*"
-    insertafter: EOF
-    state: present
-    owner: "{{ target_user }}"
-    group: "{{ linuxcnc_autostart_group.stdout }}"
-    mode: "0644"
-    backup: true
+    - name: Enforce private target-user runtime permissions
+      ansible.builtin.file:
+        path: "{{ linuxcnc_autostart_final_runtime.path }}"
+        state: directory
+        mode: "0700"
+      become_user: "{{ target_user }}"
+      changed_when: false
 
-- name: Validate the resulting Sway configuration
-  ansible.builtin.command:
-    argv:
-      - /usr/bin/sway
-      - --validate
-      - --config
-      - "{{ linuxcnc_autostart_home }}/.config/sway/config"
-  become_user: "{{ target_user }}"
-  environment:
-    HOME: "{{ linuxcnc_autostart_home }}"
-    XDG_RUNTIME_DIR: "/run/user/{{ linuxcnc_autostart_uid }}"
-  changed_when: false
-  check_mode: false
+    - name: Create user autostart directories
+      ansible.builtin.file:
+        path: "{{ linuxcnc_autostart_home }}/{{ item }}"
+        state: directory
+        owner: "{{ target_user }}"
+        group: "{{ linuxcnc_autostart_group.stdout }}"
+        mode: "0755"
+      loop:
+        - .local
+        - .local/bin
+        - .config/sway/config.d
+
+    - name: Install the LinuxCNC autostart wrapper
+      ansible.builtin.template:
+        src: templates/linuxcnc-autostart.sh.j2
+        dest: "{{ linuxcnc_autostart_home }}/.local/bin/linuxcnc-autostart"
+        owner: "{{ target_user }}"
+        group: "{{ linuxcnc_autostart_group.stdout }}"
+        mode: "0755"
+        backup: true
+
+    - name: Install the LinuxCNC Sway autostart snippet
+      ansible.builtin.template:
+        src: templates/linuxcnc-autostart-sway.conf.j2
+        dest: "{{ linuxcnc_autostart_home }}/.config/sway/config.d/90-linuxcnc-autostart.conf"
+        owner: "{{ target_user }}"
+        group: "{{ linuxcnc_autostart_group.stdout }}"
+        mode: "0644"
+        backup: true
+        validate: /usr/bin/sway --validate --config %s
+      environment:
+        HOME: "{{ linuxcnc_autostart_home }}"
+        XDG_RUNTIME_DIR: "{{ linuxcnc_autostart_snippet_runtime.path }}"
+        WLR_BACKENDS: headless
+        WLR_RENDERER: pixman
+        WLR_LIBINPUT_NO_DEVICES: "1"
+        WAYLAND_DISPLAY: ""
+        DISPLAY: ""
+        SWAYSOCK: ""
+
+    - name: Include user-managed Sway configuration snippets
+      ansible.builtin.lineinfile:
+        path: "{{ linuxcnc_autostart_home }}/.config/sway/config"
+        line: "include ~/.config/sway/config.d/*"
+        insertafter: EOF
+        state: present
+        owner: "{{ target_user }}"
+        group: "{{ linuxcnc_autostart_group.stdout }}"
+        mode: "0644"
+        backup: true
+
+    - name: Validate the resulting Sway configuration
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/sway
+          - --validate
+          - --config
+          - "{{ linuxcnc_autostart_home }}/.config/sway/config"
+      become_user: "{{ target_user }}"
+      environment:
+        HOME: "{{ linuxcnc_autostart_home }}"
+        XDG_RUNTIME_DIR: "{{ linuxcnc_autostart_final_runtime.path }}"
+        WLR_BACKENDS: headless
+        WLR_RENDERER: pixman
+        WLR_LIBINPUT_NO_DEVICES: "1"
+        WAYLAND_DISPLAY: ""
+        DISPLAY: ""
+        SWAYSOCK: ""
+      register: linuxcnc_autostart_final_validation
+      changed_when: false
+      check_mode: false
+      failed_when: >-
+        linuxcnc_autostart_final_validation.rc != 0 or
+        "Error(s) loading config!" in
+        (
+          (linuxcnc_autostart_final_validation.stdout | default("")) +
+          (linuxcnc_autostart_final_validation.stderr | default(""))
+        )
+      when: not ansible_check_mode
+  always:
+    - name: Remove the private snippet-validation runtime
+      ansible.builtin.file:
+        path: "{{ linuxcnc_autostart_snippet_runtime.path }}"
+        state: absent
+      when:
+        - linuxcnc_autostart_snippet_runtime is defined
+        - linuxcnc_autostart_snippet_runtime.path is defined
+      check_mode: false
+      changed_when: false
+
+    - name: Remove the private target-user validation runtime
+      ansible.builtin.file:
+        path: "{{ linuxcnc_autostart_final_runtime.path }}"
+        state: absent
+      when:
+        - linuxcnc_autostart_final_runtime is defined
+        - linuxcnc_autostart_final_runtime.path is defined
+      check_mode: false
+      changed_when: false
