@@ -83,6 +83,7 @@ func TestLinuxCNCConfigPlaybookPreservesExistingCheckout(t *testing.T) {
 		"accept_newhostkey: true",
 		"update: false",
 		"force: false",
+		"corvus_missing_packages | length > 0",
 		"when: not corvus_destination_before.stat.exists",
 		"recurse: false",
 		"corvus_ini_files.matched | int > 0",

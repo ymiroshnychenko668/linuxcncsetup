@@ -86,8 +86,9 @@ selecting Sway automatic login.
 ## CorvusCNC configuration installation
 
 The main-menu **Install CorvusCNC config** item, immediately after **Install
-Ansible**, runs an embedded Ansible playbook that installs Git and OpenSSH when
-needed, creates the target user's `~/linuxcnc/configs` directory, and clones
+Ansible**, runs an embedded Ansible playbook that installs Git or OpenSSH only
+when its executable is missing, creates the target user's
+`~/linuxcnc/configs` directory, and clones
 `git@github.com:ymiroshnychenko668/corvuscnc.git` directly to
 `~/linuxcnc/configs/corvuscnc`. The repository root is the ready-to-use
 LinuxCNC configuration directory; no additional nesting or copy step is

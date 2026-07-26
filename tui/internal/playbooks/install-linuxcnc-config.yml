@@ -82,15 +82,35 @@
           directory and a usable shell.
 
   tasks:
-    - name: Install Git and the OpenSSH client
+    - name: Inspect Git and OpenSSH client executables
+      ansible.builtin.stat:
+        path: "{{ item.path }}"
+        follow: true
+      loop:
+        - package: git
+          path: /usr/bin/git
+        - package: openssh-client
+          path: /usr/bin/ssh
+      register: corvus_dependency_executables
+
+    - name: Determine missing CorvusCNC dependency packages
+      ansible.builtin.set_fact:
+        corvus_missing_packages: >-
+          {{
+            corvus_dependency_executables.results
+            | rejectattr("stat.exists")
+            | map(attribute="item.package")
+            | list
+          }}
+
+    - name: Install missing Git and OpenSSH client packages
       ansible.builtin.apt:
-        name:
-          - git
-          - openssh-client
+        name: "{{ corvus_missing_packages }}"
         state: present
         update_cache: true
         cache_valid_time: 3600
       become: true
+      when: corvus_missing_packages | length > 0
 
     - name: Inspect the target user's SSH directory
       ansible.builtin.stat:
