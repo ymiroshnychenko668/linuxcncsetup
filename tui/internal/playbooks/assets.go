@@ -15,16 +15,20 @@ var assets embed.FS
 type Playbook string
 
 const (
-	Autologin         Playbook = "autologin.yml"
-	InstallSway       Playbook = "install-sway.yml"
-	LinuxCNCAutostart Playbook = "linuxcnc-autostart.yml"
+	Autologin             Playbook = "autologin.yml"
+	InstallLinuxCNCConfig Playbook = "install-linuxcnc-config.yml"
+	IRQAffinity           Playbook = "irq-affinity.yml"
+	InstallDevTools       Playbook = "install-devtools.yml"
+	InstallSway           Playbook = "install-sway.yml"
+	LinuxCNCAutostart     Playbook = "linuxcnc-autostart.yml"
 )
 
 // Materialize writes the embedded playbook tree to a temporary directory.
 // The caller must invoke cleanup after ansible-playbook exits.
 func Materialize(playbook Playbook) (playbookPath string, cleanup func(), err error) {
 	switch playbook {
-	case Autologin, InstallSway, LinuxCNCAutostart:
+	case Autologin, InstallLinuxCNCConfig, IRQAffinity, InstallDevTools,
+		InstallSway, LinuxCNCAutostart:
 	default:
 		return "", nil, fmt.Errorf("unknown embedded playbook: %q", playbook)
 	}

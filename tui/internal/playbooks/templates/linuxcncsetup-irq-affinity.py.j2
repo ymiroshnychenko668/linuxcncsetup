@@ -1,0 +1,1070 @@
+#!/usr/bin/python3
+"""Resolve and apply stable, declarative IRQ-affinity rules.
+
+Persistent policies contain CPU lists and stable device selectors only. Numeric
+IRQ identifiers are discovered from procfs/sysfs on every run and are written
+only to runtime result files.
+"""
+
+import argparse
+import datetime
+import errno
+import json
+import os
+import pathlib
+import re
+import stat
+import subprocess
+import sys
+import tempfile
+
+
+DEFAULT_CONFIG = pathlib.Path("/etc/linuxcncsetup/irq-affinity.yml")
+DEFAULT_RESULT = pathlib.Path("/run/linuxcncsetup/irq-affinity-result.json")
+DEFAULT_LIVE_RESULT = pathlib.Path(
+    "/run/linuxcncsetup/irq-affinity-live-result.json"
+)
+ONLINE_CPUS = pathlib.Path("/sys/devices/system/cpu/online")
+CPU_ROOT = pathlib.Path("/sys/devices/system/cpu")
+DEFAULT_AFFINITY = pathlib.Path("/proc/irq/default_smp_affinity")
+IRQ_ROOT = pathlib.Path("/proc/irq")
+SYS_IRQ_ROOT = pathlib.Path("/sys/kernel/irq")
+CPU_LIST_PATTERN = re.compile(
+    r"^(?:[0-9]+(?:-[0-9]+)?)(?:,[0-9]+(?:-[0-9]+)?)*$"
+)
+PCI_BDF_PATTERN = re.compile(
+    r"^[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7]$"
+)
+PCI_BDF_AT_END_PATTERN = re.compile(
+    r"([0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7])$"
+)
+EXPECTED_V1_CONFIG_KEYS = {
+    "schema_version",
+    "housekeeping_cpus",
+    "protected_cpus",
+}
+EXPECTED_V2_CONFIG_KEYS = {
+    "schema_version",
+    "default_policy",
+    "device_rules",
+}
+EXPECTED_DEFAULT_POLICY_KEYS = {"housekeeping_cpus", "protected_cpus"}
+EXPECTED_DEVICE_RULE_KEYS = {"selector", "cpus", "label"}
+EXPECTED_SELECTOR_KEYS = {"kind", "value"}
+LINUXCNC_PROCESS_NAMES = {
+    "halcmd",
+    "halrun",
+    "linuxcnc",
+    "linuxcncsvr",
+    "milltask",
+    "rtapi_app",
+}
+
+
+class PolicyError(RuntimeError):
+    """A configuration or runtime condition that prevents a safe apply."""
+
+
+def parse_cpu_list(value, label, maximum=None):
+    if not isinstance(value, str) or not CPU_LIST_PATTERN.fullmatch(value):
+        raise PolicyError(f"{label} is not a valid Linux CPU list")
+
+    cpus = set()
+    for item in value.split(","):
+        bounds = [int(part) for part in item.split("-", 1)]
+        first = bounds[0]
+        last = bounds[-1]
+        if last < first:
+            raise PolicyError(f"{label} contains a descending range: {item}")
+        if maximum is not None and last > maximum:
+            raise PolicyError(
+                f"{label} references CPU {last}, above online maximum "
+                f"CPU {maximum}"
+            )
+        cpus.update(range(first, last + 1))
+    if not cpus:
+        raise PolicyError(f"{label} must not be empty")
+    return cpus
+
+
+def format_cpu_list(cpus):
+    ordered = sorted(cpus)
+    if not ordered:
+        raise PolicyError("cannot format an empty CPU set")
+
+    ranges = []
+    start = previous = ordered[0]
+    for cpu in ordered[1:]:
+        if cpu == previous + 1:
+            previous = cpu
+            continue
+        ranges.append(str(start) if start == previous else f"{start}-{previous}")
+        start = previous = cpu
+    ranges.append(str(start) if start == previous else f"{start}-{previous}")
+    return ",".join(ranges)
+
+
+def format_cpu_mask(cpus):
+    value = 0
+    for cpu in cpus:
+        value |= 1 << cpu
+    hexadecimal = f"{value:x}"
+    groups = []
+    while hexadecimal:
+        groups.append(hexadecimal[-8:].zfill(8))
+        hexadecimal = hexadecimal[:-8]
+    groups[-1] = groups[-1].lstrip("0") or "0"
+    return ",".join(reversed(groups))
+
+
+def load_online_cpus():
+    try:
+        online_text = ONLINE_CPUS.read_text(encoding="ascii").strip()
+    except OSError as error:
+        raise PolicyError(f"cannot read online CPUs: {error}") from error
+    return parse_cpu_list(online_text, "online CPUs")
+
+
+def normalize_selector(value, label):
+    if not isinstance(value, dict) or set(value) != EXPECTED_SELECTOR_KEYS:
+        raise PolicyError(f"{label} must contain exactly kind and value")
+    kind = value["kind"]
+    selector = value["value"]
+    if kind not in {"pci_bdf", "action"}:
+        raise PolicyError(f"{label}.kind must be pci_bdf or action")
+    if (
+        not isinstance(selector, str)
+        or not selector
+        or selector != selector.strip()
+        or len(selector) > 128
+        or not selector.isprintable()
+    ):
+        raise PolicyError(f"{label}.value is not a safe exact selector")
+    if kind == "pci_bdf":
+        if not PCI_BDF_PATTERN.fullmatch(selector):
+            raise PolicyError(f"{label}.value is not a canonical PCI BDF")
+        selector = selector.lower()
+    elif "," in selector or selector.isdigit():
+        raise PolicyError(f"{label}.value is not a safe action token")
+    return {"kind": kind, "value": selector}
+
+
+def normalize_device_rule(value, index, online):
+    label = f"device rule {index}"
+    if not isinstance(value, dict) or set(value) != EXPECTED_DEVICE_RULE_KEYS:
+        raise PolicyError(
+            f"{label} must contain exactly selector, cpus, and label"
+        )
+    display_label = value["label"]
+    if (
+        not isinstance(display_label, str)
+        or display_label != display_label.strip()
+        or len(display_label) > 128
+        or not display_label.isprintable()
+    ):
+        raise PolicyError(f"{label}.label is not safe display text")
+    cpus = parse_cpu_list(value["cpus"], f"{label} CPUs", max(online))
+    if not cpus <= online:
+        raise PolicyError(f"{label} includes an offline CPU")
+    return {
+        "selector": normalize_selector(value["selector"], f"{label}.selector"),
+        "cpus": format_cpu_list(cpus),
+        "cpu_set": cpus,
+        "label": display_label,
+    }
+
+
+def normalize_default_policy(value, online):
+    if value is None:
+        return None
+    if not isinstance(value, dict) or set(value) != EXPECTED_DEFAULT_POLICY_KEYS:
+        raise PolicyError(
+            "default_policy must contain exactly housekeeping_cpus and "
+            "protected_cpus"
+        )
+    housekeeping = parse_cpu_list(
+        value["housekeeping_cpus"], "housekeeping CPUs", max(online)
+    )
+    protected = parse_cpu_list(
+        value["protected_cpus"], "protected CPUs", max(online)
+    )
+    if not housekeeping <= online:
+        raise PolicyError("housekeeping CPU set includes an offline CPU")
+    if not protected <= online:
+        raise PolicyError("protected CPU set includes an offline CPU")
+    overlap = housekeeping & protected
+    if overlap:
+        raise PolicyError(
+            "housekeeping and protected CPU sets overlap at "
+            + format_cpu_list(overlap)
+        )
+    unassigned = online - housekeeping - protected
+    if unassigned:
+        raise PolicyError(
+            "online CPUs have no policy role: " + format_cpu_list(unassigned)
+        )
+    validate_thread_sibling_roles(online, housekeeping, protected)
+    return {
+        "housekeeping": housekeeping,
+        "protected": protected,
+        "housekeeping_cpus": format_cpu_list(housekeeping),
+        "protected_cpus": format_cpu_list(protected),
+    }
+
+
+def normalize_policy_data(data):
+    if not isinstance(data, dict):
+        raise PolicyError("policy must be a JSON object")
+    online = load_online_cpus()
+    schema_version = data.get("schema_version")
+
+    if schema_version == 1:
+        if set(data) != EXPECTED_V1_CONFIG_KEYS:
+            raise PolicyError(
+                "schema v1 policy must contain exactly schema_version, "
+                "housekeeping_cpus, and protected_cpus"
+            )
+        default_policy = normalize_default_policy(
+            {
+                "housekeeping_cpus": data["housekeeping_cpus"],
+                "protected_cpus": data["protected_cpus"],
+            },
+            online,
+        )
+        device_rules = []
+    elif schema_version == 2:
+        if set(data) != EXPECTED_V2_CONFIG_KEYS:
+            raise PolicyError(
+                "schema v2 policy must contain exactly schema_version, "
+                "default_policy, and device_rules"
+            )
+        default_policy = normalize_default_policy(
+            data["default_policy"], online
+        )
+        if not isinstance(data["device_rules"], list):
+            raise PolicyError("device_rules must be a list")
+        device_rules = [
+            normalize_device_rule(rule, index, online)
+            for index, rule in enumerate(data["device_rules"])
+        ]
+        selectors = [
+            (rule["selector"]["kind"], rule["selector"]["value"])
+            for rule in device_rules
+        ]
+        if len(selectors) != len(set(selectors)):
+            raise PolicyError("device rule selectors must be unique")
+        if default_policy is None and not device_rules:
+            raise PolicyError(
+                "a policy needs default_policy, device_rules, or both"
+            )
+    else:
+        raise PolicyError(
+            f"unsupported policy schema_version: {schema_version!r}"
+        )
+
+    return {
+        "schema_version": schema_version,
+        "online": online,
+        "online_cpus": format_cpu_list(online),
+        "default_policy": default_policy,
+        "device_rules": device_rules,
+    }
+
+
+def require_secure_regular_file(path):
+    try:
+        details = path.lstat()
+    except OSError as error:
+        raise PolicyError(f"cannot inspect policy {path}: {error}") from error
+    if not stat.S_ISREG(details.st_mode):
+        raise PolicyError(f"policy must be a regular file, not a link: {path}")
+    if details.st_uid != 0:
+        raise PolicyError(f"policy must be owned by root: {path}")
+    if stat.S_IMODE(details.st_mode) & 0o022:
+        raise PolicyError(f"policy must not be group/world writable: {path}")
+
+
+def load_policy(path):
+    require_secure_regular_file(path)
+    try:
+        with path.open("r", encoding="utf-8") as policy_file:
+            data = json.load(policy_file)
+    except (OSError, json.JSONDecodeError) as error:
+        raise PolicyError(f"cannot read policy {path}: {error}") from error
+    return normalize_policy_data(data)
+
+
+def validate_thread_sibling_roles(online, housekeeping, protected):
+    checked = set()
+    for cpu in sorted(online):
+        siblings_path = (
+            CPU_ROOT / f"cpu{cpu}" / "topology" / "thread_siblings_list"
+        )
+        try:
+            siblings_text = siblings_path.read_text(
+                encoding="ascii"
+            ).strip()
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            raise PolicyError(
+                f"cannot read CPU {cpu} thread siblings: {error}"
+            ) from error
+
+        siblings = parse_cpu_list(
+            siblings_text,
+            f"CPU {cpu} thread siblings",
+        ) & online
+        sibling_key = frozenset(siblings)
+        if len(siblings) < 2 or sibling_key in checked:
+            continue
+        checked.add(sibling_key)
+        if siblings & housekeeping and siblings & protected:
+            raise PolicyError(
+                "SMT sibling group "
+                + format_cpu_list(siblings)
+                + " is split between housekeeping and protected roles"
+            )
+
+
+def process_ids_named(name):
+    matches = []
+    for process in pathlib.Path("/proc").iterdir():
+        if not process.name.isdigit():
+            continue
+        try:
+            process_name = (process / "comm").read_text(
+                encoding="utf-8"
+            ).strip()
+        except (FileNotFoundError, PermissionError, ProcessLookupError):
+            continue
+        if process_name == name:
+            matches.append(int(process.name))
+    return sorted(matches)
+
+
+def systemctl_state(operation):
+    environment = os.environ.copy()
+    environment["LC_ALL"] = "C"
+    completed = subprocess.run(
+        ["/usr/bin/systemctl", operation, "irqbalance.service"],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        env=environment,
+    )
+    return completed.returncode, completed.stdout.strip()
+
+
+def require_no_irqbalance():
+    active_rc, active_state = systemctl_state("is-active")
+    enabled_rc, enabled_state = systemctl_state("is-enabled")
+    manual_pids = process_ids_named("irqbalance")
+    safe_active_states = {"inactive", "failed", "unknown"}
+    safe_enabled_states = {"disabled", "masked", "not-found"}
+    if (
+        active_state not in safe_active_states
+        or enabled_state not in safe_enabled_states
+        or manual_pids
+    ):
+        raise PolicyError(
+            "irqbalance conflicts with static IRQ rules; stop and disable it "
+            "explicitly, or repair the systemctl query, then retry "
+            f"(active={active_state!r}/rc={active_rc}, "
+            f"enabled={enabled_state!r}/rc={enabled_rc}, "
+            f"pids={manual_pids})"
+        )
+
+
+def require_no_linuxcnc():
+    matches = {}
+    for name in sorted(LINUXCNC_PROCESS_NAMES):
+        process_ids = process_ids_named(name)
+        if process_ids:
+            matches[name] = process_ids
+    if matches:
+        raise PolicyError(
+            "refusing to change live IRQ affinity while LinuxCNC/RT processes "
+            f"are running: {json.dumps(matches, sort_keys=True)}"
+        )
+
+
+def write_virtual_file(path, value):
+    with path.open("w", encoding="ascii") as virtual_file:
+        virtual_file.write(value)
+
+
+def atomic_write_result(path, result):
+    directory = path.parent
+    directory.mkdir(mode=0o755, parents=True, exist_ok=True)
+    details = directory.lstat()
+    if not stat.S_ISDIR(details.st_mode) or details.st_uid != 0:
+        raise PolicyError(f"unsafe result directory: {directory}")
+    if stat.S_IMODE(details.st_mode) & 0o022:
+        raise PolicyError(f"result directory is group/world writable: {directory}")
+
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=".irq-affinity-result-",
+        suffix=".json",
+        dir=directory,
+        text=True,
+    )
+    temporary_path = pathlib.Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as result_file:
+            json.dump(result, result_file, indent=2, sort_keys=True)
+            result_file.write("\n")
+            result_file.flush()
+            os.fsync(result_file.fileno())
+        temporary_path.chmod(0o644)
+        os.replace(temporary_path, path)
+    finally:
+        try:
+            temporary_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def empty_irq_counts():
+    return {
+        "applied": 0,
+        "constrained": 0,
+        "kernel_managed": 0,
+        "unwritable": 0,
+        "no_affinity_interface": 0,
+        "disappeared": 0,
+        "failed": 0,
+    }
+
+
+def empty_device_rule_counts():
+    return {
+        "configured": 0,
+        "matched": 0,
+        "no_match": 0,
+        "unsafe_selector": 0,
+        "ambiguous_selector": 0,
+        "applied": 0,
+        "partial": 0,
+        "failed": 0,
+    }
+
+
+def new_result(operation):
+    return {
+        "schema_version": 2,
+        "operation": operation,
+        "generated_at": datetime.datetime.now(
+            datetime.timezone.utc
+        ).isoformat().replace("+00:00", "Z"),
+        "status": "failed",
+        "message": "",
+        "policy": {
+            "default_policy": None,
+            "device_rules": [],
+        },
+        "online_cpus": "",
+        "default_smp_affinity": "",
+        "counts": empty_irq_counts(),
+        "irqs": [],
+        "device_rule_counts": empty_device_rule_counts(),
+        "device_rules": [],
+    }
+
+
+def classify_irq(irq, desired_list):
+    affinity_path = IRQ_ROOT / str(irq) / "smp_affinity_list"
+    effective_path = IRQ_ROOT / str(irq) / "effective_affinity_list"
+    record = {
+        "irq": irq,
+        "status": "",
+        "requested": desired_list,
+        "effective": "",
+        "detail": "",
+    }
+
+    try:
+        details = affinity_path.stat()
+    except FileNotFoundError:
+        record["status"] = "no_affinity_interface"
+        record["detail"] = "smp_affinity_list is not exposed"
+        return record
+    except OSError as error:
+        record["status"] = "failed"
+        record["detail"] = f"cannot inspect smp_affinity_list: {error}"
+        return record
+
+    if not stat.S_IMODE(details.st_mode) & (
+        stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH
+    ):
+        record["status"] = "unwritable"
+        record["detail"] = "smp_affinity_list has no writable mode bits"
+        return record
+
+    try:
+        write_virtual_file(affinity_path, desired_list)
+    except FileNotFoundError:
+        record["status"] = "disappeared"
+        record["detail"] = "IRQ disappeared while applying policy"
+        return record
+    except OSError as error:
+        if error.errno in (errno.EIO, errno.EINVAL, errno.ENODEV, errno.ENOSYS):
+            record["status"] = "kernel_managed"
+            record["detail"] = (
+                "kernel rejected the affinity change; IRQ is managed or "
+                f"controller-constrained: {error}"
+            )
+        elif error.errno in (errno.EACCES, errno.EPERM, errno.EROFS):
+            record["status"] = "unwritable"
+            record["detail"] = f"kernel interface is not writable: {error}"
+        else:
+            record["status"] = "failed"
+            record["detail"] = f"unexpected write failure: {error}"
+        return record
+
+    try:
+        effective_text = effective_path.read_text(encoding="ascii").strip()
+        effective_cpus = parse_cpu_list(effective_text, "effective affinity")
+        desired_cpus = parse_cpu_list(desired_list, "requested affinity")
+        record["effective"] = format_cpu_list(effective_cpus)
+        if effective_cpus == desired_cpus:
+            record["status"] = "applied"
+            record["detail"] = "requested and effective affinities match"
+        else:
+            record["status"] = "constrained"
+            record["detail"] = (
+                "kernel accepted the request but effective affinity is "
+                "controller-constrained"
+            )
+    except (OSError, PolicyError) as error:
+        record["status"] = "constrained"
+        record["detail"] = (
+            "affinity write succeeded but effective affinity could not be "
+            f"verified: {error}"
+        )
+    return record
+
+
+def numeric_irq_directories():
+    irqs = []
+    try:
+        entries = IRQ_ROOT.iterdir()
+    except OSError as error:
+        raise PolicyError(f"cannot enumerate {IRQ_ROOT}: {error}") from error
+    for entry in entries:
+        if entry.name.isdigit():
+            irqs.append(int(entry.name))
+    return sorted(irqs)
+
+
+def read_irq_identity(irq):
+    directory = SYS_IRQ_ROOT / str(irq)
+    try:
+        actions_text = (directory / "actions").read_text(
+            encoding="utf-8"
+        ).strip()
+    except (FileNotFoundError, PermissionError):
+        actions_text = ""
+    except OSError as error:
+        raise PolicyError(f"cannot read IRQ {irq} actions: {error}") from error
+    actions = [
+        token.strip()
+        for token in actions_text.split(",")
+        if token.strip()
+    ]
+
+    try:
+        chip_name = (directory / "chip_name").read_text(
+            encoding="ascii"
+        ).strip()
+    except (FileNotFoundError, PermissionError):
+        chip_name = ""
+    except OSError as error:
+        raise PolicyError(f"cannot read IRQ {irq} chip_name: {error}") from error
+    match = PCI_BDF_AT_END_PATTERN.search(chip_name)
+    pci_bdf = match.group(1).lower() if match else ""
+    return {
+        "irq": irq,
+        "actions": actions,
+        "chip_name": chip_name,
+        "pci_bdf": pci_bdf,
+    }
+
+
+def resolve_device_rules(rules, irqs=None):
+    if irqs is None:
+        irqs = numeric_irq_directories()
+    identities = [read_irq_identity(irq) for irq in irqs]
+    plans = []
+
+    for rule in rules:
+        selector = rule["selector"]
+        if selector["kind"] == "pci_bdf":
+            matches = [
+                identity
+                for identity in identities
+                if identity["pci_bdf"] == selector["value"]
+            ]
+        else:
+            matches = [
+                identity
+                for identity in identities
+                if selector["value"] in identity["actions"]
+            ]
+
+        plan = {
+            "rule": rule,
+            "status": "ready",
+            "detail": "",
+            "matched_identities": matches,
+            "apply_irqs": [identity["irq"] for identity in matches],
+        }
+        if not matches:
+            plan["status"] = "no_match"
+            plan["detail"] = "no current IRQ matches the stable selector"
+            plan["apply_irqs"] = []
+        elif selector["kind"] == "action" and any(
+            identity["pci_bdf"] for identity in matches
+        ):
+            plan["status"] = "unsafe_selector"
+            plan["detail"] = (
+                "action selectors cannot target PCI-backed IRQs; use the "
+                "exact PCI BDF so all vectors belong to one device"
+            )
+            plan["apply_irqs"] = []
+        elif selector["kind"] == "action" and len(matches) != 1:
+            plan["status"] = "ambiguous_selector"
+            plan["detail"] = (
+                "non-PCI action selector matched more than one IRQ and cannot "
+                "identify exactly one device"
+            )
+            plan["apply_irqs"] = []
+        plans.append(plan)
+
+    irq_to_plans = {}
+    for index, plan in enumerate(plans):
+        if plan["status"] != "ready":
+            continue
+        for irq in plan["apply_irqs"]:
+            irq_to_plans.setdefault(irq, []).append(index)
+    ambiguous_indexes = {
+        index
+        for indexes in irq_to_plans.values()
+        if len(indexes) > 1
+        for index in indexes
+    }
+    for index in sorted(ambiguous_indexes):
+        plan = plans[index]
+        overlaps = sorted(
+            irq
+            for irq in plan["apply_irqs"]
+            if len(irq_to_plans.get(irq, [])) > 1
+        )
+        plan["status"] = "ambiguous_selector"
+        plan["detail"] = (
+            "selector overlaps another device rule at current IRQs "
+            + ",".join(str(irq) for irq in overlaps)
+        )
+        plan["apply_irqs"] = []
+    return plans
+
+
+def public_device_rule(rule):
+    return {
+        "selector": dict(rule["selector"]),
+        "cpus": rule["cpus"],
+        "label": rule["label"],
+    }
+
+
+def new_device_rule_record(plan):
+    rule = plan["rule"]
+    return {
+        "selector": dict(rule["selector"]),
+        "label": rule["label"],
+        "requested": rule["cpus"],
+        "status": plan["status"],
+        "detail": plan["detail"],
+        "matched_irqs": [
+            identity["irq"] for identity in plan["matched_identities"]
+        ],
+        "counts": empty_irq_counts(),
+        "irqs": [],
+    }
+
+
+def finalize_device_rule_record(record):
+    if record["status"] != "ready":
+        return
+    counts = record["counts"]
+    if counts["failed"]:
+        record["status"] = "failed"
+        record["detail"] = "one or more affinity writes failed unexpectedly"
+    elif (
+        counts["constrained"]
+        or counts["kernel_managed"]
+        or counts["unwritable"]
+        or counts["no_affinity_interface"]
+        or counts["disappeared"]
+    ):
+        record["status"] = "partial"
+        record["detail"] = (
+            "some matching IRQs are kernel-managed, unwritable, missing, or "
+            "controller-constrained"
+        )
+    else:
+        record["status"] = "applied"
+        record["detail"] = "all matching IRQs have the requested affinity"
+
+
+def summarize_device_rules(records):
+    summary = empty_device_rule_counts()
+    summary["configured"] = len(records)
+    for record in records:
+        if record["matched_irqs"]:
+            summary["matched"] += 1
+        if record["status"] in summary:
+            summary[record["status"]] += 1
+    return summary
+
+
+def apply_device_plans(plans):
+    records = []
+    for plan in plans:
+        record = new_device_rule_record(plan)
+        if plan["status"] == "ready":
+            for irq in plan["apply_irqs"]:
+                irq_record = classify_irq(irq, plan["rule"]["cpus"])
+                record["irqs"].append(irq_record)
+                record["counts"][irq_record["status"]] += 1
+                print(
+                    f"device {plan['rule']['selector']['kind']}="
+                    f"{plan['rule']['selector']['value']}; IRQ {irq}: "
+                    f"{irq_record['status']}; "
+                    f"requested={irq_record['requested']}; "
+                    f"effective={irq_record['effective'] or 'unknown'}; "
+                    f"{irq_record['detail']}"
+                )
+            finalize_device_rule_record(record)
+        else:
+            print(
+                f"device {plan['rule']['selector']['kind']}="
+                f"{plan['rule']['selector']['value']}: "
+                f"{record['status']}; {record['detail']}"
+            )
+        records.append(record)
+    return records
+
+
+def require_live_device_plans_writable(plans):
+    blockers = []
+    inspected = set()
+    for plan in plans:
+        if plan["status"] != "ready":
+            continue
+        for irq in plan["apply_irqs"]:
+            if irq in inspected:
+                continue
+            inspected.add(irq)
+            affinity_path = IRQ_ROOT / str(irq) / "smp_affinity_list"
+            try:
+                details = affinity_path.stat()
+            except FileNotFoundError:
+                blockers.append(
+                    {
+                        "irq": irq,
+                        "reason": "smp_affinity_list is not exposed",
+                    }
+                )
+                continue
+            except OSError as error:
+                blockers.append(
+                    {
+                        "irq": irq,
+                        "reason": f"cannot inspect smp_affinity_list: {error}",
+                    }
+                )
+                continue
+            if not stat.S_IMODE(details.st_mode) & (
+                stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH
+            ):
+                blockers.append(
+                    {
+                        "irq": irq,
+                        "reason": "smp_affinity_list has no writable mode bits",
+                    }
+                )
+
+    if blockers:
+        blocking_text = "; ".join(
+            f"IRQ {blocker['irq']} ({blocker['reason']})"
+            for blocker in blockers
+        )
+        raise PolicyError(
+            "live device preflight failed; no IRQ affinity was changed; "
+            f"blocking vectors: {blocking_text}"
+        )
+
+
+def policy_result_data(policy):
+    default_policy = policy["default_policy"]
+    return {
+        "default_policy": (
+            {
+                "housekeeping_cpus": default_policy["housekeeping_cpus"],
+                "protected_cpus": default_policy["protected_cpus"],
+            }
+            if default_policy is not None
+            else None
+        ),
+        "device_rules": [
+            public_device_rule(rule) for rule in policy["device_rules"]
+        ],
+    }
+
+
+def store_result(result_path, result):
+    result["generated_at"] = datetime.datetime.now(
+        datetime.timezone.utc
+    ).isoformat().replace("+00:00", "Z")
+    try:
+        atomic_write_result(result_path, result)
+    except (OSError, PolicyError) as error:
+        print(f"cannot write result file {result_path}: {error}", file=sys.stderr)
+        return False
+    print(
+        "IRQ affinity broad-policy summary: "
+        + json.dumps(result["counts"], sort_keys=True)
+    )
+    print(
+        "IRQ affinity device-rule summary: "
+        + json.dumps(result["device_rule_counts"], sort_keys=True)
+    )
+    return True
+
+
+def apply_policy(config_path, result_path):
+    result = new_result("boot_apply")
+    return_code = 1
+    try:
+        policy = load_policy(config_path)
+        result["policy"] = policy_result_data(policy)
+        result["online_cpus"] = policy["online_cpus"]
+
+        require_no_linuxcnc()
+        require_no_irqbalance()
+        plans = resolve_device_rules(policy["device_rules"])
+        result["device_rules"] = [
+            new_device_rule_record(plan) for plan in plans
+        ]
+        result["device_rule_counts"] = summarize_device_rules(
+            result["device_rules"]
+        )
+        blockers = [
+            record
+            for record in result["device_rules"]
+            if record["status"] in {"unsafe_selector", "ambiguous_selector"}
+        ]
+        if blockers:
+            raise PolicyError(
+                "unsafe or ambiguous device selectors were left unchanged; "
+                "inspect device_rules in the result"
+            )
+
+        default_policy = policy["default_policy"]
+        if default_policy is not None:
+            default_mask = format_cpu_mask(default_policy["housekeeping"])
+            try:
+                write_virtual_file(DEFAULT_AFFINITY, default_mask)
+            except OSError as error:
+                raise PolicyError(
+                    f"cannot set {DEFAULT_AFFINITY} to {default_mask}: {error}"
+                ) from error
+            result["default_smp_affinity"] = default_mask
+            print(
+                f"default_smp_affinity: applied mask {default_mask} "
+                f"({default_policy['housekeeping_cpus']})"
+            )
+
+            for irq in numeric_irq_directories():
+                record = classify_irq(
+                    irq, default_policy["housekeeping_cpus"]
+                )
+                result["irqs"].append(record)
+                result["counts"][record["status"]] += 1
+                print(
+                    f"IRQ {irq}: {record['status']}; "
+                    f"requested={record['requested']}; "
+                    f"effective={record['effective'] or 'unknown'}; "
+                    f"{record['detail']}"
+                )
+
+        result["device_rules"] = apply_device_plans(plans)
+        result["device_rule_counts"] = summarize_device_rules(
+            result["device_rules"]
+        )
+        if result["counts"]["failed"] or result["device_rule_counts"]["failed"]:
+            raise PolicyError(
+                "one or more IRQ affinity writes failed unexpectedly; "
+                "inspect the result records"
+            )
+
+        warnings = (
+            result["counts"]["constrained"]
+            + result["counts"]["kernel_managed"]
+            + result["counts"]["unwritable"]
+            + result["counts"]["no_affinity_interface"]
+            + result["counts"]["disappeared"]
+            + result["device_rule_counts"]["no_match"]
+            + result["device_rule_counts"]["partial"]
+        )
+        result["status"] = "applied_with_warnings" if warnings else "applied"
+        result["message"] = (
+            "IRQ policy applied; device selectors were resolved at runtime "
+            "without persisting numeric IRQ identifiers"
+        )
+        return_code = 0
+    except (OSError, PolicyError) as error:
+        result["status"] = "failed"
+        result["message"] = str(error)
+        print(f"IRQ affinity apply failed: {error}", file=sys.stderr)
+
+    if not store_result(result_path, result):
+        return 1
+    return return_code
+
+
+def apply_device_live(rule_data, result_path):
+    result = new_result("apply_device_live")
+    return_code = 1
+    try:
+        online = load_online_cpus()
+        rule = normalize_device_rule(rule_data, 0, online)
+        result["online_cpus"] = format_cpu_list(online)
+        result["policy"]["device_rules"] = [public_device_rule(rule)]
+
+        require_no_linuxcnc()
+        require_no_irqbalance()
+        plans = resolve_device_rules([rule])
+        result["device_rules"] = [
+            new_device_rule_record(plan) for plan in plans
+        ]
+        result["device_rule_counts"] = summarize_device_rules(
+            result["device_rules"]
+        )
+        require_live_device_plans_writable(plans)
+        result["device_rules"] = apply_device_plans(plans)
+        result["device_rule_counts"] = summarize_device_rules(
+            result["device_rules"]
+        )
+        record = result["device_rules"][0]
+        if record["status"] != "applied":
+            raise PolicyError(
+                "selected device rule was not fully applied; "
+                f"status={record['status']}; {record['detail']}"
+            )
+        result["status"] = "applied"
+        result["message"] = (
+            "selected device rule was applied live after LinuxCNC/RT and "
+            "irqbalance safety checks"
+        )
+        return_code = 0
+    except (OSError, PolicyError) as error:
+        result["status"] = "failed"
+        result["message"] = str(error)
+        print(f"live device IRQ apply failed: {error}", file=sys.stderr)
+
+    if not store_result(result_path, result):
+        return 1
+    return return_code
+
+
+def parse_arguments():
+    parser = argparse.ArgumentParser(description=__doc__)
+    operation = parser.add_mutually_exclusive_group(required=True)
+    operation.add_argument(
+        "--apply",
+        action="store_true",
+        help="apply the persistent policy to current IRQs",
+    )
+    operation.add_argument(
+        "--apply-device-live",
+        action="store_true",
+        help="explicitly apply one stable device rule to current IRQs",
+    )
+    operation.add_argument(
+        "--validate-config",
+        metavar="PATH",
+        type=pathlib.Path,
+        help="validate a policy without changing IRQ affinity",
+    )
+    parser.add_argument(
+        "--config",
+        type=pathlib.Path,
+        default=DEFAULT_CONFIG,
+        help=f"policy path for --apply (default: {DEFAULT_CONFIG})",
+    )
+    parser.add_argument(
+        "--rule-json",
+        help="strict device-rule JSON for --apply-device-live",
+    )
+    parser.add_argument(
+        "--result",
+        type=pathlib.Path,
+        help="result path (uses a namespaced default for each operation)",
+    )
+    return parser.parse_args()
+
+
+def main():
+    arguments = parse_arguments()
+    if arguments.validate_config is not None:
+        try:
+            policy = load_policy(arguments.validate_config)
+        except PolicyError as error:
+            print(f"invalid IRQ-affinity policy: {error}", file=sys.stderr)
+            return 1
+        default_policy = policy["default_policy"]
+        default_text = "none"
+        if default_policy is not None:
+            default_text = (
+                f"housekeeping={default_policy['housekeeping_cpus']}, "
+                f"protected={default_policy['protected_cpus']}"
+            )
+        print(
+            f"valid IRQ-affinity policy: default_policy={default_text}, "
+            f"device_rules={len(policy['device_rules'])}, "
+            f"online={policy['online_cpus']}"
+        )
+        return 0
+    if arguments.apply_device_live:
+        if arguments.rule_json is None:
+            print(
+                "--rule-json is required with --apply-device-live",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            rule_data = json.loads(arguments.rule_json)
+        except json.JSONDecodeError as error:
+            print(f"invalid --rule-json: {error}", file=sys.stderr)
+            return 2
+        return apply_device_live(
+            rule_data,
+            arguments.result or DEFAULT_LIVE_RESULT,
+        )
+    if arguments.rule_json is not None:
+        print(
+            "--rule-json is valid only with --apply-device-live",
+            file=sys.stderr,
+        )
+        return 2
+    return apply_policy(
+        arguments.config,
+        arguments.result or DEFAULT_RESULT,
+    )
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -60,10 +60,13 @@ func TestAutologinSubmenuStructure(t *testing.T) {
 	if mainSections[1].action != actionInstallSway {
 		t.Fatal("Sway installation should follow Ansible installation")
 	}
-	if mainSections[2].action != actionOpenLinuxCNCAutostart {
-		t.Fatal("LinuxCNC autostart should follow Sway installation")
+	if mainSections[2].action != actionOpenDevTools {
+		t.Fatal("developer-tools submenu should follow Sway installation")
 	}
-	if mainSections[3].action != actionOpenAutologin {
+	if mainSections[3].action != actionOpenLinuxCNCAutostart {
+		t.Fatal("LinuxCNC autostart should follow developer-tools installation")
+	}
+	if mainSections[4].action != actionOpenAutologin {
 		t.Fatal("automatic login should follow LinuxCNC autostart")
 	}
 	if autologinSections[0].action != actionAutologinLightDM {
@@ -75,14 +78,14 @@ func TestAutologinSubmenuStructure(t *testing.T) {
 	if autologinSections[2].action != actionBack {
 		t.Fatal("automatic-login submenu should end with a back action")
 	}
-	if mainSections[4].action != actionReboot {
+	if mainSections[5].action != actionReboot {
 		t.Fatal("reboot should follow the automatic-login submenu")
 	}
 }
 
 func TestEnterAndLeaveAutologinSubmenu(t *testing.T) {
 	model := New()
-	model.selected = 3
+	model.selected = 4
 	model.prepareSelectedAction()
 
 	if model.page != menuAutologin || model.selected != 0 {
@@ -95,7 +98,7 @@ func TestEnterAndLeaveAutologinSubmenu(t *testing.T) {
 	}
 
 	result := updated.(Model)
-	if result.page != menuMain || result.selected != 3 {
+	if result.page != menuMain || result.selected != 4 {
 		t.Fatalf("Esc returned to page %d selection %d", result.page, result.selected)
 	}
 }
@@ -109,6 +112,248 @@ func TestLinuxCNCAutostartSubmenuStructure(t *testing.T) {
 	}
 	if linuxCNCAutostartSections[2].action != actionBack {
 		t.Fatal("LinuxCNC autostart submenu should end with a back action")
+	}
+}
+
+func TestConfigurationSubmenuStructure(t *testing.T) {
+	if mainSections[7].action != actionOpenConfiguration {
+		t.Fatal("Configuration should open its submenu")
+	}
+	if configurationSections[0].action != actionInstallLinuxCNCConfig {
+		t.Fatal("CorvusCNC should be the first configuration installer")
+	}
+	if configurationSections[1].action != actionOpenIRQAffinity {
+		t.Fatal("IRQ affinity should follow the CorvusCNC installer")
+	}
+	if configurationSections[2].action != actionBack {
+		t.Fatal("configuration submenu should end with a back action")
+	}
+	if irqAffinitySections[0].action != actionIRQDevices {
+		t.Fatal("the live IRQ device table should be the first IRQ affinity option")
+	}
+	if irqAffinitySections[1].action != actionIRQStatus {
+		t.Fatal("IRQ status should follow the device table")
+	}
+	if irqAffinitySections[2].action != actionIRQGuidedSetup {
+		t.Fatal("the default policy should follow IRQ status")
+	}
+	if irqAffinitySections[3].action != actionIRQDisable {
+		t.Fatal("disable should follow the default policy")
+	}
+}
+
+func TestEnterAndLeaveConfigurationSubmenu(t *testing.T) {
+	model := New()
+	model.selected = 7
+	model.prepareSelectedAction()
+
+	if model.page != menuConfiguration || model.selected != 0 {
+		t.Fatalf("entering Configuration produced page %d selection %d", model.page, model.selected)
+	}
+
+	updated, command := model.Update(tea.KeyPressMsg{Code: tea.KeyEscape})
+	if command != nil {
+		t.Fatal("leaving Configuration should not execute a command")
+	}
+	result := updated.(Model)
+	if result.page != menuMain || result.selected != 7 {
+		t.Fatalf("Esc returned to page %d selection %d", result.page, result.selected)
+	}
+}
+
+func TestIRQCPUSelectionAndValidation(t *testing.T) {
+	model := New()
+	model.page = menuIRQCPUs
+	model.irqSnapshotLoaded = true
+	model.irqSnapshot = IRQSnapshot{OnlineCPUs: []int{0, 1, 2, 3, 4, 5}}
+	model.irqProtectedCPUs = []int{4, 5}
+	model.rebuildIRQCPUSections()
+
+	if len(model.irqCPUSections) != 8 {
+		t.Fatalf("CPU page has %d entries; want six CPUs, Continue, and Back", len(model.irqCPUSections))
+	}
+	if err := model.validateIRQDraft(); err != nil {
+		t.Fatalf("recommended policy is invalid: %v", err)
+	}
+	if !strings.Contains(model.irqCPUSections[4].title, "[x]") {
+		t.Fatal("protected CPU is not visibly selected")
+	}
+
+	model.toggleIRQCPU("3")
+	if !containsCPU(model.irqProtectedCPUs, 3) {
+		t.Fatal("toggling CPU 3 did not protect it")
+	}
+	model.toggleIRQCPU("0")
+	model.toggleIRQCPU("1")
+	model.toggleIRQCPU("2")
+	if containsCPU(model.irqProtectedCPUs, 2) {
+		t.Fatal("the UI allowed every online CPU to become protected")
+	}
+	if !strings.Contains(model.status, "At least one CPU") {
+		t.Fatalf("unexpected all-protected warning: %q", model.status)
+	}
+}
+
+func TestIRQReviewView(t *testing.T) {
+	model := New()
+	model.page = menuIRQReview
+	model.width = 160
+	model.irqSnapshotLoaded = true
+	model.irqSnapshot = IRQSnapshot{
+		OnlineCPUs: []int{0, 1, 2, 3, 4, 5},
+		IRQs:       make([]IRQEntry, 12),
+	}
+	model.irqProtectedCPUs = []int{4, 5}
+	view := model.View()
+
+	for _, expected := range []string{
+		"Protected LinuxCNC CPUs: 4-5",
+		"Housekeeping/IRQ CPUs:   0-3",
+		"Nothing is applied to live IRQs now",
+		"Preview Ansible changes",
+	} {
+		if !strings.Contains(view.Content, expected) {
+			t.Fatalf("IRQ review does not contain %q", expected)
+		}
+	}
+}
+
+func TestIRQApplyConfirmationView(t *testing.T) {
+	model := New()
+	model.page = menuIRQReview
+	model.selected = 1
+	model.width = 160
+	model.confirming = true
+	model.irqSnapshotLoaded = true
+	model.irqSnapshot = IRQSnapshot{OnlineCPUs: []int{0, 1, 2, 3}}
+	model.irqProtectedCPUs = []int{3}
+	view := model.View()
+
+	for _, expected := range []string{
+		"Enable this IRQ policy?",
+		"next boot",
+		"not change live IRQs",
+		"will not",
+	} {
+		if !strings.Contains(view.Content, expected) {
+			t.Fatalf("IRQ apply confirmation does not contain %q", expected)
+		}
+	}
+}
+
+func TestIRQStatusShowsManagedPolicyAndBootResult(t *testing.T) {
+	model := New()
+	model.irqSnapshotLoaded = true
+	model.irqSnapshot = IRQSnapshot{
+		OnlineCPUs: []int{0, 1, 2, 3},
+		ManagedPolicy: ManagedIRQPolicyStatus{
+			Config:  ManagedIRQComponentStatus{Present: true},
+			Helper:  ManagedIRQComponentStatus{Present: true},
+			Service: ManagedIRQComponentStatus{Present: true},
+			Enabled: true,
+			ConfigData: &ManagedIRQConfig{
+				HousekeepingCPUs: []int{0, 1, 2},
+				ProtectedCPUs:    []int{3},
+			},
+			ResultData: &ManagedIRQResult{
+				GeneratedAt: "2026-07-26T12:00:00Z",
+				Status:      "applied",
+				Message:     "policy applied",
+				Policy: ManagedIRQResultPolicy{
+					HousekeepingCPUs: []int{0, 1, 2},
+					ProtectedCPUs:    []int{3},
+				},
+				Counts: ManagedIRQResultCounts{
+					Applied:       7,
+					Constrained:   2,
+					KernelManaged: 3,
+					Unwritable:    1,
+					Failed:        0,
+				},
+			},
+		},
+	}
+
+	status := model.renderIRQStatus()
+	for _, expected := range []string{
+		"Protected CPUs:    3",
+		"Housekeeping CPUs: 0-2",
+		"Last boot result:     applied",
+		"Applied/constrained: 7/2",
+		"Kernel-managed:     3",
+		"Unwritable/failed:  1/0",
+		"2026-07-26T12:00:00Z",
+		"policy applied",
+	} {
+		if !strings.Contains(status, expected) {
+			t.Errorf("IRQ status does not contain %q:\n%s", expected, status)
+		}
+	}
+}
+
+func TestIRQSMTSiblingsMoveTogether(t *testing.T) {
+	model := New()
+	model.irqSnapshotLoaded = true
+	model.irqSnapshot = IRQSnapshot{
+		OnlineCPUs: []int{0, 1, 2, 3},
+		CPUs: []CPUInfo{
+			{ID: 0, ThreadSiblings: []int{0, 2}},
+			{ID: 1, ThreadSiblings: []int{1, 3}},
+			{ID: 2, ThreadSiblings: []int{0, 2}},
+			{ID: 3, ThreadSiblings: []int{1, 3}},
+		},
+	}
+	model.irqProtectedCPUs = []int{2}
+	if err := model.validateIRQDraft(); err == nil || !strings.Contains(err.Error(), "SMT sibling") {
+		t.Fatalf("split SMT policy error = %v", err)
+	}
+
+	model.irqProtectedCPUs = model.expandIRQSiblingGroups(model.irqProtectedCPUs)
+	if got := FormatCPUList(model.irqProtectedCPUs); got != "0,2" {
+		t.Fatalf("expanded protected CPUs = %q; want 0,2", got)
+	}
+	if err := model.validateIRQDraft(); err != nil {
+		t.Fatalf("whole-core SMT policy is invalid: %v", err)
+	}
+
+	model.rebuildIRQCPUSections()
+	model.toggleIRQCPU("1")
+	if got := FormatCPUList(model.irqProtectedCPUs); got != "0,2" {
+		t.Fatalf("all-protected guard changed CPUs to %q", got)
+	}
+	if !strings.Contains(model.status, "At least one CPU") {
+		t.Fatalf("unexpected all-protected status: %q", model.status)
+	}
+
+	model.toggleIRQCPU("2")
+	if len(model.irqProtectedCPUs) != 0 {
+		t.Fatalf("removing CPU 2 did not remove sibling group: %v", model.irqProtectedCPUs)
+	}
+}
+
+func TestIRQManagedPolicyDetectsResultOnlyCleanup(t *testing.T) {
+	model := New()
+	model.irqSnapshot.ManagedPolicy.Result = ManagedIRQComponentStatus{Present: true}
+	if !model.irqManagedPolicyPresent() {
+		t.Fatal("a stale managed result should be eligible for cleanup")
+	}
+	if got := renderManagedIRQState(model.irqSnapshot.ManagedPolicy); got != "partial installation detected" {
+		t.Fatalf("result-only managed state = %q", got)
+	}
+}
+
+func TestIRQBalanceStateShowsEnabledConflict(t *testing.T) {
+	got := renderIRQBalanceState(IRQBalanceStatus{
+		Installed:    true,
+		Active:       false,
+		ActiveKnown:  true,
+		Enabled:      true,
+		EnabledKnown: true,
+	})
+	for _, expected := range []string{"inactive", "enabled", "must be resolved"} {
+		if !strings.Contains(got, expected) {
+			t.Fatalf("irqbalance state %q does not contain %q", got, expected)
+		}
 	}
 }
 
@@ -161,7 +406,7 @@ func TestEnterAndLeaveLinuxCNCAutostartMenus(t *testing.T) {
 	t.Setenv(linuxCNCConfigDirectoryEnvironment, root)
 
 	model := New()
-	model.selected = 2
+	model.selected = 3
 	model.prepareSelectedAction()
 	if model.page != menuLinuxCNCAutostart || model.selected != 0 {
 		t.Fatalf("entering platform menu produced page %d selection %d", model.page, model.selected)
@@ -192,7 +437,7 @@ func TestEnterAndLeaveLinuxCNCAutostartMenus(t *testing.T) {
 		t.Fatal("leaving the platform menu should not execute a command")
 	}
 	result = updated.(Model)
-	if result.page != menuMain || result.selected != 2 {
+	if result.page != menuMain || result.selected != 3 {
 		t.Fatalf("second Esc returned to page %d selection %d", result.page, result.selected)
 	}
 }
@@ -311,7 +556,7 @@ func TestAutologinCancellationNamesSelectedAction(t *testing.T) {
 
 func TestRebootConfirmationView(t *testing.T) {
 	model := New()
-	model.selected = 4
+	model.selected = 5
 	model.confirming = true
 	view := model.View()
 

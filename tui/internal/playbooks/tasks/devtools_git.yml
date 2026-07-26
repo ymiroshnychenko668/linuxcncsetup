@@ -1,0 +1,155 @@
+---
+- name: Read the configured global Git user name
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/git
+      - config
+      - --global
+      - --get
+      - user.name
+  become: true
+  become_user: "{{ target_user }}"
+  environment:
+    HOME: "{{ devtools_target_home }}"
+  register: devtools_current_git_name
+  changed_when: false
+  failed_when: devtools_current_git_name.rc not in [0, 1]
+  check_mode: false
+
+- name: Configure the global Git user name
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/git
+      - config
+      - --global
+      - user.name
+      - "{{ devtools_git_name }}"
+  become: true
+  become_user: "{{ target_user }}"
+  environment:
+    HOME: "{{ devtools_target_home }}"
+  when: devtools_current_git_name.stdout | trim != devtools_git_name
+  changed_when: true
+
+- name: Read the configured global Git email
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/git
+      - config
+      - --global
+      - --get
+      - user.email
+  become: true
+  become_user: "{{ target_user }}"
+  environment:
+    HOME: "{{ devtools_target_home }}"
+  register: devtools_current_git_email
+  changed_when: false
+  failed_when: devtools_current_git_email.rc not in [0, 1]
+  check_mode: false
+
+- name: Configure the global Git email
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/git
+      - config
+      - --global
+      - user.email
+      - "{{ devtools_git_email }}"
+  become: true
+  become_user: "{{ target_user }}"
+  environment:
+    HOME: "{{ devtools_target_home }}"
+  when: devtools_current_git_email.stdout | trim != devtools_git_email
+  changed_when: true
+
+- name: Inspect the SSH configuration directory
+  ansible.builtin.stat:
+    path: "{{ devtools_target_home }}/.ssh"
+    follow: false
+  register: devtools_ssh_directory
+
+- name: Reject an unsafe SSH configuration path
+  ansible.builtin.assert:
+    that:
+      - not devtools_ssh_directory.stat.exists or devtools_ssh_directory.stat.isdir
+      - not devtools_ssh_directory.stat.exists or not devtools_ssh_directory.stat.islnk
+    fail_msg: >-
+      The target user's .ssh path is not a regular directory. It was not
+      modified; repair or move the path and retry.
+
+- name: Create the SSH configuration directory
+  ansible.builtin.file:
+    path: "{{ devtools_target_home }}/.ssh"
+    state: directory
+    owner: "{{ target_user }}"
+    group: "{{ devtools_target_group_result.stdout | trim }}"
+    mode: "0700"
+  become: true
+
+- name: Inspect the GitHub SSH key pair
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+  loop:
+    - "{{ devtools_target_home }}/.ssh/id_ed25519"
+    - "{{ devtools_target_home }}/.ssh/id_ed25519.pub"
+  register: devtools_ssh_key_paths
+
+- name: Reject an incomplete or unsafe SSH key pair
+  ansible.builtin.assert:
+    that:
+      - not devtools_ssh_key_paths.results[1].stat.exists or devtools_ssh_key_paths.results[0].stat.exists
+      - not devtools_ssh_key_paths.results[0].stat.exists or devtools_ssh_key_paths.results[0].stat.isreg
+      - not devtools_ssh_key_paths.results[1].stat.exists or devtools_ssh_key_paths.results[1].stat.isreg
+    fail_msg: >-
+      The id_ed25519 key paths are not a safe key pair. No existing key was
+      overwritten; repair or move those paths and retry.
+
+- name: Generate the GitHub SSH key pair
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/ssh-keygen
+      - -t
+      - ed25519
+      - -C
+      - "{{ devtools_git_email }}"
+      - -f
+      - "{{ devtools_target_home }}/.ssh/id_ed25519"
+      - -N
+      - ""
+    creates: "{{ devtools_target_home }}/.ssh/id_ed25519"
+  become: true
+  become_user: "{{ target_user }}"
+  environment:
+    HOME: "{{ devtools_target_home }}"
+  when:
+    - not devtools_ssh_key_paths.results[0].stat.exists
+    - not devtools_ssh_key_paths.results[1].stat.exists
+
+- name: Recover a missing SSH public key from the private key
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/ssh-keygen
+      - -y
+      - -f
+      - "{{ devtools_target_home }}/.ssh/id_ed25519"
+  become: true
+  become_user: "{{ target_user }}"
+  environment:
+    HOME: "{{ devtools_target_home }}"
+  register: devtools_recovered_public_key
+  changed_when: true
+  when:
+    - devtools_ssh_key_paths.results[0].stat.exists
+    - not devtools_ssh_key_paths.results[1].stat.exists
+
+- name: Write the recovered SSH public key
+  ansible.builtin.copy:
+    dest: "{{ devtools_target_home }}/.ssh/id_ed25519.pub"
+    content: "{{ devtools_recovered_public_key.stdout | trim }} {{ devtools_git_email }}\n"
+    owner: "{{ target_user }}"
+    group: "{{ devtools_target_group_result.stdout | trim }}"
+    mode: "0644"
+  become: true
+  when: devtools_recovered_public_key is not skipped

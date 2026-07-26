@@ -1,0 +1,157 @@
+---
+- name: Install and configure developer tools
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  become: false
+
+  vars:
+    devtools_component: all
+    devtools_valid_components:
+      - all
+      - git
+      - vscode
+      - htop
+      - mc
+      - terminator
+      - linger
+    devtools_packages_by_component:
+      all:
+        - ca-certificates
+        - git
+        - gpg
+        - htop
+        - mc
+        - openssh-client
+        - terminator
+        - wget
+      git:
+        - git
+        - openssh-client
+      vscode:
+        - ca-certificates
+        - gpg
+        - wget
+      htop:
+        - htop
+      mc:
+        - mc
+      terminator:
+        - terminator
+      linger: []
+    devtools_git_name: cnc
+    devtools_git_email: cnc@cnc.cn
+    devtools_microsoft_key_url: https://packages.microsoft.com/keys/microsoft.asc
+    devtools_microsoft_key_source: /usr/share/keyrings/packages.microsoft.asc
+    devtools_microsoft_keyring: /usr/share/keyrings/packages.microsoft.gpg
+    devtools_vscode_repository: >-
+      deb [arch=amd64 signed-by=/usr/share/keyrings/packages.microsoft.gpg]
+      https://packages.microsoft.com/repos/vscode stable main
+
+  pre_tasks:
+    - name: Validate the requested developer-tools component
+      ansible.builtin.assert:
+        that:
+          - devtools_component is string
+          - devtools_component in devtools_valid_components
+          - ansible_facts["distribution"] == "Debian"
+        fail_msg: >-
+          devtools_component must be one of all, git, vscode, htop, mc,
+          terminator, or linger, and the target system must be Debian.
+
+    - name: Validate the Visual Studio Code architecture
+      ansible.builtin.assert:
+        that:
+          - ansible_facts["architecture"] == "x86_64"
+        fail_msg: The referenced Visual Studio Code repository is amd64-only.
+      when: devtools_component in ["all", "vscode"]
+
+    - name: Validate the target-user request
+      ansible.builtin.assert:
+        that:
+          - (target_user | default("")) is match("^[a-zA-Z_][a-zA-Z0-9_.-]*[$]?$")
+          - (target_user | default("")) != "root"
+        fail_msg: A regular non-root target_user is required for this component.
+      when: devtools_component in ["all", "git", "linger"]
+
+    - name: Read the target account
+      ansible.builtin.getent:
+        database: passwd
+        key: "{{ target_user }}"
+      when: devtools_component in ["all", "git", "linger"]
+
+    - name: Derive target account details
+      ansible.builtin.set_fact:
+        devtools_target_home: "{{ ansible_facts['getent_passwd'][target_user][4] }}"
+        devtools_target_uid: "{{ ansible_facts['getent_passwd'][target_user][1] | int }}"
+        devtools_target_shell: "{{ ansible_facts['getent_passwd'][target_user][5] }}"
+      when: devtools_component in ["all", "git", "linger"]
+
+    - name: Read the target account's primary group
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/id
+          - -gn
+          - --
+          - "{{ target_user }}"
+      register: devtools_target_group_result
+      changed_when: false
+      check_mode: false
+      when: devtools_component in ["all", "git"]
+
+    - name: Inspect the target home
+      ansible.builtin.stat:
+        path: "{{ devtools_target_home }}"
+        follow: true
+      register: devtools_target_home_status
+      when: devtools_component in ["all", "git", "linger"]
+
+    - name: Validate the target account
+      ansible.builtin.assert:
+        that:
+          - devtools_target_uid >= 1000
+          - devtools_target_uid <= 60000
+          - devtools_target_home is match("^/")
+          - not (devtools_target_shell is match("^.*/(nologin|false)$"))
+          - devtools_target_home_status.stat.exists
+          - devtools_target_home_status.stat.isdir
+        fail_msg: >-
+          target_user must be a regular login account with an existing home
+          directory and a usable shell.
+      when: devtools_component in ["all", "git", "linger"]
+
+  tasks:
+    - name: Install the selected developer packages
+      ansible.builtin.apt:
+        name: "{{ devtools_packages_by_component[devtools_component] }}"
+        state: present
+        update_cache: true
+      become: true
+      when: devtools_packages_by_component[devtools_component] | length > 0
+
+    - name: Configure Git and GitHub SSH
+      ansible.builtin.import_tasks: tasks/devtools_git.yml
+      when: devtools_component in ["all", "git"]
+
+    - name: Configure the Visual Studio Code repository
+      ansible.builtin.import_tasks: tasks/devtools_vscode.yml
+      when: devtools_component in ["all", "vscode"]
+
+    - name: Enable user lingering
+      ansible.builtin.import_tasks: tasks/devtools_linger.yml
+      when: devtools_component in ["all", "linger"]
+
+  post_tasks:
+    - name: Read the GitHub SSH public key
+      ansible.builtin.slurp:
+        src: "{{ devtools_target_home }}/.ssh/id_ed25519.pub"
+      register: devtools_ssh_public_key
+      when: devtools_component in ["all", "git"]
+
+    - name: Show the GitHub SSH public key
+      ansible.builtin.debug:
+        msg:
+          - "GitHub SSH public key:"
+          - "{{ devtools_ssh_public_key.content | b64decode | trim }}"
+          - "Add this key at https://github.com/settings/keys"
+      when: devtools_component in ["all", "git"]

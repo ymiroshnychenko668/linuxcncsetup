@@ -1,0 +1,251 @@
+---
+- name: Install the CorvusCNC LinuxCNC configuration
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  become: false
+
+  vars:
+    corvus_repository: git@github.com:ymiroshnychenko668/corvuscnc.git
+
+  pre_tasks:
+    - name: Validate the CorvusCNC installation request
+      ansible.builtin.assert:
+        that:
+          - ansible_facts["distribution"] == "Debian"
+          - (target_user | default("")) is match("^[a-zA-Z_][a-zA-Z0-9_.-]*[$]?$")
+          - (target_user | default("")) != "root"
+        fail_msg: >-
+          This playbook requires Debian and a regular non-root target_user.
+
+    - name: Read the target account
+      ansible.builtin.getent:
+        database: passwd
+        key: "{{ target_user }}"
+
+    - name: Read regular-user UID bounds
+      ansible.builtin.slurp:
+        src: /etc/login.defs
+      register: corvus_login_defs
+
+    - name: Derive target account details and UID bounds
+      ansible.builtin.set_fact:
+        corvus_target_home: "{{ ansible_facts['getent_passwd'][target_user][4] }}"
+        corvus_target_uid: "{{ ansible_facts['getent_passwd'][target_user][1] | int }}"
+        corvus_target_shell: "{{ ansible_facts['getent_passwd'][target_user][5] }}"
+        corvus_uid_min_matches: >-
+          {{
+            corvus_login_defs.content
+            | b64decode
+            | regex_findall('(?m)^\s*UID_MIN\s+(\d+)\s*$')
+          }}
+        corvus_uid_max_matches: >-
+          {{
+            corvus_login_defs.content
+            | b64decode
+            | regex_findall('(?m)^\s*UID_MAX\s+(\d+)\s*$')
+          }}
+
+    - name: Derive the CorvusCNC installation paths
+      ansible.builtin.set_fact:
+        corvus_config_root: "{{ corvus_target_home }}/linuxcnc/configs"
+        corvus_config_destination: "{{ corvus_target_home }}/linuxcnc/configs/corvuscnc"
+        corvus_git_environment: >-
+          {{
+            {"HOME": corvus_target_home}
+            | combine(
+                {"SSH_AUTH_SOCK": corvus_ssh_auth_sock | default("")}
+                if (corvus_ssh_auth_sock | default("") | length > 0)
+                else {}
+              )
+          }}
+
+    - name: Inspect the target home
+      ansible.builtin.stat:
+        path: "{{ corvus_target_home }}"
+        follow: true
+      register: corvus_target_home_status
+
+    - name: Validate the target account
+      ansible.builtin.assert:
+        that:
+          - corvus_uid_min_matches | length == 1
+          - corvus_uid_max_matches | length == 1
+          - corvus_target_uid >= (corvus_uid_min_matches[0] | int)
+          - corvus_target_uid <= (corvus_uid_max_matches[0] | int)
+          - corvus_target_home is match("^/")
+          - not (corvus_target_shell is match("^.*/(nologin|false)$"))
+          - corvus_target_home_status.stat.exists
+          - corvus_target_home_status.stat.isdir
+        fail_msg: >-
+          target_user must be a regular login account with an existing home
+          directory and a usable shell.
+
+  tasks:
+    - name: Install Git and the OpenSSH client
+      ansible.builtin.apt:
+        name:
+          - git
+          - openssh-client
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+      become: true
+
+    - name: Inspect the target user's SSH directory
+      ansible.builtin.stat:
+        path: "{{ corvus_target_home }}/.ssh"
+        follow: false
+      become: true
+      become_user: "{{ target_user }}"
+      register: corvus_ssh_directory
+
+    - name: Reject an unsafe SSH directory
+      ansible.builtin.assert:
+        that:
+          - not corvus_ssh_directory.stat.exists or corvus_ssh_directory.stat.isdir
+          - not corvus_ssh_directory.stat.exists or not corvus_ssh_directory.stat.islnk
+        fail_msg: >-
+          The target user's .ssh path is not a regular directory. It was not
+          modified; repair or move the path and retry.
+
+    - name: Create the target user's SSH directory
+      ansible.builtin.file:
+        path: "{{ corvus_target_home }}/.ssh"
+        state: directory
+        mode: "0700"
+      become: true
+      become_user: "{{ target_user }}"
+
+    - name: Create the LinuxCNC configuration directory
+      ansible.builtin.file:
+        path: "{{ corvus_config_root }}"
+        state: directory
+        mode: "0755"
+      become: true
+      become_user: "{{ target_user }}"
+
+    - name: Inspect the CorvusCNC destination
+      ansible.builtin.stat:
+        path: "{{ corvus_config_destination }}"
+        follow: false
+      become: true
+      become_user: "{{ target_user }}"
+      register: corvus_destination_before
+
+    - name: Reject an unsafe CorvusCNC destination
+      ansible.builtin.assert:
+        that:
+          - not corvus_destination_before.stat.exists or corvus_destination_before.stat.isdir
+          - not corvus_destination_before.stat.exists or not corvus_destination_before.stat.islnk
+        fail_msg: >-
+          The CorvusCNC destination already exists but is not a regular
+          directory. It was not modified; repair or move the path and retry.
+
+    - name: Inspect an existing checkout's Git metadata
+      ansible.builtin.stat:
+        path: "{{ corvus_config_destination }}/.git"
+        follow: false
+      become: true
+      become_user: "{{ target_user }}"
+      register: corvus_git_metadata
+      when: corvus_destination_before.stat.exists
+
+    - name: Require an existing destination to be a Git checkout
+      ansible.builtin.assert:
+        that:
+          - corvus_git_metadata.stat.exists
+          - corvus_git_metadata.stat.isdir
+          - not corvus_git_metadata.stat.islnk
+        fail_msg: >-
+          The CorvusCNC destination already exists and is not a Git checkout.
+          It was left unchanged; repair or move the path and retry.
+      when: corvus_destination_before.stat.exists
+
+    - name: Read the existing checkout's origin
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/git
+          - -C
+          - "{{ corvus_config_destination }}"
+          - remote
+          - get-url
+          - origin
+      become: true
+      become_user: "{{ target_user }}"
+      environment: "{{ corvus_git_environment }}"
+      register: corvus_existing_origin
+      changed_when: false
+      failed_when: false
+      check_mode: false
+      when: corvus_destination_before.stat.exists
+
+    - name: Require an existing checkout to be CorvusCNC
+      ansible.builtin.assert:
+        that:
+          - corvus_existing_origin.rc == 0
+          - corvus_existing_origin.stdout | trim == corvus_repository
+        fail_msg: >-
+          The CorvusCNC destination is a different Git checkout. It was left
+          unchanged; repair or move the path and retry.
+      when: corvus_destination_before.stat.exists
+
+    - name: Clone the CorvusCNC configuration
+      ansible.builtin.git:
+        repo: "{{ corvus_repository }}"
+        dest: "{{ corvus_config_destination }}"
+        version: HEAD
+        update: false
+        force: false
+        accept_newhostkey: true
+      become: true
+      become_user: "{{ target_user }}"
+      environment: "{{ corvus_git_environment }}"
+      when: not corvus_destination_before.stat.exists
+
+    - name: Find root LinuxCNC INI files
+      ansible.builtin.find:
+        paths: "{{ corvus_config_destination }}"
+        patterns: '(?i)^.*[.]ini$'
+        use_regex: true
+        file_type: file
+        recurse: false
+        follow: false
+      become: true
+      become_user: "{{ target_user }}"
+      register: corvus_ini_files
+      when: not ansible_check_mode or corvus_destination_before.stat.exists
+
+    - name: Require a ready-to-use LinuxCNC configuration
+      ansible.builtin.assert:
+        that:
+          - corvus_ini_files.matched | int > 0
+        fail_msg: >-
+          The CorvusCNC checkout contains no LinuxCNC .ini files at its root
+          and is not ready to select. The checkout was left in place for
+          inspection.
+      when: not ansible_check_mode or corvus_destination_before.stat.exists
+
+  post_tasks:
+    - name: Report the installed CorvusCNC configuration
+      ansible.builtin.debug:
+        msg: >-
+          CorvusCNC is available at {{ corvus_config_destination }} with
+          {{ corvus_ini_files.matched }} root LinuxCNC INI file(s).
+          {{
+            "The existing checkout was verified and left unchanged."
+            if corvus_destination_before.stat.exists
+            else "A new checkout was cloned."
+          }}
+          LinuxCNC was not started.
+      when: not ansible_check_mode or corvus_destination_before.stat.exists
+
+    - name: Report a fresh-install preview
+      ansible.builtin.debug:
+        msg: >-
+          CorvusCNC would be cloned from {{ corvus_repository }} to
+          {{ corvus_config_destination }} as {{ target_user }}. LinuxCNC would
+          not be started.
+      when:
+        - ansible_check_mode
+        - not corvus_destination_before.stat.exists

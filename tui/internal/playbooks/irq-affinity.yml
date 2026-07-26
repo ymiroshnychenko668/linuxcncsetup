@@ -1,0 +1,568 @@
+---
+- name: Configure persistent LinuxCNC IRQ affinity
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  become: false
+
+  vars:
+    irq_affinity_config_path: /etc/linuxcncsetup/irq-affinity.yml
+    irq_affinity_helper_path: /usr/local/libexec/linuxcncsetup-irq-affinity
+    irq_affinity_service_name: linuxcncsetup-irq-affinity.service
+    irq_affinity_service_path: /etc/systemd/system/linuxcncsetup-irq-affinity.service
+    irq_affinity_result_path: /run/linuxcncsetup/irq-affinity-result.json
+    irq_affinity_live_result_path: /run/linuxcncsetup/irq-affinity-live-result.json
+    irq_affinity_legacy_irqbalance_dropin: >-
+      /etc/systemd/system/irqbalance.service.d/90-linuxcncsetup-irq-affinity.conf
+
+  pre_tasks:
+    - name: Normalize the requested IRQ-affinity operation
+      ansible.builtin.set_fact:
+        irq_affinity_requested_operation: >-
+          {{ irq_affinity_operation | default("configure") }}
+        irq_affinity_requested_default_policy: >-
+          {{
+            (
+              none
+              if (
+                irq_affinity_operation | default("configure")
+              ) == "apply_device_live"
+              else
+              (
+                irq_default_policy
+                if irq_default_policy is defined
+                else
+                (
+                  {
+                    "housekeeping_cpus": irq_housekeeping_cpus,
+                    "protected_cpus": irq_protected_cpus
+                  }
+                  if (
+                    irq_housekeeping_cpus is defined and
+                    irq_protected_cpus is defined
+                  )
+                  else none
+                )
+              )
+            )
+          }}
+        irq_affinity_requested_device_rules: >-
+          {{
+            [irq_device_rule]
+            if (
+              irq_affinity_operation | default("configure")
+            ) == "apply_device_live" and irq_device_rule is defined
+            else irq_device_rules | default([])
+          }}
+
+    - name: Validate the IRQ-affinity request
+      ansible.builtin.assert:
+        that:
+          - ansible_facts["distribution"] == "Debian"
+          - ansible_facts["distribution_major_version"] == "13"
+          - >-
+            irq_affinity_requested_operation
+            in ["configure", "apply_device_live"]
+          - >-
+            irq_affinity_requested_operation != "configure" or
+            (irq_affinity_state | default("")) in ["present", "absent"]
+          - >-
+            irq_affinity_requested_operation != "apply_device_live" or
+            irq_device_rule is defined
+        fail_msg: >-
+          This playbook requires Debian 13 and either operation=configure with
+          irq_affinity_state=present|absent, or the explicit
+          operation=apply_device_live with one irq_device_rule.
+
+    - name: Validate and normalize the requested persistent policy
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/python3
+          - -c
+          - |
+            import json
+            import pathlib
+            import re
+            import sys
+
+            cpu_expression = re.compile(
+                r"^(?:[0-9]+(?:-[0-9]+)?)(?:,[0-9]+(?:-[0-9]+)?)*$"
+            )
+            bdf_expression = re.compile(
+                r"^[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:"
+                r"[0-9a-fA-F]{2}\.[0-7]$"
+            )
+
+            def parse(value, label, maximum=None):
+                if (
+                    not isinstance(value, str) or
+                    not cpu_expression.fullmatch(value)
+                ):
+                    raise ValueError(f"{label} is not a valid Linux CPU list")
+                cpus = set()
+                for item in value.split(","):
+                    bounds = [int(part) for part in item.split("-", 1)]
+                    first = bounds[0]
+                    last = bounds[-1]
+                    if last < first:
+                        raise ValueError(
+                            f"{label} contains a descending range: {item}"
+                        )
+                    if maximum is not None and last > maximum:
+                        raise ValueError(
+                            f"{label} references CPU {last}, above online maximum "
+                            f"CPU {maximum}"
+                        )
+                    cpus.update(range(first, last + 1))
+                return cpus
+
+            def format_list(cpus):
+                ordered = sorted(cpus)
+                ranges = []
+                start = previous = ordered[0]
+                for cpu in ordered[1:]:
+                    if cpu == previous + 1:
+                        previous = cpu
+                        continue
+                    ranges.append(
+                        str(start) if start == previous else f"{start}-{previous}"
+                    )
+                    start = previous = cpu
+                ranges.append(
+                    str(start) if start == previous else f"{start}-{previous}"
+                )
+                return ",".join(ranges)
+
+            def normalize_selector(value, label):
+                if not isinstance(value, dict):
+                    raise ValueError(f"{label} must be an object")
+                if set(value) != {"kind", "value"}:
+                    raise ValueError(
+                        f"{label} must contain exactly kind and value"
+                    )
+                kind = value["kind"]
+                selector = value["value"]
+                if kind not in {"pci_bdf", "action"}:
+                    raise ValueError(
+                        f"{label}.kind must be pci_bdf or action"
+                    )
+                if (
+                    not isinstance(selector, str) or
+                    not selector or
+                    selector != selector.strip() or
+                    len(selector) > 128 or
+                    not selector.isprintable()
+                ):
+                    raise ValueError(
+                        f"{label}.value is not a safe exact selector"
+                    )
+                if kind == "pci_bdf":
+                    if not bdf_expression.fullmatch(selector):
+                        raise ValueError(
+                            f"{label}.value is not a canonical PCI BDF"
+                        )
+                    selector = selector.lower()
+                elif "," in selector or selector.isdigit():
+                    raise ValueError(
+                        f"{label}.value is not a safe action token"
+                    )
+                return {"kind": kind, "value": selector}
+
+            def normalize_rule(value, index, online):
+                label = f"device rule {index}"
+                if not isinstance(value, dict):
+                    raise ValueError(f"{label} must be an object")
+                allowed = {"selector", "cpus", "label"}
+                if not {"selector", "cpus"} <= set(value) or not set(value) <= allowed:
+                    raise ValueError(
+                        f"{label} must contain selector, cpus, and optional label"
+                    )
+                display_label = value.get("label", "")
+                if (
+                    not isinstance(display_label, str) or
+                    display_label != display_label.strip() or
+                    len(display_label) > 128 or
+                    not display_label.isprintable()
+                ):
+                    raise ValueError(f"{label}.label is not safe display text")
+                cpus = parse(value["cpus"], f"{label} CPUs", max(online))
+                if not cpus <= online:
+                    raise ValueError(f"{label} includes an offline CPU")
+                return {
+                    "selector": normalize_selector(
+                        value["selector"], f"{label}.selector"
+                    ),
+                    "cpus": format_list(cpus),
+                    "label": display_label,
+                }
+
+            try:
+                online_text = pathlib.Path(
+                    "/sys/devices/system/cpu/online"
+                ).read_text(encoding="ascii").strip()
+                online = parse(online_text, "online CPUs")
+                default_policy_input = json.loads(sys.argv[1])
+                device_rules_input = json.loads(sys.argv[2])
+                default_policy = None
+                if default_policy_input is not None:
+                    if (
+                        not isinstance(default_policy_input, dict) or
+                        set(default_policy_input) != {
+                            "housekeeping_cpus", "protected_cpus"
+                        }
+                    ):
+                        raise ValueError(
+                            "default_policy must contain exactly "
+                            "housekeeping_cpus and protected_cpus"
+                        )
+                    housekeeping = parse(
+                        default_policy_input["housekeeping_cpus"],
+                        "housekeeping CPUs",
+                        max(online),
+                    )
+                    protected = parse(
+                        default_policy_input["protected_cpus"],
+                        "protected CPUs",
+                        max(online),
+                    )
+                    if not housekeeping <= online:
+                        raise ValueError(
+                            "housekeeping CPU set includes an offline CPU"
+                        )
+                    if not protected <= online:
+                        raise ValueError(
+                            "protected CPU set includes an offline CPU"
+                        )
+                    overlap = housekeeping & protected
+                    if overlap:
+                        raise ValueError(
+                            "CPU sets overlap at " + format_list(overlap)
+                        )
+                    unassigned = online - housekeeping - protected
+                    if unassigned:
+                        raise ValueError(
+                            "online CPUs have no policy role: "
+                            + format_list(unassigned)
+                        )
+                    for cpu in sorted(online):
+                        siblings_path = pathlib.Path(
+                            f"/sys/devices/system/cpu/cpu{cpu}/topology/"
+                            "thread_siblings_list"
+                        )
+                        try:
+                            siblings = parse(
+                                siblings_path.read_text(
+                                    encoding="ascii"
+                                ).strip(),
+                                f"CPU {cpu} thread siblings",
+                            ) & online
+                        except FileNotFoundError:
+                            continue
+                        if siblings & housekeeping and siblings & protected:
+                            raise ValueError(
+                                "SMT sibling group "
+                                + format_list(siblings)
+                                + " is split between housekeeping and protected "
+                                "roles"
+                            )
+                    default_policy = {
+                        "housekeeping_cpus": format_list(housekeeping),
+                        "protected_cpus": format_list(protected),
+                    }
+                if not isinstance(device_rules_input, list):
+                    raise ValueError("device_rules must be a list")
+                device_rules = [
+                    normalize_rule(rule, index, online)
+                    for index, rule in enumerate(device_rules_input)
+                ]
+                selectors = [
+                    (rule["selector"]["kind"], rule["selector"]["value"])
+                    for rule in device_rules
+                ]
+                if len(selectors) != len(set(selectors)):
+                    raise ValueError("device rule selectors must be unique")
+                if default_policy is None and not device_rules:
+                    raise ValueError(
+                        "a persistent policy needs default_policy, "
+                        "device_rules, or both"
+                    )
+                print(
+                    json.dumps(
+                        {
+                            "default_policy": default_policy,
+                            "device_rules": device_rules,
+                            "online_cpus": format_list(online),
+                        },
+                        sort_keys=True,
+                    )
+                )
+            except (OSError, ValueError) as error:
+                print(str(error), file=sys.stderr)
+                raise SystemExit(2)
+          - "{{ irq_affinity_requested_default_policy | to_json }}"
+          - "{{ irq_affinity_requested_device_rules | to_json }}"
+      register: irq_affinity_cpu_validation
+      changed_when: false
+      check_mode: false
+      when: >-
+        (
+          irq_affinity_requested_operation == "configure" and
+          irq_affinity_state == "present"
+        ) or irq_affinity_requested_operation == "apply_device_live"
+
+    - name: Record the normalized persistent policy
+      ansible.builtin.set_fact:
+        irq_affinity_policy: "{{ irq_affinity_cpu_validation.stdout | from_json }}"
+      when:
+        - irq_affinity_requested_operation == "configure"
+        - irq_affinity_state == "present"
+
+    - name: Record the normalized live device rule
+      ansible.builtin.set_fact:
+        irq_affinity_live_rule: >-
+          {{
+            (
+              irq_affinity_cpu_validation.stdout | from_json
+            ).device_rules[0]
+          }}
+      when: irq_affinity_requested_operation == "apply_device_live"
+
+    - name: Find exact LinuxCNC and RT process names
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/python3
+          - -c
+          - |
+            import json
+            import pathlib
+            import sys
+
+            wanted = set(sys.argv[1:])
+            matches = []
+            for process in pathlib.Path("/proc").iterdir():
+                if not process.name.isdigit():
+                    continue
+                try:
+                    name = (process / "comm").read_text(
+                        encoding="utf-8"
+                    ).strip()
+                except (FileNotFoundError, PermissionError, ProcessLookupError):
+                    continue
+                if name in wanted:
+                    matches.append({"pid": int(process.name), "name": name})
+            print(json.dumps(sorted(matches, key=lambda item: item["pid"])))
+            raise SystemExit(2 if matches else 0)
+          - linuxcnc
+          - linuxcncsvr
+          - rtapi_app
+          - milltask
+          - halrun
+          - halcmd
+      register: irq_affinity_linuxcnc_processes
+      changed_when: false
+      check_mode: false
+      failed_when: irq_affinity_linuxcnc_processes.rc not in [0, 2]
+      when: >-
+        (
+          irq_affinity_requested_operation == "configure" and
+          irq_affinity_state == "present"
+        ) or irq_affinity_requested_operation == "apply_device_live"
+
+    - name: Check whether irqbalance is active
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/systemctl
+          - is-active
+          - irqbalance.service
+      register: irq_affinity_irqbalance_active
+      changed_when: false
+      check_mode: false
+      failed_when: false
+      when: >-
+        (
+          irq_affinity_requested_operation == "configure" and
+          irq_affinity_state == "present"
+        ) or irq_affinity_requested_operation == "apply_device_live"
+
+    - name: Check whether irqbalance is enabled for the next boot
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/systemctl
+          - is-enabled
+          - irqbalance.service
+      register: irq_affinity_irqbalance_enabled
+      changed_when: false
+      check_mode: false
+      failed_when: false
+      when: >-
+        (
+          irq_affinity_requested_operation == "configure" and
+          irq_affinity_state == "present"
+        ) or irq_affinity_requested_operation == "apply_device_live"
+
+    - name: Find a manually launched irqbalance process
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/python3
+          - -c
+          - |
+            import pathlib
+
+            matches = []
+            for process in pathlib.Path("/proc").iterdir():
+                if not process.name.isdigit():
+                    continue
+                try:
+                    name = (process / "comm").read_text(
+                        encoding="utf-8"
+                    ).strip()
+                except (FileNotFoundError, PermissionError, ProcessLookupError):
+                    continue
+                if name == "irqbalance":
+                    matches.append(f"{process.name}:{name}")
+            print(", ".join(matches))
+            raise SystemExit(2 if matches else 0)
+      register: irq_affinity_irqbalance_process
+      changed_when: false
+      check_mode: false
+      failed_when: irq_affinity_irqbalance_process.rc not in [0, 2]
+      when: >-
+        (
+          irq_affinity_requested_operation == "configure" and
+          irq_affinity_state == "present"
+        ) or irq_affinity_requested_operation == "apply_device_live"
+
+    - name: Require an idle LinuxCNC stack and no irqbalance conflict
+      ansible.builtin.assert:
+        that:
+          - irq_affinity_linuxcnc_processes.rc == 0
+          - >-
+            irq_affinity_irqbalance_active.stdout | trim
+            in ["inactive", "failed", "unknown"]
+          - >-
+            irq_affinity_irqbalance_enabled.stdout | trim
+            in ["disabled", "masked", "not-found"]
+          - irq_affinity_irqbalance_process.rc == 0
+        fail_msg: >-
+          IRQ affinity was not configured. Stop LinuxCNC, linuxcncsvr,
+          rtapi_app, milltask, halrun, and halcmd before continuing. irqbalance
+          must also be stopped and disabled explicitly by the administrator:
+          this playbook will never silently disable or override it. LinuxCNC
+          processes={{ irq_affinity_linuxcnc_processes.stdout | default("[]") }};
+          irqbalance active={{ irq_affinity_irqbalance_active.stdout |
+          default("unknown") }}, enabled={{
+          irq_affinity_irqbalance_enabled.stdout | default("unknown") }},
+          manual={{ irq_affinity_irqbalance_process.stdout | default("") }}.
+      when: >-
+        (
+          irq_affinity_requested_operation == "configure" and
+          irq_affinity_state == "present"
+        ) or irq_affinity_requested_operation == "apply_device_live"
+
+  tasks:
+    - name: Install the persistent IRQ-affinity policy
+      ansible.builtin.import_tasks: tasks/irq_affinity_present.yml
+      become: true
+      when:
+        - irq_affinity_requested_operation == "configure"
+        - irq_affinity_state == "present"
+
+    - name: Remove the persistent IRQ-affinity policy
+      ansible.builtin.import_tasks: tasks/irq_affinity_absent.yml
+      become: true
+      when:
+        - irq_affinity_requested_operation == "configure"
+        - irq_affinity_state == "absent"
+
+    - name: Resolve and apply one device rule with an ephemeral helper
+      become: true
+      when:
+        - irq_affinity_requested_operation == "apply_device_live"
+        - not ansible_check_mode
+      block:
+        - name: Create a private root-owned live-helper directory
+          ansible.builtin.tempfile:
+            state: directory
+            prefix: linuxcncsetup-irq-live-
+          register: irq_affinity_live_temp
+
+        - name: Enforce private ownership on the live-helper directory
+          ansible.builtin.file:
+            path: "{{ irq_affinity_live_temp.path }}"
+            state: directory
+            owner: root
+            group: root
+            mode: "0700"
+
+        - name: Render the validated ephemeral IRQ helper
+          ansible.builtin.template:
+            src: templates/linuxcncsetup-irq-affinity.py.j2
+            dest: "{{ irq_affinity_live_temp.path }}/linuxcncsetup-irq-affinity"
+            owner: root
+            group: root
+            mode: "0700"
+            validate: /usr/bin/python3 -m py_compile %s
+
+        - name: Apply exactly one selected device rule live
+          ansible.builtin.command:
+            argv:
+              - "{{ irq_affinity_live_temp.path }}/linuxcncsetup-irq-affinity"
+              - --apply-device-live
+              - --rule-json
+              - "{{ irq_affinity_live_rule | to_json }}"
+              - --result
+              - "{{ irq_affinity_live_result_path }}"
+          register: irq_affinity_live_apply
+          changed_when: true
+      always:
+        - name: Remove the ephemeral live-helper directory
+          ansible.builtin.file:
+            path: "{{ irq_affinity_live_temp.path }}"
+            state: absent
+          when:
+            - irq_affinity_live_temp is defined
+            - irq_affinity_live_temp.path is defined
+
+    - name: Preview an explicitly requested live device apply
+      ansible.builtin.debug:
+        msg: >-
+          Would resolve and apply only {{ irq_affinity_live_rule.selector.kind }}={{
+          irq_affinity_live_rule.selector.value }} to CPUs {{
+          irq_affinity_live_rule.cpus }}.
+          LinuxCNC/RT and irqbalance safety checks would run again inside the
+          helper before any write.
+      changed_when: true
+      when:
+        - irq_affinity_requested_operation == "apply_device_live"
+        - ansible_check_mode
+
+  post_tasks:
+    - name: Report activation behavior
+      ansible.builtin.debug:
+        msg: >-
+          {{
+            (
+              "Preview complete. No files, services, or live IRQ affinities "
+              "were changed."
+            )
+            if ansible_check_mode
+            else
+            (
+              (
+                "Selected device IRQ affinity was applied live. Detailed "
+                "requested and effective values are in "
+                + irq_affinity_live_result_path + "."
+              )
+              if irq_affinity_requested_operation == "apply_device_live"
+              else
+              (
+                "IRQ-affinity policy is installed and enabled for the next boot. "
+                "No live IRQ affinity was changed and the service was not started."
+                if irq_affinity_state == "present"
+                else
+                "The owned IRQ-affinity policy was removed. The service was not "
+                "stopped and live IRQ affinity was not changed. Reboot is required "
+                "to return to kernel/default IRQ placement."
+              )
+            )
+          }}
