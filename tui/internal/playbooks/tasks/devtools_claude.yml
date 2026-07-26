@@ -1,0 +1,180 @@
+---
+- name: Inspect the Claude Code command path
+  ansible.builtin.stat:
+    path: "{{ devtools_target_home }}/.local/bin/claude"
+    follow: false
+  register: devtools_claude_command_entry
+  check_mode: false
+
+- name: Inspect the resolved Claude Code command
+  ansible.builtin.stat:
+    path: "{{ devtools_target_home }}/.local/bin/claude"
+    follow: true
+  register: devtools_claude_command_target
+  check_mode: false
+  when: devtools_claude_command_entry.stat.exists
+
+- name: Resolve the Claude Code command path
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/readlink
+      - -f
+      - --
+      - "{{ devtools_target_home }}/.local/bin/claude"
+  register: devtools_claude_resolved_command
+  changed_when: false
+  check_mode: false
+  when: devtools_claude_command_entry.stat.exists
+
+- name: Validate an existing Claude Code installation
+  ansible.builtin.assert:
+    that:
+      - >-
+        devtools_claude_command_entry.stat.isreg | default(false) or
+        devtools_claude_command_entry.stat.islnk | default(false)
+      - devtools_claude_command_target.stat.exists
+      - devtools_claude_command_target.stat.isreg | default(false)
+      - devtools_claude_command_target.stat.executable | default(false)
+      - devtools_claude_command_target.stat.pw_name | default("") == target_user
+      - >-
+        devtools_claude_resolved_command.stdout == devtools_target_home or
+        devtools_claude_resolved_command.stdout.startswith(
+          devtools_target_home + "/"
+        )
+    fail_msg: >-
+      The existing Claude Code command is not a target-user-owned executable
+      inside the target user's home. It was not executed or replaced.
+  when: devtools_claude_command_entry.stat.exists
+
+- name: Inspect Claude Code installation directories
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+  loop:
+    - "{{ devtools_target_home }}/.local"
+    - "{{ devtools_target_home }}/.local/bin"
+  register: devtools_claude_install_directories
+  when: not devtools_claude_command_entry.stat.exists
+
+- name: Reject unsafe Claude Code installation directories
+  ansible.builtin.assert:
+    that:
+      - not item.stat.exists or item.stat.isdir | default(false)
+      - not item.stat.exists or not item.stat.islnk | default(false)
+      - not item.stat.exists or item.stat.pw_name | default("") == target_user
+    fail_msg: >-
+      An existing Claude Code installation directory is not a
+      target-user-owned regular directory. It was not modified.
+  loop: "{{ devtools_claude_install_directories.results }}"
+  when: not devtools_claude_command_entry.stat.exists
+
+- name: Check for a Claude Code installer downloader
+  ansible.builtin.command:
+    argv:
+      - /bin/sh
+      - -c
+      - command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1
+  become: true
+  become_user: "{{ target_user }}"
+  environment:
+    HOME: "{{ devtools_target_home }}"
+    PATH: /usr/local/bin:/usr/bin:/bin
+  register: devtools_claude_downloader
+  changed_when: false
+  failed_when: devtools_claude_downloader.rc not in [0, 1]
+  check_mode: false
+  when: not devtools_claude_command_entry.stat.exists
+
+- name: Install curl when no Claude Code installer downloader exists
+  ansible.builtin.apt:
+    name: curl
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+    lock_timeout: 120
+  become: true
+  when:
+    - not ansible_check_mode
+    - not devtools_claude_command_entry.stat.exists
+    - devtools_claude_downloader.rc != 0
+
+- name: Preview the Claude Code installation in check mode
+  ansible.builtin.debug:
+    msg: >-
+      Claude Code would be installed for {{ target_user }} from the official
+      native installer.
+  changed_when: true
+  when:
+    - ansible_check_mode
+    - not devtools_claude_command_entry.stat.exists
+
+- name: Install Claude Code from the official native installer
+  when:
+    - not ansible_check_mode
+    - not devtools_claude_command_entry.stat.exists
+  block:
+    - name: Create a private Claude Code installer directory
+      ansible.builtin.tempfile:
+        state: directory
+        prefix: linuxcncsetup-claude-
+      become: true
+      become_user: "{{ target_user }}"
+      register: devtools_claude_installer_directory
+
+    - name: Set private Claude Code installer directory permissions
+      ansible.builtin.file:
+        path: "{{ devtools_claude_installer_directory.path }}"
+        state: directory
+        mode: "0700"
+      become: true
+      become_user: "{{ target_user }}"
+
+    - name: Download the official Claude Code installer
+      ansible.builtin.get_url:
+        url: "{{ devtools_claude_installer_url }}"
+        dest: "{{ devtools_claude_installer_directory.path }}/install.sh"
+        mode: "0700"
+      become: true
+      become_user: "{{ target_user }}"
+
+    - name: Run the official Claude Code installer as the target user
+      ansible.builtin.command:
+        argv:
+          - /bin/bash
+          - "{{ devtools_claude_installer_directory.path }}/install.sh"
+          - stable
+        creates: "{{ devtools_target_home }}/.local/bin/claude"
+      become: true
+      become_user: "{{ target_user }}"
+      environment:
+        HOME: "{{ devtools_target_home }}"
+        SHELL: "{{ devtools_target_shell }}"
+        USER: "{{ target_user }}"
+        LOGNAME: "{{ target_user }}"
+        PATH: /usr/local/bin:/usr/bin:/bin
+  always:
+    - name: Remove the private Claude Code installer directory
+      ansible.builtin.file:
+        path: "{{ devtools_claude_installer_directory.path }}"
+        state: absent
+      become: true
+      when:
+        - devtools_claude_installer_directory is defined
+        - devtools_claude_installer_directory.path is defined
+
+- name: Verify the managed Claude Code command
+  ansible.builtin.command:
+    argv:
+      - "{{ devtools_target_home }}/.local/bin/claude"
+      - --version
+  become: true
+  become_user: "{{ target_user }}"
+  environment:
+    HOME: "{{ devtools_target_home }}"
+    USER: "{{ target_user }}"
+    LOGNAME: "{{ target_user }}"
+    PATH: "{{ devtools_target_home }}/.local/bin:/usr/local/bin:/usr/bin:/bin"
+  changed_when: false
+  check_mode: false
+  when:
+    - devtools_claude_command_entry.stat.exists or not ansible_check_mode

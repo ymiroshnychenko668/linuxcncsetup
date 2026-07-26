@@ -34,6 +34,9 @@ func TestDevToolsSubmenuStructure(t *testing.T) {
 		actionInstallDevToolsAll,
 		actionInstallDevToolsGit,
 		actionInstallDevToolsVSCode,
+		actionInstallDevToolsCodex,
+		actionInstallDevToolsClaude,
+		actionInstallDevToolsWarp,
 		actionInstallDevToolsHtop,
 		actionInstallDevToolsMC,
 		actionInstallDevToolsTerminator,
@@ -56,6 +59,58 @@ func TestDevToolsSubmenuStructure(t *testing.T) {
 				devToolsSections[index].action,
 				action,
 			)
+		}
+	}
+}
+
+func TestNewDevToolsSubmenuEntries(t *testing.T) {
+	tests := []struct {
+		action      sectionAction
+		title       string
+		description []string
+	}{
+		{
+			action:      actionInstallDevToolsCodex,
+			title:       "Codex CLI",
+			description: []string{"OpenAI", "official installer"},
+		},
+		{
+			action:      actionInstallDevToolsClaude,
+			title:       "Claude Code",
+			description: []string{"Anthropic", "official installer"},
+		},
+		{
+			action:      actionInstallDevToolsWarp,
+			title:       "Warp Terminal",
+			description: []string{"signed APT repository", "Warp Terminal"},
+		},
+	}
+
+	vscodeIndex := sectionActionIndex(t, devToolsSections, actionInstallDevToolsVSCode)
+	for offset, test := range tests {
+		index := sectionActionIndex(t, devToolsSections, test.action)
+		if index != vscodeIndex+offset+1 {
+			t.Errorf(
+				"%s is at index %d; want index %d immediately after Visual Studio Code",
+				test.title,
+				index,
+				vscodeIndex+offset+1,
+			)
+		}
+
+		entry := devToolsSections[index]
+		if entry.title != test.title {
+			t.Errorf("menu title is %q; want %q", entry.title, test.title)
+		}
+		for _, expected := range test.description {
+			if !strings.Contains(entry.description, expected) {
+				t.Errorf(
+					"%s description does not contain %q: %q",
+					test.title,
+					expected,
+					entry.description,
+				)
+			}
 		}
 	}
 }
@@ -131,10 +186,14 @@ func TestDevToolsConfirmationViewsDescribeSelectedComponent(t *testing.T) {
 				"Install all developer tools?",
 				"Git",
 				"VS Code",
+				"Codex CLI",
+				"Claude Code",
+				"Warp Terminal",
 				"htop",
 				"mc",
 				"Terminator",
 				"user lingering",
+				"sign-in on first run",
 			},
 		},
 		{
@@ -157,6 +216,36 @@ func TestDevToolsConfirmationViewsDescribeSelectedComponent(t *testing.T) {
 				"signed amd64 APT",
 				"repository and installs VS Code",
 				"requires x86-64",
+			},
+		},
+		{
+			name:   "codex",
+			action: actionInstallDevToolsCodex,
+			expected: []string{
+				"Install Codex CLI?",
+				"OpenAI",
+				"official per-user installer",
+				"sign-in on first run",
+			},
+		},
+		{
+			name:   "claude",
+			action: actionInstallDevToolsClaude,
+			expected: []string{
+				"Install Claude Code?",
+				"Anthropic",
+				"official per-user installer",
+				"sign-in on first run",
+			},
+		},
+		{
+			name:   "warp",
+			action: actionInstallDevToolsWarp,
+			expected: []string{
+				"Install Warp Terminal?",
+				"signed APT repository",
+				"installs Warp Terminal",
+				"x86-64 and ARM64",
 			},
 		},
 		{
@@ -215,6 +304,9 @@ func TestDevToolsComponentMapping(t *testing.T) {
 		{action: actionInstallDevToolsAll, component: "all"},
 		{action: actionInstallDevToolsGit, component: "git"},
 		{action: actionInstallDevToolsVSCode, component: "vscode"},
+		{action: actionInstallDevToolsCodex, component: "codex"},
+		{action: actionInstallDevToolsClaude, component: "claude"},
+		{action: actionInstallDevToolsWarp, component: "warp"},
 		{action: actionInstallDevToolsHtop, component: "htop"},
 		{action: actionInstallDevToolsMC, component: "mc"},
 		{action: actionInstallDevToolsTerminator, component: "terminator"},
@@ -258,6 +350,9 @@ func TestDevToolsPlaybookVariables(t *testing.T) {
 		{action: actionInstallDevToolsAll, component: "all"},
 		{action: actionInstallDevToolsGit, component: "git"},
 		{action: actionInstallDevToolsVSCode, component: "vscode"},
+		{action: actionInstallDevToolsCodex, component: "codex"},
+		{action: actionInstallDevToolsClaude, component: "claude"},
+		{action: actionInstallDevToolsWarp, component: "warp"},
 		{action: actionInstallDevToolsHtop, component: "htop"},
 		{action: actionInstallDevToolsMC, component: "mc"},
 		{action: actionInstallDevToolsTerminator, component: "terminator"},
@@ -303,6 +398,18 @@ func TestDevToolsCancellationNamesSelectedAction(t *testing.T) {
 		{
 			action: actionInstallDevToolsVSCode,
 			status: "Visual Studio Code installation cancelled.",
+		},
+		{
+			action: actionInstallDevToolsCodex,
+			status: "Codex CLI installation cancelled.",
+		},
+		{
+			action: actionInstallDevToolsClaude,
+			status: "Claude Code installation cancelled.",
+		},
+		{
+			action: actionInstallDevToolsWarp,
+			status: "Warp Terminal installation cancelled.",
 		},
 		{
 			action: actionInstallDevToolsHtop,
@@ -377,6 +484,30 @@ func TestDevToolsActionMessages(t *testing.T) {
 			running:    "Installing Visual Studio Code...",
 			cancelled:  "Visual Studio Code installation cancelled.",
 			success:    "Visual Studio Code installed successfully.",
+		},
+		{
+			name:       "codex",
+			action:     actionInstallDevToolsCodex,
+			actionName: "Codex CLI installation",
+			running:    "Installing Codex CLI...",
+			cancelled:  "Codex CLI installation cancelled.",
+			success:    "Codex CLI installed successfully.",
+		},
+		{
+			name:       "claude",
+			action:     actionInstallDevToolsClaude,
+			actionName: "Claude Code installation",
+			running:    "Installing Claude Code...",
+			cancelled:  "Claude Code installation cancelled.",
+			success:    "Claude Code installed successfully.",
+		},
+		{
+			name:       "warp",
+			action:     actionInstallDevToolsWarp,
+			actionName: "Warp Terminal installation",
+			running:    "Installing Warp Terminal...",
+			cancelled:  "Warp Terminal installation cancelled.",
+			success:    "Warp Terminal installed successfully.",
 		},
 		{
 			name:       "htop",

@@ -59,6 +59,9 @@ const (
 	actionInstallDevToolsAll
 	actionInstallDevToolsGit
 	actionInstallDevToolsVSCode
+	actionInstallDevToolsCodex
+	actionInstallDevToolsClaude
+	actionInstallDevToolsWarp
 	actionInstallDevToolsHtop
 	actionInstallDevToolsMC
 	actionInstallDevToolsTerminator
@@ -635,6 +638,9 @@ func (m Model) renderDetail() string {
 	case actionInstallDevToolsAll,
 		actionInstallDevToolsGit,
 		actionInstallDevToolsVSCode,
+		actionInstallDevToolsCodex,
+		actionInstallDevToolsClaude,
+		actionInstallDevToolsWarp,
 		actionInstallDevToolsHtop,
 		actionInstallDevToolsMC,
 		actionInstallDevToolsTerminator,
@@ -1060,6 +1066,9 @@ func (m *Model) prepareSelectedAction() {
 	case actionInstallDevToolsAll,
 		actionInstallDevToolsGit,
 		actionInstallDevToolsVSCode,
+		actionInstallDevToolsCodex,
+		actionInstallDevToolsClaude,
+		actionInstallDevToolsWarp,
 		actionInstallDevToolsHtop,
 		actionInstallDevToolsMC,
 		actionInstallDevToolsTerminator,
@@ -1346,6 +1355,9 @@ func (m Model) executeAction(action sectionAction, value string) tea.Cmd {
 	case actionInstallDevToolsAll,
 		actionInstallDevToolsGit,
 		actionInstallDevToolsVSCode,
+		actionInstallDevToolsCodex,
+		actionInstallDevToolsClaude,
+		actionInstallDevToolsWarp,
 		actionInstallDevToolsHtop,
 		actionInstallDevToolsMC,
 		actionInstallDevToolsTerminator,

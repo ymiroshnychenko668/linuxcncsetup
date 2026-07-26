@@ -27,6 +27,21 @@ var devToolsSections = []section{
 		action:      actionInstallDevToolsVSCode,
 	},
 	{
+		title:       "Codex CLI",
+		description: "Install Codex CLI for this user with OpenAI's official installer.",
+		action:      actionInstallDevToolsCodex,
+	},
+	{
+		title:       "Claude Code",
+		description: "Install Claude Code for this user with Anthropic's official installer.",
+		action:      actionInstallDevToolsClaude,
+	},
+	{
+		title:       "Warp Terminal",
+		description: "Add Warp's signed APT repository and install Warp Terminal.",
+		action:      actionInstallDevToolsWarp,
+	},
+	{
 		title:       "htop",
 		description: "Install the interactive process viewer from Debian's repositories.",
 		action:      actionInstallDevToolsHtop,
@@ -61,6 +76,12 @@ func devToolsComponent(action sectionAction) (string, bool) {
 		return "git", true
 	case actionInstallDevToolsVSCode:
 		return "vscode", true
+	case actionInstallDevToolsCodex:
+		return "codex", true
+	case actionInstallDevToolsClaude:
+		return "claude", true
+	case actionInstallDevToolsWarp:
+		return "warp", true
 	case actionInstallDevToolsHtop:
 		return "htop", true
 	case actionInstallDevToolsMC:
@@ -82,6 +103,12 @@ func devToolsActionName(action sectionAction) (string, bool) {
 		return "Git and GitHub SSH setup", true
 	case actionInstallDevToolsVSCode:
 		return "Visual Studio Code installation", true
+	case actionInstallDevToolsCodex:
+		return "Codex CLI installation", true
+	case actionInstallDevToolsClaude:
+		return "Claude Code installation", true
+	case actionInstallDevToolsWarp:
+		return "Warp Terminal installation", true
 	case actionInstallDevToolsHtop:
 		return "htop installation", true
 	case actionInstallDevToolsMC:
@@ -103,6 +130,12 @@ func devToolsRunningMessage(action sectionAction) (string, bool) {
 		return "Installing Git and configuring GitHub SSH...", true
 	case actionInstallDevToolsVSCode:
 		return "Installing Visual Studio Code...", true
+	case actionInstallDevToolsCodex:
+		return "Installing Codex CLI...", true
+	case actionInstallDevToolsClaude:
+		return "Installing Claude Code...", true
+	case actionInstallDevToolsWarp:
+		return "Installing Warp Terminal...", true
 	case actionInstallDevToolsHtop:
 		return "Installing htop...", true
 	case actionInstallDevToolsMC:
@@ -132,6 +165,12 @@ func devToolsSuccessMessage(action sectionAction) (string, bool) {
 		return "Git and GitHub SSH configured successfully.", true
 	case actionInstallDevToolsVSCode:
 		return "Visual Studio Code installed successfully.", true
+	case actionInstallDevToolsCodex:
+		return "Codex CLI installed successfully.", true
+	case actionInstallDevToolsClaude:
+		return "Claude Code installed successfully.", true
+	case actionInstallDevToolsWarp:
+		return "Warp Terminal installed successfully.", true
 	case actionInstallDevToolsHtop:
 		return "htop installed successfully.", true
 	case actionInstallDevToolsMC:
@@ -156,11 +195,13 @@ func renderDevToolsAction(action sectionAction, confirming bool) []string {
 		lines = []string{
 			warningStyle.Render("Install all developer tools?"),
 			"",
-			"Installs Git, VS Code, htop, mc,",
-			"Terminator, and supporting packages.",
+			"Installs Git, VS Code, Codex CLI,",
+			"Claude Code, Warp Terminal, htop,",
+			"mc, Terminator, and supporting packages.",
 			"Configures cnc <cnc@cnc.cn>, GitHub",
-			"SSH, Microsoft's amd64 repository,",
-			"and user lingering.",
+			"SSH, signed APT repositories, official",
+			"per-user installers, and user lingering.",
+			"Codex and Claude request sign-in on first run.",
 		}
 	case actionInstallDevToolsGit:
 		lines = []string{
@@ -179,6 +220,28 @@ func renderDevToolsAction(action sectionAction, confirming bool) []string {
 			"Adds Microsoft's signed amd64 APT",
 			"repository and installs VS Code.",
 			"This component requires x86-64.",
+		}
+	case actionInstallDevToolsCodex:
+		lines = []string{
+			warningStyle.Render("Install Codex CLI?"),
+			"",
+			"Runs OpenAI's official per-user installer.",
+			"Codex requests sign-in on first run.",
+		}
+	case actionInstallDevToolsClaude:
+		lines = []string{
+			warningStyle.Render("Install Claude Code?"),
+			"",
+			"Runs Anthropic's official per-user installer.",
+			"Claude Code requests sign-in on first run.",
+		}
+	case actionInstallDevToolsWarp:
+		lines = []string{
+			warningStyle.Render("Install Warp Terminal?"),
+			"",
+			"Adds Warp's signed APT repository and",
+			"installs Warp Terminal.",
+			"Supports x86-64 and ARM64.",
 		}
 	case actionInstallDevToolsHtop:
 		lines = []string{

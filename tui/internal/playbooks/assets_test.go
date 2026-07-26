@@ -28,9 +28,12 @@ func TestMaterialize(t *testing.T) {
 
 			for _, path := range []string{
 				playbookPath,
+				filepath.Join(directory, "tasks", "devtools_claude.yml"),
+				filepath.Join(directory, "tasks", "devtools_codex.yml"),
 				filepath.Join(directory, "tasks", "devtools_git.yml"),
 				filepath.Join(directory, "tasks", "devtools_linger.yml"),
 				filepath.Join(directory, "tasks", "devtools_vscode.yml"),
+				filepath.Join(directory, "tasks", "devtools_warp.yml"),
 				filepath.Join(directory, "tasks", "lightdm.yml"),
 				filepath.Join(directory, "tasks", "sway.yml"),
 				filepath.Join(directory, "tasks", "install_sway.yml"),
@@ -61,6 +64,469 @@ func TestMaterializeRejectsUnknownPlaybook(t *testing.T) {
 	if _, _, err := Materialize(Playbook("../outside.yml")); err == nil {
 		t.Fatal("Materialize() accepted an unknown playbook")
 	}
+}
+
+func TestDeveloperToolsPlaybookIncludesIndependentAgentComponents(t *testing.T) {
+	playbook, _ := materializedDeveloperToolsAsset(
+		t,
+		"tasks/devtools_codex.yml",
+	)
+
+	for _, expected := range []string{
+		"\n      - codex\n",
+		"\n      - claude\n",
+		"\n      - warp\n",
+		"tasks/devtools_codex.yml",
+		"tasks/devtools_claude.yml",
+		"tasks/devtools_warp.yml",
+	} {
+		if !strings.Contains(playbook, expected) {
+			t.Errorf("developer-tools playbook does not contain %q", expected)
+		}
+	}
+}
+
+func TestDeveloperToolsSharedAPTOnlyInstallsMissingPackages(t *testing.T) {
+	playbook, _ := materializedDeveloperToolsAsset(
+		t,
+		"tasks/devtools_codex.yml",
+	)
+	packageBlock := assetBlockBetween(
+		t,
+		playbook,
+		"- name: Read installed developer package facts",
+		"- name: Configure Git and GitHub SSH",
+	)
+
+	for _, expected := range []string{
+		"ansible.builtin.package_facts:",
+		"manager: auto",
+		"devtools_missing_packages: >-",
+		"difference(ansible_facts.packages.keys() | list)",
+		`name: "{{ devtools_missing_packages }}"`,
+		"- devtools_missing_packages | length > 0",
+		"cache_valid_time: 3600",
+		"lock_timeout: 120",
+	} {
+		if !strings.Contains(packageBlock, expected) {
+			t.Errorf("shared developer-package block does not contain %q", expected)
+		}
+	}
+	if strings.Contains(
+		packageBlock,
+		`name: "{{ devtools_packages_by_component[devtools_component] }}"`,
+	) {
+		t.Fatal("shared APT task still installs the unfiltered component package list")
+	}
+}
+
+func TestOfficialAgentInstallersArePerUserAndNotPipedToShell(t *testing.T) {
+	tests := []struct {
+		name        string
+		task        string
+		officialURL string
+		command     string
+		extra       []string
+	}{
+		{
+			name:        "Codex",
+			task:        "tasks/devtools_codex.yml",
+			officialURL: "https://chatgpt.com/codex/install.sh",
+			command:     "codex",
+			extra: []string{
+				"CODEX_NON_INTERACTIVE",
+			},
+		},
+		{
+			name:        "Claude Code",
+			task:        "tasks/devtools_claude.yml",
+			officialURL: "https://claude.ai/install.sh",
+			command:     "claude",
+			extra: []string{
+				"- stable",
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			playbook, task := materializedDeveloperToolsAsset(t, test.task)
+			combined := playbook + "\n" + task
+
+			expected := []string{
+				test.officialURL,
+				"ansible.builtin.stat:",
+				"ansible.builtin.get_url:",
+				"ansible.builtin.command:",
+				`become_user: "{{ target_user }}"`,
+				`HOME: "{{ devtools_target_home }}"`,
+				"creates:",
+				`mode: "0700"`,
+				"--version",
+				"/.local/bin/" + test.command,
+			}
+			expected = append(expected, test.extra...)
+			for _, value := range expected {
+				if !strings.Contains(combined, value) {
+					t.Errorf("%s installer does not contain %q", test.name, value)
+				}
+			}
+
+			for _, unsafe := range []string{
+				"ansible.builtin.shell:",
+				"| sh",
+				"| bash",
+				"validate_certs: false",
+			} {
+				if strings.Contains(task, unsafe) {
+					t.Errorf("%s installer contains unsafe pattern %q", test.name, unsafe)
+				}
+			}
+		})
+	}
+}
+
+func TestWarpUsesScopedSignedRepositoryForNativeArchitecture(t *testing.T) {
+	playbook, task := materializedDeveloperToolsAsset(
+		t,
+		"tasks/devtools_warp.yml",
+	)
+	combined := playbook + "\n" + task
+
+	for _, expected := range []string{
+		"https://releases.warp.dev/linux/keys/warp.asc",
+		"https://releases.warp.dev/linux/deb",
+		"/etc/apt/keyrings/warpdotdev.gpg",
+		"signed-by={{ devtools_warp_keyring }}",
+		"0913165C78D5B7A41B42AC657FF7AB39D60F803F",
+		"warp-terminal",
+		"dpkg-query",
+		"--print-architecture",
+		"amd64",
+		"arm64",
+		"ansible.builtin.assert:",
+		"ansible.builtin.get_url:",
+		"ansible.builtin.copy:",
+		"ansible.builtin.apt:",
+		"--dearmor",
+		"state: present",
+	} {
+		if !strings.Contains(combined, expected) {
+			t.Errorf("Warp installer does not contain %q", expected)
+		}
+	}
+
+	for _, unsafe := range []string{
+		"ansible.builtin.shell:",
+		"apt-key",
+		"trusted=yes",
+		"trusted: yes",
+		"validate_certs: false",
+		"arch=amd64",
+	} {
+		if strings.Contains(task, unsafe) {
+			t.Errorf("Warp installer contains unsafe or non-portable pattern %q", unsafe)
+		}
+	}
+}
+
+func TestWarpSkipsRepositoryAndAPTWhenAlreadyInstalled(t *testing.T) {
+	_, task := materializedDeveloperToolsAsset(
+		t,
+		"tasks/devtools_warp.yml",
+	)
+
+	blocks := []struct {
+		name  string
+		start string
+		end   string
+	}{
+		{
+			name:  "APT keyring directory",
+			start: "- name: Create the scoped APT keyring directory",
+			end:   "- name: Download the Warp repository signing key",
+		},
+		{
+			name:  "repository signing-key download",
+			start: "- name: Download the Warp repository signing key",
+			end:   "- name: Inspect the Warp repository signing key",
+		},
+		{
+			name:  "repository configuration",
+			start: "- name: Configure the Warp stable repository",
+			end:   "- name: Install Warp Terminal",
+		},
+		{
+			name:  "APT package installation",
+			start: "- name: Install Warp Terminal",
+			end:   "- name: Preview the Warp Terminal installation in check mode",
+		},
+	}
+
+	for _, block := range blocks {
+		content := assetBlockBetween(t, task, block.start, block.end)
+		if !strings.Contains(content, "not devtools_warp_installed") {
+			t.Errorf(
+				"Warp %s is not skipped when Warp is already installed",
+				block.name,
+			)
+		}
+	}
+}
+
+func materializedDeveloperToolsAsset(
+	t *testing.T,
+	relativePath string,
+) (string, string) {
+	t.Helper()
+
+	playbookPath, cleanup, err := Materialize(InstallDevTools)
+	if err != nil {
+		t.Fatalf("Materialize() error: %v", err)
+	}
+	t.Cleanup(cleanup)
+
+	playbookData, err := os.ReadFile(playbookPath)
+	if err != nil {
+		t.Fatalf("read materialized developer-tools playbook: %v", err)
+	}
+	assetData, err := os.ReadFile(
+		filepath.Join(filepath.Dir(playbookPath), filepath.FromSlash(relativePath)),
+	)
+	if err != nil {
+		t.Fatalf("read materialized developer-tools asset %q: %v", relativePath, err)
+	}
+
+	return string(playbookData), string(assetData)
+}
+
+func TestSwayInstallUsesPrivateHeadlessValidationRuntime(t *testing.T) {
+	playbookPath, cleanup, err := Materialize(InstallSway)
+	if err != nil {
+		t.Fatalf("Materialize() error: %v", err)
+	}
+	t.Cleanup(cleanup)
+
+	taskPath := filepath.Join(
+		filepath.Dir(playbookPath),
+		"tasks",
+		"install_sway.yml",
+	)
+	data, err := os.ReadFile(taskPath)
+	if err != nil {
+		t.Fatalf("read Sway installation tasks: %v", err)
+	}
+	tasks := string(data)
+
+	configRootBlock := assetBlockBetween(
+		t,
+		tasks,
+		"- name: Create a private user configuration root",
+		"- name: Create Sway configuration directories",
+	)
+	for _, expected := range []string{
+		`path: "{{ sway_target_home }}/.config"`,
+		`owner: "{{ target_user }}"`,
+		`group: "{{ sway_target_group_result.stdout }}"`,
+		`mode: "0700"`,
+	} {
+		if !strings.Contains(configRootBlock, expected) {
+			t.Errorf("private configuration-root task does not contain %q", expected)
+		}
+	}
+
+	childDirectoriesBlock := assetBlockBetween(
+		t,
+		tasks,
+		"- name: Create Sway configuration directories",
+		"- name: Install and validate the Sway configuration atomically",
+	)
+	if strings.Contains(childDirectoriesBlock, "\n    - .config\n") {
+		t.Fatal("the mode-0755 child-directory loop also changes the private .config root")
+	}
+	for _, expected := range []string{
+		`mode: "0755"`,
+		"- .config/sway",
+		"- .config/sway/config.d",
+		"- .config/waybar",
+	} {
+		if !strings.Contains(childDirectoriesBlock, expected) {
+			t.Errorf("Sway child-directory task does not contain %q", expected)
+		}
+	}
+
+	validationBlock := assetBlockBetween(
+		t,
+		tasks,
+		"- name: Install and validate the Sway configuration atomically",
+		"- name: Install the remaining Sway desktop configuration",
+	)
+	for _, expected := range []string{
+		"ansible.builtin.tempfile:",
+		"prefix: linuxcncsetup-sway-validate-",
+		`become_user: "{{ target_user }}"`,
+		"register: sway_validation_runtime",
+		`mode: "0700"`,
+		"validate: /usr/bin/sway --validate --config %s",
+		"- name: Validate the installed Sway configuration and included snippets",
+		`HOME: "{{ sway_target_home }}"`,
+		`XDG_RUNTIME_DIR: "{{ sway_validation_runtime.path }}"`,
+		"WLR_BACKENDS: headless",
+		"WLR_RENDERER: pixman",
+		`WLR_LIBINPUT_NO_DEVICES: "1"`,
+		`WAYLAND_DISPLAY: ""`,
+		`DISPLAY: ""`,
+		`SWAYSOCK: ""`,
+		"always:",
+		"- name: Remove the temporary Sway validation runtime",
+		`path: "{{ sway_validation_runtime.path }}"`,
+		"state: absent",
+		"- sway_validation_runtime is defined",
+		"- sway_validation_runtime.path is defined",
+	} {
+		if !strings.Contains(validationBlock, expected) {
+			t.Errorf("atomic Sway validation block does not contain %q", expected)
+		}
+	}
+	if got := strings.Count(
+		validationBlock,
+		`XDG_RUNTIME_DIR: "{{ sway_validation_runtime.path }}"`,
+	); got != 2 {
+		t.Errorf("temporary validation runtime is referenced %d times; want template and final validation", got)
+	}
+	if strings.Contains(validationBlock, "/run/user/") {
+		t.Fatal("headless Sway validation still depends on a live /run/user runtime")
+	}
+	if strings.Index(validationBlock, "always:") >
+		strings.Index(validationBlock, "- name: Remove the temporary Sway validation runtime") {
+		t.Fatal("temporary validation runtime removal is not inside the always block")
+	}
+}
+
+func TestSwayTemplateValidatesHeadlesslyWithoutRuntimeArtifacts(t *testing.T) {
+	swayPath, err := exec.LookPath("sway")
+	if err != nil {
+		t.Skip("sway is not available")
+	}
+
+	playbookPath, cleanup, err := Materialize(InstallSway)
+	if err != nil {
+		t.Fatalf("Materialize() error: %v", err)
+	}
+	t.Cleanup(cleanup)
+	templatePath := filepath.Join(
+		filepath.Dir(playbookPath),
+		"templates",
+		"sway-config.j2",
+	)
+	data, err := os.ReadFile(templatePath)
+	if err != nil {
+		t.Fatalf("read Sway configuration template: %v", err)
+	}
+	rendered := string(data)
+	for placeholder, value := range map[string]string{
+		"{{ sway_effective_terminal }}": "foot",
+		"{{ sway_output_name }}":        "DP-1",
+		"{{ sway_output_mode }}":        "1920x1080",
+		"{{ sway_output_position }}":    "0,0",
+		"{{ sway_keyboard_layout }}":    "us",
+	} {
+		rendered = strings.ReplaceAll(rendered, placeholder, value)
+	}
+	if strings.Contains(rendered, "{{") || strings.Contains(rendered, "{%") {
+		t.Fatalf("minimal Sway template rendering left a Jinja expression")
+	}
+
+	fixtureRoot := t.TempDir()
+	targetHome := filepath.Join(fixtureRoot, "home")
+	configDirectory := filepath.Join(targetHome, ".config", "sway")
+	if err := os.MkdirAll(
+		filepath.Join(configDirectory, "config.d"),
+		0o755,
+	); err != nil {
+		t.Fatalf("create Sway configuration fixture: %v", err)
+	}
+	configPath := filepath.Join(configDirectory, "config")
+	if err := os.WriteFile(configPath, []byte(rendered), 0o644); err != nil {
+		t.Fatalf("write rendered Sway configuration: %v", err)
+	}
+
+	runtimeDirectory, err := os.MkdirTemp(
+		"",
+		"linuxcncsetup-sway-validate-",
+	)
+	if err != nil {
+		t.Fatalf("create private validation runtime: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = os.RemoveAll(runtimeDirectory)
+	})
+	if err := os.Chmod(runtimeDirectory, 0o700); err != nil {
+		t.Fatalf("make validation runtime private: %v", err)
+	}
+	info, err := os.Stat(runtimeDirectory)
+	if err != nil {
+		t.Fatalf("stat private validation runtime: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o700 {
+		t.Fatalf("validation runtime mode = %#o; want 0700", got)
+	}
+
+	command := exec.Command(
+		swayPath,
+		"--validate",
+		"--config",
+		configPath,
+	)
+	command.Env = []string{
+		"PATH=/usr/bin:/bin",
+		"LANG=C.UTF-8",
+		"HOME=" + targetHome,
+		"XDG_CONFIG_HOME=" + filepath.Join(targetHome, ".config"),
+		"XDG_CONFIG_DIRS=/etc/xdg",
+		"XDG_RUNTIME_DIR=" + runtimeDirectory,
+		"WLR_BACKENDS=headless",
+		"WLR_RENDERER=pixman",
+		"WLR_LIBINPUT_NO_DEVICES=1",
+		"WAYLAND_DISPLAY=",
+		"DISPLAY=",
+		"SWAYSOCK=",
+	}
+	output, validationErr := command.CombinedOutput()
+	if validationErr != nil ||
+		strings.Contains(string(output), "Error(s) loading config!") {
+		t.Fatalf(
+			"headless Sway template validation failed: %v\n%s",
+			validationErr,
+			output,
+		)
+	}
+	// Sway may leave its headless Wayland socket and lock in the private
+	// runtime. The playbook's always block removes the entire directory.
+	if err := os.RemoveAll(runtimeDirectory); err != nil {
+		t.Fatalf("clean private validation runtime: %v", err)
+	}
+	if _, err := os.Stat(runtimeDirectory); !os.IsNotExist(err) {
+		t.Fatalf("validation runtime survived cleanup: %v", err)
+	}
+}
+
+func assetBlockBetween(
+	t *testing.T,
+	content string,
+	startMarker string,
+	endMarker string,
+) string {
+	t.Helper()
+	start := strings.Index(content, startMarker)
+	if start < 0 {
+		t.Fatalf("asset does not contain start marker %q", startMarker)
+	}
+	endRelative := strings.Index(content[start:], endMarker)
+	if endRelative < 0 {
+		t.Fatalf("asset does not contain end marker %q after %q", endMarker, startMarker)
+	}
+	return content[start : start+endRelative]
 }
 
 func TestLinuxCNCConfigPlaybookPreservesExistingCheckout(t *testing.T) {

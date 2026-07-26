@@ -119,6 +119,14 @@
       - sway_primary_terminal_binary.stat.executable
     fail_msg: "Primary terminal not found: /usr/bin/{{ sway_effective_terminal }}"
 
+- name: Create a private user configuration root
+  ansible.builtin.file:
+    path: "{{ sway_target_home }}/.config"
+    state: directory
+    owner: "{{ target_user }}"
+    group: "{{ sway_target_group_result.stdout }}"
+    mode: "0700"
+
 - name: Create Sway configuration directories
   ansible.builtin.file:
     path: "{{ sway_target_home }}/{{ item }}"
@@ -127,7 +135,6 @@
     group: "{{ sway_target_group_result.stdout }}"
     mode: "0755"
   loop:
-    - .config
     - .config/environment.d
     - .config/mako
     - .config/sway
@@ -137,7 +144,85 @@
     - .config/waybar
     - .config/xdg-desktop-portal
 
-- name: Install the Sway desktop configuration
+- name: Install and validate the Sway configuration atomically
+  block:
+    - name: Create a private runtime directory for Sway validation
+      ansible.builtin.tempfile:
+        state: directory
+        prefix: linuxcncsetup-sway-validate-
+      become_user: "{{ target_user }}"
+      register: sway_validation_runtime
+      check_mode: false
+      changed_when: false
+
+    - name: Enforce private validation-runtime permissions
+      ansible.builtin.file:
+        path: "{{ sway_validation_runtime.path }}"
+        state: directory
+        mode: "0700"
+      become_user: "{{ target_user }}"
+      changed_when: false
+
+    - name: Install the Sway desktop configuration
+      ansible.builtin.template:
+        src: templates/sway-config.j2
+        dest: "{{ sway_target_home }}/.config/sway/config"
+        owner: "{{ target_user }}"
+        group: "{{ sway_target_group_result.stdout }}"
+        mode: "0644"
+        backup: true
+        validate: /usr/bin/sway --validate --config %s
+      become_user: "{{ target_user }}"
+      environment:
+        HOME: "{{ sway_target_home }}"
+        XDG_RUNTIME_DIR: "{{ sway_validation_runtime.path }}"
+        WLR_BACKENDS: headless
+        WLR_RENDERER: pixman
+        WLR_LIBINPUT_NO_DEVICES: "1"
+        WAYLAND_DISPLAY: ""
+        DISPLAY: ""
+        SWAYSOCK: ""
+
+    - name: Validate the installed Sway configuration and included snippets
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/sway
+          - --validate
+          - --config
+          - "{{ sway_target_home }}/.config/sway/config"
+      become_user: "{{ target_user }}"
+      environment:
+        HOME: "{{ sway_target_home }}"
+        XDG_RUNTIME_DIR: "{{ sway_validation_runtime.path }}"
+        WLR_BACKENDS: headless
+        WLR_RENDERER: pixman
+        WLR_LIBINPUT_NO_DEVICES: "1"
+        WAYLAND_DISPLAY: ""
+        DISPLAY: ""
+        SWAYSOCK: ""
+      register: sway_config_validation
+      changed_when: false
+      check_mode: false
+      failed_when: >-
+        sway_config_validation.rc != 0 or
+        "Error(s) loading config!" in
+        (
+          (sway_config_validation.stdout | default("")) +
+          (sway_config_validation.stderr | default(""))
+        )
+      when: not ansible_check_mode
+  always:
+    - name: Remove the temporary Sway validation runtime
+      ansible.builtin.file:
+        path: "{{ sway_validation_runtime.path }}"
+        state: absent
+      when:
+        - sway_validation_runtime is defined
+        - sway_validation_runtime.path is defined
+      check_mode: false
+      changed_when: false
+
+- name: Install the remaining Sway desktop configuration
   ansible.builtin.template:
     src: "templates/{{ item.src }}"
     dest: "{{ sway_target_home }}/{{ item.dest }}"
@@ -147,9 +232,6 @@
     backup: true
     validate: "{{ item.validate | default(omit) }}"
   loop:
-    - src: sway-config.j2
-      dest: .config/sway/config
-      validate: /usr/bin/sway --validate --config %s
     - src: waybar-config.json.j2
       dest: .config/waybar/config
       validate: /usr/bin/python3 -m json.tool %s
@@ -237,20 +319,6 @@
   register: sway_user_daemon_reload
   changed_when: false
   failed_when: false
-
-- name: Validate the Sway configuration
-  ansible.builtin.command:
-    argv:
-      - /usr/bin/sway
-      - --validate
-      - --config
-      - "{{ sway_target_home }}/.config/sway/config"
-  become_user: "{{ target_user }}"
-  environment:
-    HOME: "{{ sway_target_home }}"
-    XDG_RUNTIME_DIR: "/run/user/{{ sway_target_uid }}"
-  changed_when: false
-  check_mode: false
 
 - name: Validate the Waybar JSON configuration
   ansible.builtin.command:

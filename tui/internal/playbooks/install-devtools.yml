@@ -11,6 +11,9 @@
       - all
       - git
       - vscode
+      - codex
+      - claude
+      - warp
       - htop
       - mc
       - terminator
@@ -23,6 +26,7 @@
         - htop
         - mc
         - openssh-client
+        - tar
         - terminator
         - wget
       git:
@@ -32,6 +36,14 @@
         - ca-certificates
         - gpg
         - wget
+      codex:
+        - ca-certificates
+        - tar
+      claude:
+        - ca-certificates
+      warp:
+        - ca-certificates
+        - gpg
       htop:
         - htop
       mc:
@@ -47,6 +59,14 @@
     devtools_vscode_repository: >-
       deb [arch=amd64 signed-by=/usr/share/keyrings/packages.microsoft.gpg]
       https://packages.microsoft.com/repos/vscode stable main
+    devtools_codex_installer_url: https://chatgpt.com/codex/install.sh
+    devtools_claude_installer_url: https://claude.ai/install.sh
+    devtools_warp_key_url: https://releases.warp.dev/linux/keys/warp.asc
+    devtools_warp_key_fingerprint: 0913165C78D5B7A41B42AC657FF7AB39D60F803F
+    devtools_warp_key_source: /etc/apt/keyrings/warpdotdev.asc
+    devtools_warp_keyring: /etc/apt/keyrings/warpdotdev.gpg
+    devtools_warp_repository_file: /etc/apt/sources.list.d/warpdotdev.list
+    devtools_warp_repository_url: https://releases.warp.dev/linux/deb
 
   pre_tasks:
     - name: Validate the requested developer-tools component
@@ -56,8 +76,9 @@
           - devtools_component in devtools_valid_components
           - ansible_facts["distribution"] == "Debian"
         fail_msg: >-
-          devtools_component must be one of all, git, vscode, htop, mc,
-          terminator, or linger, and the target system must be Debian.
+          devtools_component must be one of all, git, vscode, codex, claude,
+          warp, htop, mc, terminator, or linger, and the target system must be
+          Debian.
 
     - name: Validate the Visual Studio Code architecture
       ansible.builtin.assert:
@@ -66,26 +87,35 @@
         fail_msg: The referenced Visual Studio Code repository is amd64-only.
       when: devtools_component in ["all", "vscode"]
 
+    - name: Validate the standalone developer-tool architecture
+      ansible.builtin.assert:
+        that:
+          - ansible_facts["architecture"] in ["x86_64", "aarch64"]
+        fail_msg: >-
+          Codex CLI, Claude Code, and Warp are supported only on x86-64 and
+          ARM64 systems.
+      when: devtools_component in ["all", "codex", "claude", "warp"]
+
     - name: Validate the target-user request
       ansible.builtin.assert:
         that:
           - (target_user | default("")) is match("^[a-zA-Z_][a-zA-Z0-9_.-]*[$]?$")
           - (target_user | default("")) != "root"
         fail_msg: A regular non-root target_user is required for this component.
-      when: devtools_component in ["all", "git", "linger"]
+      when: devtools_component in ["all", "git", "linger", "codex", "claude"]
 
     - name: Read the target account
       ansible.builtin.getent:
         database: passwd
         key: "{{ target_user }}"
-      when: devtools_component in ["all", "git", "linger"]
+      when: devtools_component in ["all", "git", "linger", "codex", "claude"]
 
     - name: Derive target account details
       ansible.builtin.set_fact:
         devtools_target_home: "{{ ansible_facts['getent_passwd'][target_user][4] }}"
         devtools_target_uid: "{{ ansible_facts['getent_passwd'][target_user][1] | int }}"
         devtools_target_shell: "{{ ansible_facts['getent_passwd'][target_user][5] }}"
-      when: devtools_component in ["all", "git", "linger"]
+      when: devtools_component in ["all", "git", "linger", "codex", "claude"]
 
     - name: Read the target account's primary group
       ansible.builtin.command:
@@ -104,7 +134,7 @@
         path: "{{ devtools_target_home }}"
         follow: true
       register: devtools_target_home_status
-      when: devtools_component in ["all", "git", "linger"]
+      when: devtools_component in ["all", "git", "linger", "codex", "claude"]
 
     - name: Validate the target account
       ansible.builtin.assert:
@@ -118,16 +148,34 @@
         fail_msg: >-
           target_user must be a regular login account with an existing home
           directory and a usable shell.
-      when: devtools_component in ["all", "git", "linger"]
+      when: devtools_component in ["all", "git", "linger", "codex", "claude"]
 
   tasks:
+    - name: Read installed developer package facts
+      ansible.builtin.package_facts:
+        manager: auto
+      when: devtools_packages_by_component[devtools_component] | length > 0
+
+    - name: Determine missing developer packages
+      ansible.builtin.set_fact:
+        devtools_missing_packages: >-
+          {{
+            devtools_packages_by_component[devtools_component]
+            | difference(ansible_facts.packages.keys() | list)
+          }}
+      when: devtools_packages_by_component[devtools_component] | length > 0
+
     - name: Install the selected developer packages
       ansible.builtin.apt:
-        name: "{{ devtools_packages_by_component[devtools_component] }}"
+        name: "{{ devtools_missing_packages }}"
         state: present
         update_cache: true
+        cache_valid_time: 3600
+        lock_timeout: 120
       become: true
-      when: devtools_packages_by_component[devtools_component] | length > 0
+      when:
+        - devtools_packages_by_component[devtools_component] | length > 0
+        - devtools_missing_packages | length > 0
 
     - name: Configure Git and GitHub SSH
       ansible.builtin.import_tasks: tasks/devtools_git.yml
@@ -140,6 +188,18 @@
     - name: Enable user lingering
       ansible.builtin.import_tasks: tasks/devtools_linger.yml
       when: devtools_component in ["all", "linger"]
+
+    - name: Install Codex CLI for the target user
+      ansible.builtin.import_tasks: tasks/devtools_codex.yml
+      when: devtools_component in ["all", "codex"]
+
+    - name: Install Claude Code for the target user
+      ansible.builtin.import_tasks: tasks/devtools_claude.yml
+      when: devtools_component in ["all", "claude"]
+
+    - name: Configure the Warp repository
+      ansible.builtin.import_tasks: tasks/devtools_warp.yml
+      when: devtools_component in ["all", "warp"]
 
   post_tasks:
     - name: Read the GitHub SSH public key

@@ -43,9 +43,8 @@ v2 for terminal layout and styling.
 
 ## Developer tools installation
 
-The **Development tools** submenu implements the root-level
-`install-devtools.sh` workflow through one embedded, selection-aware Ansible
-playbook. **Install all** preserves the combined workflow, while the remaining
+The **Development tools** submenu uses one embedded, selection-aware Ansible
+playbook. **Install all** runs the complete TUI workflow, while the remaining
 items can be run independently:
 
 - **Git & GitHub SSH** installs Git and OpenSSH, sets the global identity to
@@ -54,16 +53,44 @@ items can be run independently:
   public key so it can be copied to GitHub.
 - **Visual Studio Code** adds Microsoft's signed amd64 APT repository and
   installs VS Code.
+- **Codex CLI** downloads and runs
+  [OpenAI's official standalone installer](https://chatgpt.com/codex/install.sh)
+  as the regular target user. It installs the `codex` command in
+  `~/.local/bin`; running `codex` for the first time asks the user to choose
+  Sign in with ChatGPT or another available authentication method. The
+  state-present action skips the installer when that command already exists.
+- **Claude Code** downloads and runs
+  [Anthropic's official native installer](https://claude.ai/install.sh) as the
+  regular target user. It installs the `claude` command in `~/.local/bin` and
+  uses Claude Code's native automatic-update mechanism. Run `claude` after
+  installation and follow the available authentication flow; installation
+  alone does not grant Claude Code service access.
+- **Warp Terminal** installs the `warp-terminal` system package from Warp's
+  [stable APT repository](https://releases.warp.dev/linux/deb). The repository
+  is restricted to the machine's native architecture and its official signing
+  key is scoped to that repository through `signed-by`. Launch
+  `warp-terminal` after installation; the first launch needs an internet
+  connection, while creating or signing in to a Warp account is optional.
+  Future releases are delivered through normal APT updates. Online AI and
+  collaboration features still require connectivity and the applicable
+  account access. Warp requires glibc 2.31+ and graphics hardware with
+  OpenGL ES 3.0+ or Vulkan support.
 - **htop**, **Midnight Commander**, and **Terminator** each install only their
   selected Debian package.
 - **User lingering** enables lingering for the target user without installing
   a developer package.
 
-User-specific files are created as the regular target user; only package and
-system configuration tasks run with elevated privileges. The VS Code
-component—and therefore **Install all**—requires x86-64, while the other
-components remain available on ARM64. The root `install-devtools.sh` remains
-the all-in-one compatibility script.
+Codex CLI and Claude Code are independent per-user installations and do not
+use a system-wide npm installation. Warp's signing key, APT source, and package
+are system-wide; as with the other Debian packages and repositories, only
+those system configuration tasks run with elevated privileges. User-specific
+files are created as the regular target user.
+
+The independent Codex CLI, Claude Code, and Warp Terminal items support both
+x86-64 and ARM64. The VS Code component—and therefore **Install all**—remains
+x86-64-only, while every other independent component is available on ARM64.
+The root `install-devtools.sh` remains a legacy compatibility script and is
+not extended by these TUI-only items.
 
 ## Wayland and Sway installation
 
