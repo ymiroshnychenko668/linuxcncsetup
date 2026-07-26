@@ -1,0 +1,99 @@
+---
+- name: Read installed packages before switching the display manager
+  ansible.builtin.package_facts:
+    manager: auto
+
+- name: Inspect the target user's Sway configuration
+  ansible.builtin.stat:
+    path: "{{ ansible_facts['getent_passwd'][target_user][4] }}/.config/sway/config"
+  register: autologin_sway_config
+
+- name: Require an installed and manually validated Sway desktop
+  ansible.builtin.assert:
+    that:
+      - "'sway' in ansible_facts.packages"
+      - autologin_sway_config.stat.exists
+      - autologin_sway_config.stat.isreg
+    fail_msg: >-
+      Install Wayland + Sway from the main menu and validate a manual Sway
+      login before enabling Sway auto-login.
+
+- name: Install greetd and tuigreet without starting them during this session
+  ansible.builtin.apt:
+    name:
+      - greetd
+      - tuigreet
+    state: present
+    policy_rc_d: 101
+
+- name: Verify the Sway login-manager packages are installed
+  ansible.builtin.package_facts:
+    manager: auto
+
+- name: Require the Sway login-manager packages
+  ansible.builtin.assert:
+    that:
+      - "'greetd' in ansible_facts.packages"
+      - "'tuigreet' in ansible_facts.packages"
+    fail_msg: greetd and tuigreet must both be installed before configuration.
+
+- name: Create the greetd configuration directory
+  ansible.builtin.file:
+    path: /etc/greetd
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Configure greetd with one automatic Sway login per boot
+  ansible.builtin.copy:
+    dest: /etc/greetd/config.toml
+    owner: root
+    group: root
+    mode: "0644"
+    backup: true
+    content: |
+      # Managed by linuxcncsetup.
+      [terminal]
+      vt = 7
+
+      [default_session]
+      command = "tuigreet --time --remember --cmd \"bash -lc 'exec sway'\""
+      user = "_greetd"
+
+      [initial_session]
+      command = "bash -lc 'exec sway'"
+      user = "{{ target_user }}"
+
+- name: Refresh service facts after package installation
+  ansible.builtin.service_facts:
+
+- name: Create the display-manager selection directory
+  ansible.builtin.file:
+    path: /etc/X11
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Persist greetd as Debian's selected display manager
+  ansible.builtin.copy:
+    dest: /etc/X11/default-display-manager
+    owner: root
+    group: root
+    mode: "0644"
+    backup: true
+    content: |
+      /usr/sbin/greetd
+
+- name: Disable LightDM at the next boot
+  ansible.builtin.systemd_service:
+    name: lightdm.service
+    enabled: false
+  when: "'lightdm.service' in ansible_facts.services"
+
+- name: Enable greetd at the next boot
+  ansible.builtin.systemd_service:
+    name: greetd.service
+    enabled: true
+    force: true

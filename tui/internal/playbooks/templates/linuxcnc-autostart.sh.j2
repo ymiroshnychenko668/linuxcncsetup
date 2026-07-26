@@ -1,0 +1,4 @@
+#!/bin/sh
+# Managed by linuxcncsetup. Changes will be replaced.
+/usr/bin/swaymsg -q 'workspace number 1' || exit 1
+exec /usr/bin/linuxcnc {{ linuxcnc_config | ansible.builtin.quote }}

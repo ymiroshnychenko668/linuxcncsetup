@@ -1,0 +1,8 @@
+[Unit]
+Description=Sway compositor session
+Documentation=man:systemd.special(7)
+# Pulling graphical-session.target in as a dependency starts the packaged
+# Waybar, mako, and foot user units without spawning swaybar.
+BindsTo=graphical-session.target
+Wants=graphical-session-pre.target
+After=graphical-session-pre.target

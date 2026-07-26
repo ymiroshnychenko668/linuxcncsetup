@@ -1,0 +1,69 @@
+---
+- name: Install LightDM without starting it during this session
+  ansible.builtin.apt:
+    name: lightdm
+    state: present
+    policy_rc_d: 101
+
+- name: Verify the LightDM package is installed
+  ansible.builtin.package_facts:
+    manager: auto
+
+- name: Require the LightDM package
+  ansible.builtin.assert:
+    that:
+      - "'lightdm' in ansible_facts.packages"
+    fail_msg: LightDM installation did not complete.
+
+- name: Create the LightDM configuration directory
+  ansible.builtin.file:
+    path: /etc/lightdm/lightdm.conf.d
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Configure LightDM automatic login
+  ansible.builtin.copy:
+    dest: /etc/lightdm/lightdm.conf.d/50-linuxcnc-autologin.conf
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      # Managed by linuxcncsetup.
+      [Seat:*]
+      autologin-user={{ target_user }}
+      autologin-user-timeout=0
+
+- name: Refresh service facts after package installation
+  ansible.builtin.service_facts:
+
+- name: Create the display-manager selection directory
+  ansible.builtin.file:
+    path: /etc/X11
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Persist LightDM as Debian's selected display manager
+  ansible.builtin.copy:
+    dest: /etc/X11/default-display-manager
+    owner: root
+    group: root
+    mode: "0644"
+    backup: true
+    content: |
+      /usr/sbin/lightdm
+
+- name: Disable greetd at the next boot
+  ansible.builtin.systemd_service:
+    name: greetd.service
+    enabled: false
+  when: "'greetd.service' in ansible_facts.services"
+
+- name: Enable LightDM at the next boot
+  ansible.builtin.systemd_service:
+    name: lightdm.service
+    enabled: true
+    force: true

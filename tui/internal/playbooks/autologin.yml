@@ -1,0 +1,99 @@
+---
+- name: Configure graphical automatic login
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  become: false
+
+  pre_tasks:
+    - name: Validate the automatic-login request
+      tags:
+        - validation
+      block:
+        - name: Validate requested configuration
+          ansible.builtin.assert:
+            that:
+              - ansible_facts["distribution"] == "Debian"
+              - ansible_facts["distribution_major_version"] == "13"
+              - (autologin_mode | default("")) in ["lightdm", "sway"]
+              - (target_user | default("")) is match("^[a-zA-Z_][a-zA-Z0-9_.-]*[$]?$")
+              - (target_user | default("")) != "root"
+              - autologin_mode != "sway" or (sway_validated | default(false) | bool)
+            fail_msg: >-
+              This playbook requires Debian 13, autologin_mode=lightdm|sway, a
+              non-root target_user, and confirmation that a manual Sway login
+              succeeded before enabling Sway auto-login.
+
+        - name: Verify the target user exists
+          ansible.builtin.getent:
+            database: passwd
+            key: "{{ target_user }}"
+
+        - name: Read regular-user UID bounds
+          ansible.builtin.slurp:
+            src: /etc/login.defs
+          register: autologin_login_defs
+
+        - name: Extract regular-user UID bounds
+          ansible.builtin.set_fact:
+            autologin_uid_min_matches: >-
+              {{
+                autologin_login_defs.content
+                | b64decode
+                | regex_findall('(?m)^\s*UID_MIN\s+(\d+)\s*$')
+              }}
+            autologin_uid_max_matches: >-
+              {{
+                autologin_login_defs.content
+                | b64decode
+                | regex_findall('(?m)^\s*UID_MAX\s+(\d+)\s*$')
+              }}
+
+        - name: Validate regular-user UID bounds
+          ansible.builtin.assert:
+            that:
+              - autologin_uid_min_matches | length == 1
+              - autologin_uid_max_matches | length == 1
+            fail_msg: Could not determine UID_MIN and UID_MAX from /etc/login.defs.
+
+        - name: Validate the target account
+          ansible.builtin.assert:
+            that:
+              - (ansible_facts["getent_passwd"][target_user][1] | int) >= (autologin_uid_min_matches[0] | int)
+              - (ansible_facts["getent_passwd"][target_user][1] | int) <= (autologin_uid_max_matches[0] | int)
+              - ansible_facts["getent_passwd"][target_user][4] is match("^/")
+              - not (ansible_facts["getent_passwd"][target_user][5] is match("^.*/(nologin|false)$"))
+            fail_msg: >-
+              target_user must be a regular login account with an absolute
+              home directory and a usable shell.
+
+        - name: Inspect the target user's home directory
+          ansible.builtin.stat:
+            path: "{{ ansible_facts['getent_passwd'][target_user][4] }}"
+          register: autologin_home
+
+        - name: Require an existing home directory
+          ansible.builtin.assert:
+            that:
+              - autologin_home.stat.exists
+              - autologin_home.stat.isdir
+            fail_msg: The target user's home directory does not exist.
+
+  tasks:
+    - name: Apply the LightDM automatic-login implementation
+      ansible.builtin.import_tasks: tasks/lightdm.yml
+      become: true
+      when: autologin_mode == "lightdm"
+
+    - name: Apply the Sway automatic-login implementation
+      ansible.builtin.import_tasks: tasks/sway.yml
+      become: true
+      when: autologin_mode == "sway"
+
+  post_tasks:
+    - name: Report next step
+      ansible.builtin.debug:
+        msg: >-
+          Configuration complete. No display manager was started or stopped.
+          Reboot when ready to activate {{ "LightDM automatic login" if
+          autologin_mode == "lightdm" else "greetd automatic login into Sway" }}.

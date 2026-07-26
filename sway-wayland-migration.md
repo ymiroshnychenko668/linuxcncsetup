@@ -122,8 +122,8 @@ still needed to test-login to Sway in Phase 3. They come in Phase 4.
 - Background: `output * bg #1e1e2e solid_color` — a solid color rather than an
   image, because the `sway-backgrounds` package is not installed and pointing at
   a nonexistent file would error.
-- Idle: `swayidle` locks after 600s, blanks outputs after 900s, locks before
-  sleep.
+- Idle: `swayidle` powers outputs off after 600s and wakes them without a
+  password. It still locks before sleep; manual locking remains available.
 - Autostarted: `lxpolkit` (polkit prompts) and `nm-applet --indicator`
   (network tray).
 - Screenshots: `Print` = whole screen to clipboard,
@@ -340,8 +340,8 @@ real gaps and what was done about them.
 ### Verified as non-issues
 
 - **`/etc/pam.d/swaylock` exists.** This is the classic Sway lockout trap — without
-  that PAM file `swaylock` can authenticate nobody and the idle lock at 600s
-  becomes an inescapable screen. Debian's package ships it, so locking is safe.
+  that PAM file `swaylock` can authenticate nobody. Debian's package ships it,
+  so the manual and before-sleep locks are safe.
 - **Keyboard layout matches.** The X11 session used `us` / `pc105`, and the Sway
   config hardcodes `xkb_layout us`. No regression.
 - **`dbus-user-session` 1.16.2-2 installed** — required for a working user D-Bus.

@@ -59,10 +59,11 @@ CATEGORIES: dict[str, list[ScriptInfo]] = {
         ScriptInfo(
             "autologin.sh",
             "Auto-Login Setup",
-            "Configure LightDM display manager for automatic graphical login",
-            "Installs LightDM, enables it via systemd, and configures autologin "
-            "for the current user with zero timeout. After reboot, the system "
-            "boots straight to the desktop without a login prompt.",
+            "Configure automatic graphical login through the Ansible playbook",
+            "Compatibility launcher for the Ansible auto-login implementation. "
+            "The default mode installs and enables LightDM, then configures "
+            "automatic login for the invoking user. The Go TUI also exposes a "
+            "greetd + Sway mode. Changes take effect after reboot.",
         ),
     ],
     "CPU & Real-Time Tuning": [

@@ -1,0 +1,56 @@
+---
+- name: Create user autostart directories
+  ansible.builtin.file:
+    path: "{{ linuxcnc_autostart_home }}/{{ item }}"
+    state: directory
+    owner: "{{ target_user }}"
+    group: "{{ linuxcnc_autostart_group.stdout }}"
+    mode: "0755"
+  loop:
+    - .local
+    - .local/bin
+    - .config/sway/config.d
+
+- name: Install the LinuxCNC autostart wrapper
+  ansible.builtin.template:
+    src: templates/linuxcnc-autostart.sh.j2
+    dest: "{{ linuxcnc_autostart_home }}/.local/bin/linuxcnc-autostart"
+    owner: "{{ target_user }}"
+    group: "{{ linuxcnc_autostart_group.stdout }}"
+    mode: "0755"
+    backup: true
+
+- name: Install the LinuxCNC Sway autostart snippet
+  ansible.builtin.template:
+    src: templates/linuxcnc-autostart-sway.conf.j2
+    dest: "{{ linuxcnc_autostart_home }}/.config/sway/config.d/90-linuxcnc-autostart.conf"
+    owner: "{{ target_user }}"
+    group: "{{ linuxcnc_autostart_group.stdout }}"
+    mode: "0644"
+    backup: true
+    validate: /usr/bin/sway --validate --config %s
+
+- name: Include user-managed Sway configuration snippets
+  ansible.builtin.lineinfile:
+    path: "{{ linuxcnc_autostart_home }}/.config/sway/config"
+    line: "include ~/.config/sway/config.d/*"
+    insertafter: EOF
+    state: present
+    owner: "{{ target_user }}"
+    group: "{{ linuxcnc_autostart_group.stdout }}"
+    mode: "0644"
+    backup: true
+
+- name: Validate the resulting Sway configuration
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/sway
+      - --validate
+      - --config
+      - "{{ linuxcnc_autostart_home }}/.config/sway/config"
+  become_user: "{{ target_user }}"
+  environment:
+    HOME: "{{ linuxcnc_autostart_home }}"
+    XDG_RUNTIME_DIR: "/run/user/{{ linuxcnc_autostart_uid }}"
+  changed_when: false
+  check_mode: false
