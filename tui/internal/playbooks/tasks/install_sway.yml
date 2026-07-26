@@ -167,9 +167,6 @@
       ansible.builtin.template:
         src: templates/sway-config.j2
         dest: "{{ sway_target_home }}/.config/sway/config"
-        owner: "{{ target_user }}"
-        group: "{{ sway_target_group_result.stdout }}"
-        mode: "0644"
         backup: true
         validate: /usr/bin/sway --validate --config %s
       become_user: "{{ target_user }}"
@@ -182,6 +179,19 @@
         WAYLAND_DISPLAY: ""
         DISPLAY: ""
         SWAYSOCK: ""
+
+    # The TUI launches ansible-playbook through sudo, so its staged template is
+    # root-owned even though this task becomes the target user. Asking the
+    # unprivileged template module to chmod/chown that staged source fails with
+    # EPERM before its validated atomic move. Enforce final metadata separately
+    # as root after the target-user validation and replacement succeed.
+    - name: Enforce Sway configuration ownership and permissions
+      ansible.builtin.file:
+        path: "{{ sway_target_home }}/.config/sway/config"
+        state: file
+        owner: "{{ target_user }}"
+        group: "{{ sway_target_group_result.stdout }}"
+        mode: "0644"
 
     - name: Validate the installed Sway configuration and included snippets
       ansible.builtin.command:
