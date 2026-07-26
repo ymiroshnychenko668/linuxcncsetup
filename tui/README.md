@@ -65,16 +65,15 @@ items can be run independently:
   uses Claude Code's native automatic-update mechanism. Run `claude` after
   installation and follow the available authentication flow; installation
   alone does not grant Claude Code service access.
-- **Warp Terminal** installs the `warp-terminal` system package from Warp's
-  [stable APT repository](https://releases.warp.dev/linux/deb). The repository
-  is restricted to the machine's native architecture and its official signing
-  key is scoped to that repository through `signed-by`. Launch
+- **Warp Terminal** downloads Warp's
+  [official architecture-specific Debian package](https://docs.warp.dev/getting-started/quickstart/installation-and-setup)
+  and installs it without refreshing the machine's global APT indexes. The
+  package configures Warp's signed update repository and signing key. Launch
   `warp-terminal` after installation; the first launch needs an internet
   connection, while creating or signing in to a Warp account is optional.
-  Future releases are delivered through normal APT updates. Online AI and
-  collaboration features still require connectivity and the applicable
-  account access. Warp requires glibc 2.31+ and graphics hardware with
-  OpenGL ES 3.0+ or Vulkan support.
+  Online AI and collaboration features still require connectivity and the
+  applicable account access. Warp requires glibc 2.31+ and graphics hardware
+  with OpenGL ES 3.0+ or Vulkan support.
 - **htop**, **Midnight Commander**, and **Terminator** each install only their
   selected Debian package.
 - **User lingering** enables lingering for the target user without installing

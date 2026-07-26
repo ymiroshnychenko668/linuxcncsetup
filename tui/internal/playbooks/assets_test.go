@@ -120,6 +120,73 @@ func TestDeveloperToolsSharedAPTOnlyInstallsMissingPackages(t *testing.T) {
 	}
 }
 
+func TestAgentComponentsDeferInstallerPackagesUntilInstallationIsNeeded(t *testing.T) {
+	playbook, _ := materializedDeveloperToolsAsset(
+		t,
+		"tasks/devtools_codex.yml",
+	)
+	for _, expected := range []string{
+		"      codex: []",
+		"      claude: []",
+		"      warp: []",
+	} {
+		if !strings.Contains(playbook, expected) {
+			t.Errorf(
+				"developer-tools playbook does not defer installer packages with %q",
+				expected,
+			)
+		}
+	}
+
+	tests := []struct {
+		name        string
+		task        string
+		start       string
+		end         string
+		missingFact string
+		absentState string
+	}{
+		{
+			name:        "Codex",
+			task:        "tasks/devtools_codex.yml",
+			start:       "- name: Read packages required by the Codex installer",
+			end:         "- name: Check for a Codex installer downloader",
+			missingFact: "devtools_codex_missing_packages",
+			absentState: "not devtools_codex_command_entry.stat.exists",
+		},
+		{
+			name:        "Claude Code",
+			task:        "tasks/devtools_claude.yml",
+			start:       "- name: Read packages required by the Claude Code installer",
+			end:         "- name: Check for a Claude Code installer downloader",
+			missingFact: "devtools_claude_missing_packages",
+			absentState: "not devtools_claude_command_entry.stat.exists",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, task := materializedDeveloperToolsAsset(t, test.task)
+			block := assetBlockBetween(t, task, test.start, test.end)
+			for _, expected := range []string{
+				"ansible.builtin.package_facts:",
+				"ansible.builtin.apt:",
+				test.missingFact,
+				test.absentState,
+				"| length > 0",
+			} {
+				if !strings.Contains(block, expected) {
+					t.Errorf(
+						"%s installer-prerequisite block does not contain %q",
+						test.name,
+						expected,
+					)
+				}
+			}
+		})
+	}
+}
+
 func TestOfficialAgentInstallersArePerUserAndNotPipedToShell(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -186,7 +253,7 @@ func TestOfficialAgentInstallersArePerUserAndNotPipedToShell(t *testing.T) {
 	}
 }
 
-func TestWarpUsesScopedSignedRepositoryForNativeArchitecture(t *testing.T) {
+func TestWarpUsesOfficialDebWithoutRefreshingAPTIndexes(t *testing.T) {
 	playbook, task := materializedDeveloperToolsAsset(
 		t,
 		"tasks/devtools_warp.yml",
@@ -194,11 +261,8 @@ func TestWarpUsesScopedSignedRepositoryForNativeArchitecture(t *testing.T) {
 	combined := playbook + "\n" + task
 
 	for _, expected := range []string{
-		"https://releases.warp.dev/linux/keys/warp.asc",
-		"https://releases.warp.dev/linux/deb",
-		"/etc/apt/keyrings/warpdotdev.gpg",
-		"signed-by={{ devtools_warp_keyring }}",
-		"0913165C78D5B7A41B42AC657FF7AB39D60F803F",
+		"https://app.warp.dev/download?package=deb",
+		"https://app.warp.dev/download?package=deb_arm64",
 		"warp-terminal",
 		"dpkg-query",
 		"--print-architecture",
@@ -206,10 +270,17 @@ func TestWarpUsesScopedSignedRepositoryForNativeArchitecture(t *testing.T) {
 		"arm64",
 		"ansible.builtin.assert:",
 		"ansible.builtin.get_url:",
-		"ansible.builtin.copy:",
-		"ansible.builtin.apt:",
-		"--dearmor",
-		"state: present",
+		"/usr/bin/dpkg-deb",
+		"- Package",
+		"- Architecture",
+		"- Version",
+		"/usr/bin/apt-get",
+		"--no-install-recommends",
+		"--no-remove",
+		"DEBIAN_FRONTEND: noninteractive",
+		"/etc/apt/sources.list.d/warpdotdev.list",
+		"/etc/apt/keyrings/warpdotdev.gpg",
+		"Remove the temporary Warp package directory",
 	} {
 		if !strings.Contains(combined, expected) {
 			t.Errorf("Warp installer does not contain %q", expected)
@@ -218,57 +289,47 @@ func TestWarpUsesScopedSignedRepositoryForNativeArchitecture(t *testing.T) {
 
 	for _, unsafe := range []string{
 		"ansible.builtin.shell:",
+		"ansible.builtin.apt:",
+		"update_cache:",
+		"apt-get update",
 		"apt-key",
-		"trusted=yes",
-		"trusted: yes",
+		"--dearmor",
+		"ansible.builtin.copy:",
 		"validate_certs: false",
 		"arch=amd64",
 	} {
 		if strings.Contains(task, unsafe) {
-			t.Errorf("Warp installer contains unsafe or non-portable pattern %q", unsafe)
+			t.Errorf(
+				"Warp direct-package installer contains forbidden pattern %q",
+				unsafe,
+			)
 		}
 	}
 }
 
-func TestWarpSkipsRepositoryAndAPTWhenAlreadyInstalled(t *testing.T) {
+func TestWarpSkipsDirectPackageWhenAlreadyInstalled(t *testing.T) {
 	_, task := materializedDeveloperToolsAsset(
 		t,
 		"tasks/devtools_warp.yml",
 	)
 
-	blocks := []struct {
-		name  string
-		start string
-		end   string
-	}{
-		{
-			name:  "APT keyring directory",
-			start: "- name: Create the scoped APT keyring directory",
-			end:   "- name: Download the Warp repository signing key",
-		},
-		{
-			name:  "repository signing-key download",
-			start: "- name: Download the Warp repository signing key",
-			end:   "- name: Inspect the Warp repository signing key",
-		},
-		{
-			name:  "repository configuration",
-			start: "- name: Configure the Warp stable repository",
-			end:   "- name: Install Warp Terminal",
-		},
-		{
-			name:  "APT package installation",
-			start: "- name: Install Warp Terminal",
-			end:   "- name: Preview the Warp Terminal installation in check mode",
-		},
-	}
-
-	for _, block := range blocks {
-		content := assetBlockBetween(t, task, block.start, block.end)
-		if !strings.Contains(content, "not devtools_warp_installed") {
+	installBlock := assetBlockBetween(
+		t,
+		task,
+		"- name: Install Warp Terminal from the official Debian package",
+		"- name: Preview the Warp Terminal installation in check mode",
+	)
+	for _, expected := range []string{
+		"- not devtools_warp_installed",
+		"ansible.builtin.get_url:",
+		"/usr/bin/apt-get",
+		"always:",
+		"Remove the temporary Warp package directory",
+	} {
+		if !strings.Contains(installBlock, expected) {
 			t.Errorf(
-				"Warp %s is not skipped when Warp is already installed",
-				block.name,
+				"Warp installed-state guard block does not contain %q",
+				expected,
 			)
 		}
 	}

@@ -38,7 +38,7 @@ var devToolsSections = []section{
 	},
 	{
 		title:       "Warp Terminal",
-		description: "Add Warp's signed APT repository and install Warp Terminal.",
+		description: "Install Warp's official Debian package without refreshing APT indexes.",
 		action:      actionInstallDevToolsWarp,
 	},
 	{
@@ -239,8 +239,9 @@ func renderDevToolsAction(action sectionAction, confirming bool) []string {
 		lines = []string{
 			warningStyle.Render("Install Warp Terminal?"),
 			"",
-			"Adds Warp's signed APT repository and",
-			"installs Warp Terminal.",
+			"Downloads Warp's official native .deb and",
+			"installs it without refreshing APT indexes.",
+			"The package configures signed updates.",
 			"Supports x86-64 and ARM64.",
 		}
 	case actionInstallDevToolsHtop:

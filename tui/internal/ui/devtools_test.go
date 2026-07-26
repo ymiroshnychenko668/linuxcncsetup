@@ -82,7 +82,7 @@ func TestNewDevToolsSubmenuEntries(t *testing.T) {
 		{
 			action:      actionInstallDevToolsWarp,
 			title:       "Warp Terminal",
-			description: []string{"signed APT repository", "Warp Terminal"},
+			description: []string{"official Debian package", "without refreshing APT"},
 		},
 	}
 
@@ -243,8 +243,9 @@ func TestDevToolsConfirmationViewsDescribeSelectedComponent(t *testing.T) {
 			action: actionInstallDevToolsWarp,
 			expected: []string{
 				"Install Warp Terminal?",
-				"signed APT repository",
-				"installs Warp Terminal",
+				"official native .deb",
+				"without refreshing APT indexes",
+				"configures signed updates",
 				"x86-64 and ARM64",
 			},
 		},

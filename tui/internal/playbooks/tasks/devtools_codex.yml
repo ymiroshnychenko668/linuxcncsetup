@@ -68,6 +68,33 @@
   loop: "{{ devtools_codex_install_directories.results }}"
   when: not devtools_codex_command_entry.stat.exists
 
+- name: Read packages required by the Codex installer
+  ansible.builtin.package_facts:
+    manager: auto
+  when: not devtools_codex_command_entry.stat.exists
+
+- name: Determine missing Codex installer packages
+  ansible.builtin.set_fact:
+    devtools_codex_missing_packages: >-
+      {{
+        devtools_codex_required_packages
+        | difference(ansible_facts.packages.keys() | list)
+      }}
+  when: not devtools_codex_command_entry.stat.exists
+
+- name: Install missing Codex installer packages
+  ansible.builtin.apt:
+    name: "{{ devtools_codex_missing_packages }}"
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+    lock_timeout: 120
+  become: true
+  when:
+    - not ansible_check_mode
+    - not devtools_codex_command_entry.stat.exists
+    - devtools_codex_missing_packages | length > 0
+
 - name: Check for a Codex installer downloader
   ansible.builtin.command:
     argv:

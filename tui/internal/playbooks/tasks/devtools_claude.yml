@@ -68,6 +68,33 @@
   loop: "{{ devtools_claude_install_directories.results }}"
   when: not devtools_claude_command_entry.stat.exists
 
+- name: Read packages required by the Claude Code installer
+  ansible.builtin.package_facts:
+    manager: auto
+  when: not devtools_claude_command_entry.stat.exists
+
+- name: Determine missing Claude Code installer packages
+  ansible.builtin.set_fact:
+    devtools_claude_missing_packages: >-
+      {{
+        devtools_claude_required_packages
+        | difference(ansible_facts.packages.keys() | list)
+      }}
+  when: not devtools_claude_command_entry.stat.exists
+
+- name: Install missing Claude Code installer packages
+  ansible.builtin.apt:
+    name: "{{ devtools_claude_missing_packages }}"
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+    lock_timeout: 120
+  become: true
+  when:
+    - not ansible_check_mode
+    - not devtools_claude_command_entry.stat.exists
+    - devtools_claude_missing_packages | length > 0
+
 - name: Check for a Claude Code installer downloader
   ansible.builtin.command:
     argv:
