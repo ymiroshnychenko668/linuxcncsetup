@@ -98,6 +98,11 @@ var mainSections = []section{
 		action:      actionInstallAnsible,
 	},
 	{
+		title:       "Install CorvusCNC config",
+		description: "Clone the ready-to-use CorvusCNC repository into ~/linuxcnc/configs/corvuscnc.",
+		action:      actionInstallLinuxCNCConfig,
+	},
+	{
 		title:       "Install Sway",
 		description: "Add the complete Sway desktop without changing the active display manager.",
 		action:      actionInstallSway,
@@ -174,11 +179,6 @@ var autologinSections = []section{
 }
 
 var configurationSections = []section{
-	{
-		title:       "Install CorvusCNC config",
-		description: "Clone the ready-to-use CorvusCNC repository into ~/linuxcnc/configs/corvuscnc.",
-		action:      actionInstallLinuxCNCConfig,
-	},
 	{
 		title:       "IRQ affinity",
 		description: "Keep movable device interrupts off CPUs reserved for LinuxCNC real-time work.",

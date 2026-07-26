@@ -9,8 +9,7 @@ import (
 
 func TestLinuxCNCConfigInstallConfirmation(t *testing.T) {
 	model := New()
-	model.page = menuConfiguration
-	model.selected = sectionActionIndex(t, configurationSections, actionInstallLinuxCNCConfig)
+	model.selected = sectionActionIndex(t, mainSections, actionInstallLinuxCNCConfig)
 	model.width = 180
 	model.confirming = true
 
@@ -32,8 +31,7 @@ func TestLinuxCNCConfigInstallConfirmation(t *testing.T) {
 
 func TestLinuxCNCConfigInstallRequiresAnsible(t *testing.T) {
 	model := New()
-	model.page = menuConfiguration
-	model.selected = sectionActionIndex(t, configurationSections, actionInstallLinuxCNCConfig)
+	model.selected = sectionActionIndex(t, mainSections, actionInstallLinuxCNCConfig)
 	t.Setenv("PATH", t.TempDir())
 
 	model.prepareSelectedAction()
@@ -48,8 +46,7 @@ func TestLinuxCNCConfigInstallRequiresAnsible(t *testing.T) {
 
 func TestLinuxCNCConfigInstallCancellation(t *testing.T) {
 	model := New()
-	model.page = menuConfiguration
-	model.selected = sectionActionIndex(t, configurationSections, actionInstallLinuxCNCConfig)
+	model.selected = sectionActionIndex(t, mainSections, actionInstallLinuxCNCConfig)
 	model.confirming = true
 
 	updated, command := model.Update(tea.KeyPressMsg{Code: 'n', Text: "n"})

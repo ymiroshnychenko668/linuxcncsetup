@@ -57,16 +57,19 @@ func TestAnsibleConfirmationView(t *testing.T) {
 }
 
 func TestAutologinSubmenuStructure(t *testing.T) {
-	if mainSections[1].action != actionInstallSway {
-		t.Fatal("Sway installation should follow Ansible installation")
+	if mainSections[1].action != actionInstallLinuxCNCConfig {
+		t.Fatal("CorvusCNC installation should follow Ansible installation")
 	}
-	if mainSections[2].action != actionOpenDevTools {
+	if mainSections[2].action != actionInstallSway {
+		t.Fatal("Sway installation should follow CorvusCNC installation")
+	}
+	if mainSections[3].action != actionOpenDevTools {
 		t.Fatal("developer-tools submenu should follow Sway installation")
 	}
-	if mainSections[3].action != actionOpenLinuxCNCAutostart {
+	if mainSections[4].action != actionOpenLinuxCNCAutostart {
 		t.Fatal("LinuxCNC autostart should follow developer-tools installation")
 	}
-	if mainSections[4].action != actionOpenAutologin {
+	if mainSections[5].action != actionOpenAutologin {
 		t.Fatal("automatic login should follow LinuxCNC autostart")
 	}
 	if autologinSections[0].action != actionAutologinLightDM {
@@ -78,14 +81,14 @@ func TestAutologinSubmenuStructure(t *testing.T) {
 	if autologinSections[2].action != actionBack {
 		t.Fatal("automatic-login submenu should end with a back action")
 	}
-	if mainSections[5].action != actionReboot {
+	if mainSections[6].action != actionReboot {
 		t.Fatal("reboot should follow the automatic-login submenu")
 	}
 }
 
 func TestEnterAndLeaveAutologinSubmenu(t *testing.T) {
 	model := New()
-	model.selected = 4
+	model.selected = 5
 	model.prepareSelectedAction()
 
 	if model.page != menuAutologin || model.selected != 0 {
@@ -98,7 +101,7 @@ func TestEnterAndLeaveAutologinSubmenu(t *testing.T) {
 	}
 
 	result := updated.(Model)
-	if result.page != menuMain || result.selected != 4 {
+	if result.page != menuMain || result.selected != 5 {
 		t.Fatalf("Esc returned to page %d selection %d", result.page, result.selected)
 	}
 }
@@ -116,16 +119,13 @@ func TestLinuxCNCAutostartSubmenuStructure(t *testing.T) {
 }
 
 func TestConfigurationSubmenuStructure(t *testing.T) {
-	if mainSections[7].action != actionOpenConfiguration {
+	if mainSections[8].action != actionOpenConfiguration {
 		t.Fatal("Configuration should open its submenu")
 	}
-	if configurationSections[0].action != actionInstallLinuxCNCConfig {
-		t.Fatal("CorvusCNC should be the first configuration installer")
+	if configurationSections[0].action != actionOpenIRQAffinity {
+		t.Fatal("IRQ affinity should be the first configuration tool")
 	}
-	if configurationSections[1].action != actionOpenIRQAffinity {
-		t.Fatal("IRQ affinity should follow the CorvusCNC installer")
-	}
-	if configurationSections[2].action != actionBack {
+	if configurationSections[1].action != actionBack {
 		t.Fatal("configuration submenu should end with a back action")
 	}
 	if irqAffinitySections[0].action != actionIRQDevices {
@@ -144,7 +144,7 @@ func TestConfigurationSubmenuStructure(t *testing.T) {
 
 func TestEnterAndLeaveConfigurationSubmenu(t *testing.T) {
 	model := New()
-	model.selected = 7
+	model.selected = 8
 	model.prepareSelectedAction()
 
 	if model.page != menuConfiguration || model.selected != 0 {
@@ -156,7 +156,7 @@ func TestEnterAndLeaveConfigurationSubmenu(t *testing.T) {
 		t.Fatal("leaving Configuration should not execute a command")
 	}
 	result := updated.(Model)
-	if result.page != menuMain || result.selected != 7 {
+	if result.page != menuMain || result.selected != 8 {
 		t.Fatalf("Esc returned to page %d selection %d", result.page, result.selected)
 	}
 }
@@ -406,7 +406,7 @@ func TestEnterAndLeaveLinuxCNCAutostartMenus(t *testing.T) {
 	t.Setenv(linuxCNCConfigDirectoryEnvironment, root)
 
 	model := New()
-	model.selected = 3
+	model.selected = 4
 	model.prepareSelectedAction()
 	if model.page != menuLinuxCNCAutostart || model.selected != 0 {
 		t.Fatalf("entering platform menu produced page %d selection %d", model.page, model.selected)
@@ -437,7 +437,7 @@ func TestEnterAndLeaveLinuxCNCAutostartMenus(t *testing.T) {
 		t.Fatal("leaving the platform menu should not execute a command")
 	}
 	result = updated.(Model)
-	if result.page != menuMain || result.selected != 3 {
+	if result.page != menuMain || result.selected != 4 {
 		t.Fatalf("second Esc returned to page %d selection %d", result.page, result.selected)
 	}
 }
@@ -484,7 +484,7 @@ func TestLinuxCNCAutostartConfirmationView(t *testing.T) {
 
 func TestSwayInstallationConfirmationView(t *testing.T) {
 	model := New()
-	model.selected = 1
+	model.selected = 2
 	model.confirming = true
 	view := model.View()
 
@@ -556,7 +556,7 @@ func TestAutologinCancellationNamesSelectedAction(t *testing.T) {
 
 func TestRebootConfirmationView(t *testing.T) {
 	model := New()
-	model.selected = 5
+	model.selected = 6
 	model.confirming = true
 	view := model.View()
 
