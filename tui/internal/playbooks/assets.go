@@ -18,6 +18,7 @@ const (
 	Autologin             Playbook = "autologin.yml"
 	InstallLinuxCNCConfig Playbook = "install-linuxcnc-config.yml"
 	IRQAffinity           Playbook = "irq-affinity.yml"
+	GRUBRealtime          Playbook = "grub-realtime.yml"
 	InstallDevTools       Playbook = "install-devtools.yml"
 	InstallSway           Playbook = "install-sway.yml"
 	LinuxCNCAutostart     Playbook = "linuxcnc-autostart.yml"
@@ -27,7 +28,7 @@ const (
 // The caller must invoke cleanup after ansible-playbook exits.
 func Materialize(playbook Playbook) (playbookPath string, cleanup func(), err error) {
 	switch playbook {
-	case Autologin, InstallLinuxCNCConfig, IRQAffinity, InstallDevTools,
+	case Autologin, InstallLinuxCNCConfig, IRQAffinity, GRUBRealtime, InstallDevTools,
 		InstallSway, LinuxCNCAutostart:
 	default:
 		return "", nil, fmt.Errorf("unknown embedded playbook: %q", playbook)

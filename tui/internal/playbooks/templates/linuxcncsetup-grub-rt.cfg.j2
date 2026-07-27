@@ -1,0 +1,2 @@
+# Managed by LinuxCNC Setup. Edit through the TUI, not by hand.
+GRUB_CMDLINE_LINUX_DEFAULT="$GRUB_CMDLINE_LINUX_DEFAULT isolcpus={{ grub_rt_protected_cpus }} nohz_full={{ grub_rt_protected_cpus }} rcu_nocbs={{ grub_rt_protected_cpus }} irqaffinity={{ grub_rt_housekeeping_cpus }} kthread_cpus={{ grub_rt_housekeeping_cpus }} nmi_watchdog=0"

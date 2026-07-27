@@ -66,11 +66,11 @@ func TestAutologinSubmenuStructure(t *testing.T) {
 	if mainSections[3].action != actionOpenDevTools {
 		t.Fatal("developer-tools submenu should follow Sway installation")
 	}
-	if mainSections[4].action != actionOpenLinuxCNCAutostart {
-		t.Fatal("LinuxCNC autostart should follow developer-tools installation")
+	if mainSections[4].action != actionOpenAutologin {
+		t.Fatal("automatic login should follow Sway installation")
 	}
-	if mainSections[5].action != actionOpenAutologin {
-		t.Fatal("automatic login should follow LinuxCNC autostart")
+	if mainSections[5].action != actionOpenLinuxCNCAutostart {
+		t.Fatal("LinuxCNC autostart should follow automatic login")
 	}
 	if autologinSections[0].action != actionAutologinLightDM {
 		t.Fatal("LightDM should be the first automatic-login option")
@@ -82,13 +82,13 @@ func TestAutologinSubmenuStructure(t *testing.T) {
 		t.Fatal("automatic-login submenu should end with a back action")
 	}
 	if mainSections[6].action != actionReboot {
-		t.Fatal("reboot should follow the automatic-login submenu")
+		t.Fatal("reboot should follow the LinuxCNC autostart submenu")
 	}
 }
 
 func TestEnterAndLeaveAutologinSubmenu(t *testing.T) {
 	model := New()
-	model.selected = 5
+	model.selected = 4
 	model.prepareSelectedAction()
 
 	if model.page != menuAutologin || model.selected != 0 {
@@ -101,7 +101,7 @@ func TestEnterAndLeaveAutologinSubmenu(t *testing.T) {
 	}
 
 	result := updated.(Model)
-	if result.page != menuMain || result.selected != 5 {
+	if result.page != menuMain || result.selected != 4 {
 		t.Fatalf("Esc returned to page %d selection %d", result.page, result.selected)
 	}
 }
@@ -122,10 +122,13 @@ func TestConfigurationSubmenuStructure(t *testing.T) {
 	if mainSections[8].action != actionOpenConfiguration {
 		t.Fatal("Configuration should open its submenu")
 	}
-	if configurationSections[0].action != actionOpenIRQAffinity {
-		t.Fatal("IRQ affinity should be the first configuration tool")
+	if configurationSections[0].action != actionOpenGRUBRealtime {
+		t.Fatal("GRUB real-time setup should be the first configuration tool")
 	}
-	if configurationSections[1].action != actionBack {
+	if configurationSections[1].action != actionOpenIRQAffinity {
+		t.Fatal("IRQ affinity should follow GRUB real-time setup")
+	}
+	if configurationSections[2].action != actionBack {
 		t.Fatal("configuration submenu should end with a back action")
 	}
 	if irqAffinitySections[0].action != actionIRQDevices {
@@ -406,7 +409,7 @@ func TestEnterAndLeaveLinuxCNCAutostartMenus(t *testing.T) {
 	t.Setenv(linuxCNCConfigDirectoryEnvironment, root)
 
 	model := New()
-	model.selected = 4
+	model.selected = 5
 	model.prepareSelectedAction()
 	if model.page != menuLinuxCNCAutostart || model.selected != 0 {
 		t.Fatalf("entering platform menu produced page %d selection %d", model.page, model.selected)
@@ -437,7 +440,7 @@ func TestEnterAndLeaveLinuxCNCAutostartMenus(t *testing.T) {
 		t.Fatal("leaving the platform menu should not execute a command")
 	}
 	result = updated.(Model)
-	if result.page != menuMain || result.selected != 4 {
+	if result.page != menuMain || result.selected != 5 {
 		t.Fatalf("second Esc returned to page %d selection %d", result.page, result.selected)
 	}
 }

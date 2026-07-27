@@ -37,9 +37,14 @@ const (
 	actionAutologinLightDM
 	actionAutologinSway
 	actionOpenConfiguration
+	actionOpenGRUBRealtime
+	actionGRUBToggleCPU
+	actionGRUBContinue
+	actionGRUBApply
 	actionInstallLinuxCNCConfig
 	actionOpenIRQAffinity
 	actionIRQDevices
+	actionIRQFullInterrupts
 	actionIRQDeviceSelect
 	actionIRQKernelCounters
 	actionIRQDeviceToggleCPU
@@ -78,6 +83,9 @@ const (
 	menuLinuxCNCConfigs
 	menuAutologin
 	menuConfiguration
+	menuGRUBRealtime
+	menuGRUBCPUs
+	menuGRUBReview
 	menuIRQAffinity
 	menuIRQDevices
 	menuIRQDeviceCPUs
@@ -116,14 +124,14 @@ var mainSections = []section{
 		action:      actionOpenDevTools,
 	},
 	{
-		title:       "LinuxCNC autostart",
-		description: "Choose a desktop and LinuxCNC configuration to start automatically.",
-		action:      actionOpenLinuxCNCAutostart,
-	},
-	{
 		title:       "Automatic login",
 		description: "Choose automatic login through LightDM or greetd with Sway.",
 		action:      actionOpenAutologin,
+	},
+	{
+		title:       "LinuxCNC autostart",
+		description: "Choose a desktop and LinuxCNC configuration to start automatically.",
+		action:      actionOpenLinuxCNCAutostart,
 	},
 	{
 		title:       "Reboot system",
@@ -182,6 +190,11 @@ var autologinSections = []section{
 }
 
 var configurationSections = []section{
+	{
+		title:       "GRUB real-time setup",
+		description: "Choose protected CPUs and install explained kernel parameters with Ansible.",
+		action:      actionOpenGRUBRealtime,
+	},
 	{
 		title:       "IRQ affinity",
 		description: "Keep movable device interrupts off CPUs reserved for LinuxCNC real-time work.",
@@ -321,6 +334,8 @@ type Model struct {
 	irqDeviceCPUs            []int
 	irqDeviceCPUSections     []section
 	irqDeviceDetailOffset    int
+	grubProtectedCPUs        []int
+	grubCPUSections          []section
 }
 
 type actionFinishedMsg struct {
@@ -443,7 +458,8 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 				message.action == actionIRQDisable ||
 				message.action == actionIRQDevicePersist ||
 				message.action == actionIRQDeviceApplyLive ||
-				message.action == actionIRQDeviceRemove {
+				message.action == actionIRQDeviceRemove ||
+				message.action == actionGRUBApply {
 				m.refreshIRQSnapshot()
 				m.refreshIRQDeviceInventory(false)
 			}
@@ -482,6 +498,10 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			if m.page == menuIRQDeviceCPUs &&
 				m.currentSection().action == actionIRQDeviceToggleCPU {
 				m.toggleIRQDeviceCPU(m.currentSection().value)
+			}
+			if m.page == menuGRUBCPUs &&
+				m.currentSection().action == actionGRUBToggleCPU {
+				m.toggleGRUBCPU(m.currentSection().value)
 			}
 		case "r":
 			if m.page == menuIRQDevices {
@@ -587,7 +607,7 @@ func (m Model) renderDetail() string {
 	current := m.currentSection()
 	var lines []string
 	switch current.action {
-	case actionIRQDeviceSelect, actionIRQKernelCounters,
+	case actionIRQFullInterrupts, actionIRQDeviceSelect, actionIRQKernelCounters,
 		actionIRQDevicePreview, actionIRQDevicePersist,
 		actionIRQDeviceApplyLive, actionIRQDeviceRemove:
 		// These views provide their own full identity and use the remaining
@@ -713,6 +733,14 @@ func (m Model) renderDetail() string {
 		}
 	case actionOpenConfiguration:
 		lines = append(lines, "Press Enter to open configuration tools.")
+	case actionOpenGRUBRealtime:
+		lines = append(lines, renderGRUBIntroduction())
+	case actionGRUBToggleCPU:
+		lines = append(lines, m.renderGRUBCPUSelection())
+	case actionGRUBContinue:
+		lines = append(lines, m.renderGRUBCPUSelection(), "", "Press Enter to review every parameter.")
+	case actionGRUBApply:
+		lines = append(lines, m.renderGRUBReview(m.confirming))
 	case actionInstallLinuxCNCConfig:
 		lines = append(lines, renderLinuxCNCConfigInstall(m.confirming)...)
 	case actionOpenIRQAffinity:
@@ -729,6 +757,8 @@ func (m Model) renderDetail() string {
 			"It reads the real /proc/interrupts counters",
 			"and groups vectors by physical device.",
 		)
+	case actionIRQFullInterrupts:
+		lines = append(lines, m.renderIRQFullInterrupts())
 	case actionIRQDeviceSelect:
 		lines = append(lines, m.renderIRQDeviceDetail(current.value))
 	case actionIRQKernelCounters:
@@ -935,6 +965,42 @@ func (m *Model) prepareSelectedAction() {
 		m.openPage(menuConfiguration)
 		return
 
+	case actionOpenGRUBRealtime:
+		if !m.beginGRUBSetup() {
+			return
+		}
+		m.openPage(menuGRUBCPUs)
+		m.rebuildGRUBCPUSections()
+		return
+
+	case actionGRUBToggleCPU:
+		m.toggleGRUBCPU(current.value)
+		return
+
+	case actionGRUBContinue:
+		if err := m.validateGRUBDraft(); err != nil {
+			m.status = fmt.Sprintf("Cannot continue: %v", err)
+			return
+		}
+		m.openPage(menuGRUBReview)
+		return
+
+	case actionGRUBApply:
+		if _, err := exec.LookPath("ansible-playbook"); err != nil {
+			m.status = "Install Ansible first, then retry this action."
+			return
+		}
+		if err := m.validateGRUBDraft(); err != nil {
+			m.status = fmt.Sprintf("Cannot configure GRUB: %v", err)
+			return
+		}
+		if os.Geteuid() != 0 {
+			if _, err := exec.LookPath("sudo"); err != nil {
+				m.status = "Cannot configure GRUB: sudo was not found."
+				return
+			}
+		}
+
 	case actionOpenIRQAffinity:
 		m.openPage(menuIRQAffinity)
 		m.refreshIRQSnapshot()
@@ -958,6 +1024,10 @@ func (m *Model) prepareSelectedAction() {
 		return
 
 	case actionIRQKernelCounters:
+		m.refreshIRQDeviceInventory(true)
+		return
+
+	case actionIRQFullInterrupts:
 		m.refreshIRQDeviceInventory(true)
 		return
 
@@ -1216,6 +1286,12 @@ func (m Model) visibleSections() []section {
 		return autologinSections
 	case menuConfiguration:
 		return configurationSections
+	case menuGRUBRealtime:
+		return grubRealtimeSections
+	case menuGRUBCPUs:
+		return m.grubCPUSections
+	case menuGRUBReview:
+		return grubReviewSections
 	case menuIRQAffinity:
 		return irqAffinitySections
 	case menuIRQDevices:
@@ -1270,6 +1346,12 @@ func (m Model) pageTitle() string {
 		return "Automatic login"
 	case menuConfiguration:
 		return "Configuration"
+	case menuGRUBRealtime:
+		return "GRUB real-time setup"
+	case menuGRUBCPUs:
+		return "Protected boot CPUs"
+	case menuGRUBReview:
+		return "Review GRUB parameters"
 	case menuIRQAffinity:
 		return "IRQ affinity"
 	case menuIRQDevices:
@@ -1311,6 +1393,15 @@ func (m *Model) back() {
 	case menuConfiguration:
 		m.openPage(menuMain)
 		m.selectAction(actionOpenConfiguration)
+	case menuGRUBRealtime:
+		m.openPage(menuConfiguration)
+		m.selectAction(actionOpenGRUBRealtime)
+	case menuGRUBCPUs:
+		m.openPage(menuConfiguration)
+		m.selectAction(actionOpenGRUBRealtime)
+	case menuGRUBReview:
+		m.openPage(menuGRUBCPUs)
+		m.selectAction(actionGRUBContinue)
 	case menuIRQAffinity:
 		m.openPage(menuConfiguration)
 		m.selectAction(actionOpenIRQAffinity)
@@ -1369,6 +1460,8 @@ func (m Model) executeAction(action sectionAction, value string) tea.Cmd {
 		return runAutologinPlaybook(action, "lightdm")
 	case actionAutologinSway:
 		return runAutologinPlaybook(action, "sway")
+	case actionGRUBApply:
+		return m.runGRUBPlaybook(action)
 	case actionIRQDevicePreview:
 		return m.runIRQDevicePersistentPlaybook(action, true, false)
 	case actionIRQDevicePersist:
@@ -1566,6 +1659,8 @@ func actionName(action sectionAction) string {
 		return "LightDM auto-login configuration"
 	case actionAutologinSway:
 		return "Sway auto-login configuration"
+	case actionGRUBApply:
+		return "GRUB real-time configuration"
 	case actionIRQDevicePreview:
 		return "Device IRQ affinity preview"
 	case actionIRQDevicePersist:
@@ -1605,6 +1700,8 @@ func actionRunningMessage(action sectionAction) string {
 		return "Running the LightDM auto-login playbook..."
 	case actionAutologinSway:
 		return "Running the Sway auto-login playbook..."
+	case actionGRUBApply:
+		return "Installing the managed GRUB real-time profile with Ansible..."
 	case actionIRQDevicePreview:
 		return "Previewing the persistent device IRQ rule..."
 	case actionIRQDevicePersist:
@@ -1644,6 +1741,8 @@ func actionCancelledMessage(action sectionAction) string {
 		return "LightDM auto-login configuration cancelled."
 	case actionAutologinSway:
 		return "Sway auto-login configuration cancelled."
+	case actionGRUBApply:
+		return "GRUB real-time configuration cancelled."
 	case actionIRQDevicePreview:
 		return "Device IRQ affinity preview cancelled."
 	case actionIRQDevicePersist:
@@ -1683,6 +1782,8 @@ func actionSuccessMessage(action sectionAction) string {
 		return "LightDM auto-login configured. Reboot when ready."
 	case actionAutologinSway:
 		return "Sway auto-login configured. Reboot when ready."
+	case actionGRUBApply:
+		return "GRUB real-time parameters installed. Reboot when ready to activate them."
 	case actionIRQDevicePreview:
 		return "Device IRQ rule preview completed. No changes were applied."
 	case actionIRQDevicePersist:

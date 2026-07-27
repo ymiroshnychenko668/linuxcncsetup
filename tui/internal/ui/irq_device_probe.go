@@ -100,6 +100,7 @@ type IRQDeviceGroup struct {
 // pseudo-interrupt rows such as NMI and LOC.
 type IRQDeviceInventory struct {
 	CPUs     []int
+	Rows     []IRQInterruptRow
 	Devices  []IRQDeviceGroup
 	Pseudo   []IRQInterruptRow
 	Problems []string
@@ -298,6 +299,10 @@ func groupIRQDevices(
 ) IRQDeviceInventory {
 	inventory := IRQDeviceInventory{
 		CPUs: append([]int(nil), table.CPUs...),
+		Rows: make([]IRQInterruptRow, 0, len(table.Rows)),
+	}
+	for _, row := range table.Rows {
+		inventory.Rows = append(inventory.Rows, cloneInterruptRow(row))
 	}
 	entries := make(map[int]IRQEntry, len(snapshot.IRQs))
 	for _, entry := range snapshot.IRQs {

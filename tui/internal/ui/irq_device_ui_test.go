@@ -16,13 +16,14 @@ func TestIRQDeviceListNavigationShowsRealProcData(t *testing.T) {
 	model := irqDeviceUIFixtureModel()
 	sections := model.visibleSections()
 
-	if len(sections) != 5 {
-		t.Fatalf("device page has %d rows; want two devices, one kernel row, refresh, and back", len(sections))
+	if len(sections) != 6 {
+		t.Fatalf("device page has %d rows; want two devices, one kernel row, full table, refresh, and back", len(sections))
 	}
 	expectedActions := []sectionAction{
 		actionIRQDeviceSelect,
 		actionIRQDeviceSelect,
 		actionIRQKernelCounters,
+		actionIRQFullInterrupts,
 		actionIRQDeviceRefresh,
 		actionBack,
 	}
@@ -43,12 +44,18 @@ func TestIRQDeviceListNavigationShowsRealProcData(t *testing.T) {
 	for _, expected := range []string{
 		"nvme0 [0000:0a:00.0]",
 		"Stable match: PCI 0000:0a:00.0",
-		"IRQ 39  nvme0q0",
+		"CPU0",
+		"CPU1",
+		"Requested",
+		"IRQ 39",
+		"nvme0q0",
 		"requested=0-1",
 		"effective=2",
-		"CPU0=10",
-		"IRQ 40  nvme0q1",
+		"IRQ 40",
+		"nvme0q1",
 		"effective=3",
+		"Σ",
+		"combined",
 	} {
 		if !strings.Contains(content, expected) {
 			t.Fatalf("device detail does not contain %q", expected)
@@ -80,12 +87,28 @@ func TestIRQDeviceListNavigationShowsRealProcData(t *testing.T) {
 	content = result.View().Content
 	for _, expected := range []string{
 		"Read-only /proc/interrupts row",
-		"ID: NMI",
-		"CPU0=5",
+		"NMI",
+		"CPU0",
+		"26",
 		"NMI: 5 6 7 8 Non-maskable interrupts",
 	} {
 		if !strings.Contains(content, expected) {
 			t.Fatalf("kernel-counter detail does not contain %q", expected)
+		}
+	}
+
+	result.selected = 3
+	content = result.View().Content
+	for _, expected := range []string{
+		"Complete /proc/interrupts",
+		"3 rows across 4 CPUs",
+		"39",
+		"nvme0q0",
+		"NMI",
+		"Non-maskable interrupts",
+	} {
+		if !strings.Contains(content, expected) {
+			t.Fatalf("full interrupt table does not contain %q", expected)
 		}
 	}
 }
@@ -178,19 +201,21 @@ func TestIRQDeviceSelectionCPUTogglingAndReviewNavigation(t *testing.T) {
 	}
 }
 
-func TestIRQDeviceDetailPgDownShowsLaterVectorAndSelectionResetsScroll(t *testing.T) {
+func TestIRQDeviceDetailTableShowsVectorsInOneScreen(t *testing.T) {
 	model := irqDeviceUIFixtureModel()
 	model.height = 22
 
 	content := model.View().Content
-	if !strings.Contains(content, "IRQ 39  nvme0q0") {
-		t.Fatal("first device-detail page does not show the first IRQ vector")
+	if !strings.Contains(content, "IRQ 39") ||
+		!strings.Contains(content, "nvme0q0") {
+		t.Fatal("device table does not show the first IRQ vector")
 	}
-	if strings.Contains(content, "IRQ 40  nvme0q1") {
-		t.Fatal("fixture is not long enough to exercise device-detail scrolling")
+	if !strings.Contains(content, "IRQ 40") ||
+		!strings.Contains(content, "nvme0q1") {
+		t.Fatal("device table does not show the second IRQ vector")
 	}
-	if !strings.Contains(content, "PgDn: more details") {
-		t.Fatal("first device-detail page does not advertise later details")
+	if strings.Contains(content, "PgDn: more details") {
+		t.Fatal("two-vector device table unexpectedly requires paging")
 	}
 
 	updated, command := model.Update(tea.KeyPressMsg{Code: tea.KeyPgDown})
@@ -198,15 +223,8 @@ func TestIRQDeviceDetailPgDownShowsLaterVectorAndSelectionResetsScroll(t *testin
 		t.Fatal("scrolling device details should not execute a command")
 	}
 	result := updated.(Model)
-	if result.irqDeviceDetailOffset == 0 {
-		t.Fatal("PgDn did not advance the device-detail offset")
-	}
-	content = result.View().Content
-	if !strings.Contains(content, "IRQ 40  nvme0q1") {
-		t.Fatal("PgDn did not expose the later IRQ vector")
-	}
-	if !strings.Contains(content, "PgUp: earlier details") {
-		t.Fatal("scrolled device detail does not advertise earlier details")
+	if result.irqDeviceDetailOffset != 0 {
+		t.Fatal("PgDn changed the offset of a table that already fits")
 	}
 
 	updated, command = result.Update(tea.KeyPressMsg{Code: tea.KeyDown})

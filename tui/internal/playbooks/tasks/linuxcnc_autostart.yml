@@ -54,6 +54,51 @@
         mode: "0755"
         backup: true
 
+    - name: Add the LinuxCNC launcher to the Waybar module list
+      ansible.builtin.set_fact:
+        linuxcnc_autostart_waybar_modules_left: >-
+          {{
+            (
+              linuxcnc_autostart_waybar_config["modules-left"]
+              | reject("equalto", "custom/linuxcnc")
+              | list
+            )
+            + ["custom/linuxcnc"]
+          }}
+
+    - name: Build the Waybar configuration with the shared LinuxCNC launcher
+      ansible.builtin.set_fact:
+        linuxcnc_autostart_waybar_managed: >-
+          {{
+            linuxcnc_autostart_waybar_config
+            | combine(
+                {
+                  "modules-left": linuxcnc_autostart_waybar_modules_left,
+                  "custom/linuxcnc": {
+                    "format": "CNC",
+                    "on-click": linuxcnc_autostart_home
+                      + "/.local/bin/linuxcnc-autostart",
+                    "tooltip": true,
+                    "tooltip-format": "Launch the selected LinuxCNC configuration"
+                  }
+                }
+              )
+          }}
+
+    - name: Install the LinuxCNC Waybar launcher
+      ansible.builtin.copy:
+        dest: "{{ linuxcnc_autostart_home }}/.config/waybar/config"
+        content: |
+          {{
+            linuxcnc_autostart_waybar_managed
+            | to_nice_json(indent=4, ensure_ascii=false)
+          }}
+        owner: "{{ target_user }}"
+        group: "{{ linuxcnc_autostart_group.stdout }}"
+        mode: "0644"
+        backup: true
+        validate: /usr/bin/python3 -m json.tool %s
+
     - name: Install the LinuxCNC Sway autostart snippet
       ansible.builtin.template:
         src: templates/linuxcnc-autostart-sway.conf.j2

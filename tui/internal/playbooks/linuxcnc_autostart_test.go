@@ -68,3 +68,61 @@ func TestLinuxCNCAutostartValidatesSwayWithoutALiveSession(t *testing.T) {
 		t.Errorf("isolated Sway validation runtimes = %d; want 3", got)
 	}
 }
+
+func TestLinuxCNCAutostartSharesFullscreenLauncherWithWaybar(t *testing.T) {
+	playbookPath, cleanup, err := Materialize(LinuxCNCAutostart)
+	if err != nil {
+		t.Fatalf("Materialize() error: %v", err)
+	}
+	t.Cleanup(cleanup)
+
+	root := filepath.Dir(playbookPath)
+	read := func(relativePath string) string {
+		t.Helper()
+		data, err := os.ReadFile(filepath.Join(root, relativePath))
+		if err != nil {
+			t.Fatalf("read %s: %v", relativePath, err)
+		}
+		return string(data)
+	}
+
+	playbook := read("linuxcnc-autostart.yml")
+	tasks := read("tasks/linuxcnc_autostart.yml")
+	swaySnippet := read("templates/linuxcnc-autostart-sway.conf.j2")
+
+	for _, expected := range []string{
+		".config/waybar/config",
+		"Validate the existing Waybar JSON configuration",
+		"linuxcnc_autostart_waybar_config",
+	} {
+		if !strings.Contains(playbook, expected) {
+			t.Errorf("LinuxCNC autostart preflight does not contain %q", expected)
+		}
+	}
+
+	sharedLauncher := `/.local/bin/linuxcnc-autostart`
+	for _, expected := range []string{
+		`"custom/linuxcnc"`,
+		`"modules-left"`,
+		`"on-click"`,
+		sharedLauncher,
+		"to_nice_json",
+		"validate: /usr/bin/python3 -m json.tool %s",
+	} {
+		if !strings.Contains(tasks, expected) {
+			t.Errorf("Waybar launcher tasks do not contain %q", expected)
+		}
+	}
+
+	for _, expected := range []string{
+		`assign [app_id="(?i)^qtvcp$"] workspace number 1`,
+		`assign [class="(?i)^qtvcp$"] workspace number 1`,
+		`for_window [app_id="(?i)^qtvcp$"] fullscreen enable`,
+		`for_window [class="(?i)^qtvcp$"] fullscreen enable`,
+		`exec --no-startup-id "$HOME` + sharedLauncher + `"`,
+	} {
+		if !strings.Contains(swaySnippet, expected) {
+			t.Errorf("Sway autostart snippet does not contain %q", expected)
+		}
+	}
+}

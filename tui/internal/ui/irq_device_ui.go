@@ -39,6 +39,8 @@ func (m *Model) refreshIRQDeviceInventory(refreshSnapshot bool) {
 			current.action == actionIRQKernelCounters {
 			selectedID = current.value
 			selectedAction = current.action
+		} else if current.action == actionIRQFullInterrupts {
+			selectedAction = current.action
 		}
 	}
 	m.irqDeviceDetailOffset = 0
@@ -64,6 +66,9 @@ func (m *Model) refreshIRQDeviceInventory(refreshSnapshot bool) {
 	}
 	if selectedID != "" && m.page == menuIRQDevices {
 		m.selectIRQInventoryRow(selectedAction, selectedID)
+	} else if selectedAction == actionIRQFullInterrupts &&
+		m.page == menuIRQDevices {
+		m.selectAction(actionIRQFullInterrupts)
 	}
 	m.status = fmt.Sprintf(
 		"Loaded %d device(s) and %d kernel counter(s) from /proc/interrupts.",
@@ -86,7 +91,7 @@ func (m *Model) clearIRQDeviceInventory() {
 
 func (m *Model) rebuildIRQDeviceSections() {
 	sections := make([]section, 0, len(m.irqDeviceInventory.Devices)+
-		len(m.irqDeviceInventory.Pseudo)+2)
+		len(m.irqDeviceInventory.Pseudo)+3)
 	for _, device := range m.irqDeviceInventory.Devices {
 		vectorLabel := fmt.Sprintf("%d IRQs", len(device.IRQs))
 		if len(device.IRQs) == 1 {
@@ -114,6 +119,11 @@ func (m *Model) rebuildIRQDeviceSections() {
 		})
 	}
 	sections = append(sections,
+		section{
+			title:       "All /proc/interrupts",
+			description: "Every device vector and kernel counter in source order.",
+			action:      actionIRQFullInterrupts,
+		},
 		section{
 			title:       "↻ Refresh /proc/interrupts",
 			description: "Reread device counters and current requested/effective affinity.",
@@ -360,33 +370,9 @@ func (m Model) irqDeviceDetailLines(id string) []string {
 		"Stable match: " + irqDeviceSelectorText(device.Selector),
 		fmt.Sprintf("Vectors: %d    Total: %d", len(device.IRQs), device.Total),
 		"",
-		"Current /proc/interrupts vectors:",
+		"Current /proc/interrupts:",
 	}
-	for _, irq := range device.IRQs {
-		action := strings.TrimSpace(irq.Action)
-		if action == "" {
-			action = "unnamed"
-		}
-		writeState := ""
-		if !irq.AffinityFileWritable {
-			writeState = " [read-only]"
-		}
-		lines = append(lines,
-			fmt.Sprintf("IRQ %d  %s%s", irq.Number, action, writeState),
-			fmt.Sprintf(
-				"  requested=%s  effective=%s  total=%d",
-				displayIRQAffinity(irq.RequestedAffinity),
-				displayIRQAffinity(irq.EffectiveAffinity),
-				irq.Total,
-			),
-		)
-		if description := strings.TrimSpace(irq.Description); description != "" {
-			lines = append(lines, "  /proc: "+description)
-		}
-		lines = append(lines, renderIRQCPUCounts(irq.PerCPU, "  ")...)
-	}
-	lines = append(lines, "", "Combined /proc/interrupts totals:")
-	lines = append(lines, renderIRQCPUCounts(device.PerCPU, "  ")...)
+	lines = append(lines, renderIRQVectorTable(device.IRQs, device.PerCPU)...)
 
 	if !device.Editable || !device.Persistable {
 		reason := device.ReadOnlyReason
@@ -404,6 +390,108 @@ func (m Model) irqDeviceDetailLines(id string) []string {
 	return lines
 }
 
+func renderIRQVectorTable(irqs []IRQDeviceIRQ, totals []IRQCPUCount) []string {
+	if len(irqs) == 0 {
+		return []string{"No interrupt vectors were exposed."}
+	}
+
+	cpus := irqTableCPUs(irqs, totals)
+	header := []string{"IRQ"}
+	for _, cpu := range cpus {
+		header = append(header, fmt.Sprintf("CPU%d", cpu))
+	}
+	header = append(header, "Total", "Requested", "Effective", "Handler")
+
+	rows := make([][]string, 0, len(irqs)+2)
+	rows = append(rows, header)
+	for _, irq := range irqs {
+		row := []string{fmt.Sprintf("IRQ %d", irq.Number)}
+		counts := irqCountMap(irq.PerCPU)
+		for _, cpu := range cpus {
+			row = append(row, strconv.FormatUint(counts[cpu], 10))
+		}
+		action := strings.TrimSpace(irq.Action)
+		if action == "" {
+			action = "unnamed"
+		}
+		if !irq.AffinityFileWritable {
+			action += " [read-only]"
+		}
+		row = append(row,
+			strconv.FormatUint(irq.Total, 10),
+			"requested="+displayIRQAffinity(irq.RequestedAffinity),
+			"effective="+displayIRQAffinity(irq.EffectiveAffinity),
+			action,
+		)
+		rows = append(rows, row)
+	}
+
+	totalRow := []string{"Σ"}
+	counts := irqCountMap(totals)
+	for _, cpu := range cpus {
+		totalRow = append(totalRow, strconv.FormatUint(counts[cpu], 10))
+	}
+	var grandTotal uint64
+	for _, count := range totals {
+		grandTotal += count.Count
+	}
+	totalRow = append(totalRow, strconv.FormatUint(grandTotal, 10), "", "", "combined")
+	rows = append(rows, totalRow)
+
+	widths := make([]int, len(header))
+	for _, row := range rows {
+		for column, value := range row {
+			widths[column] = max(widths[column], len([]rune(value)))
+		}
+	}
+
+	lines := make([]string, 0, len(rows)+1)
+	for rowIndex, row := range rows {
+		cells := make([]string, len(row))
+		for column, value := range row {
+			cells[column] = fmt.Sprintf("%-*s", widths[column], value)
+		}
+		lines = append(lines, strings.TrimRight(strings.Join(cells, " │ "), " "))
+		if rowIndex == 0 {
+			parts := make([]string, len(widths))
+			for column, width := range widths {
+				parts[column] = strings.Repeat("─", width)
+			}
+			lines = append(lines, strings.Join(parts, "─┼─"))
+		}
+	}
+	return lines
+}
+
+func irqTableCPUs(irqs []IRQDeviceIRQ, totals []IRQCPUCount) []int {
+	cpus := make([]int, 0, len(totals))
+	for _, count := range totals {
+		if count.CPU >= 0 {
+			cpus = append(cpus, count.CPU)
+		}
+	}
+	if len(cpus) == 0 {
+		for _, irq := range irqs {
+			for _, count := range irq.PerCPU {
+				if count.CPU >= 0 {
+					cpus = append(cpus, count.CPU)
+				}
+			}
+		}
+	}
+	return sortedUniqueNonNegative(cpus)
+}
+
+func irqCountMap(counts []IRQCPUCount) map[int]uint64 {
+	result := make(map[int]uint64, len(counts))
+	for _, count := range counts {
+		if count.CPU >= 0 {
+			result[count.CPU] = count.Count
+		}
+	}
+	return result
+}
+
 func (m Model) renderIRQKernelCounters(id string) string {
 	return m.renderScrollableIRQDeviceLines(m.irqKernelCounterLines(id))
 }
@@ -413,21 +501,118 @@ func (m Model) irqKernelCounterLines(id string) []string {
 		if row.ID != id {
 			continue
 		}
-		lines := []string{
-			"Read-only /proc/interrupts row",
-			"",
-			"ID: " + row.ID,
-			"Description: " + strings.TrimSpace(row.Description),
-			fmt.Sprintf("Total: %d", row.Total),
-			"",
-		}
-		lines = append(lines, renderIRQCPUCounts(row.PerCPU, "")...)
+		lines := []string{"Read-only /proc/interrupts row", ""}
+		lines = append(lines, renderIRQInterruptTable(
+			[]IRQInterruptRow{row},
+			m.irqDeviceInventory.CPUs,
+		)...)
 		if row.Raw != "" {
 			lines = append(lines, "", "Raw:", row.Raw)
 		}
 		return lines
 	}
 	return []string{"Kernel counter not found. Press r to refresh."}
+}
+
+func (m Model) renderIRQFullInterrupts() string {
+	return m.renderScrollableIRQDeviceLines(m.irqFullInterruptLines())
+}
+
+func (m Model) irqFullInterruptLines() []string {
+	if !m.irqDeviceInventoryLoaded {
+		return []string{"The interrupt inventory is unavailable. Press r to retry."}
+	}
+	rows := m.irqDeviceInventory.Rows
+	if len(rows) == 0 {
+		// Keep manually constructed inventories and older fixtures useful.
+		for _, device := range m.irqDeviceInventory.Devices {
+			for _, irq := range device.IRQs {
+				rows = append(rows, IRQInterruptRow{
+					ID:          strconv.Itoa(irq.Number),
+					Number:      irq.Number,
+					Numeric:     true,
+					PerCPU:      cloneCPUCounts(irq.PerCPU),
+					Total:       irq.Total,
+					Description: strings.TrimSpace(irq.Description + " " + irq.Action),
+				})
+			}
+		}
+		for _, row := range m.irqDeviceInventory.Pseudo {
+			rows = append(rows, cloneInterruptRow(row))
+		}
+	}
+	lines := []string{
+		"Complete /proc/interrupts",
+		fmt.Sprintf("%d rows across %d CPUs", len(rows), len(m.irqDeviceInventory.CPUs)),
+		"",
+	}
+	return append(lines, renderIRQInterruptTable(rows, m.irqDeviceInventory.CPUs)...)
+}
+
+func renderIRQInterruptTable(rows []IRQInterruptRow, cpus []int) []string {
+	if len(rows) == 0 {
+		return []string{"No interrupt rows were exposed."}
+	}
+	header := []string{"ID"}
+	for _, cpu := range cpus {
+		header = append(header, fmt.Sprintf("CPU%d", cpu))
+	}
+	header = append(header, "Total", "Description")
+
+	table := make([][]string, 0, len(rows)+1)
+	table = append(table, header)
+	for _, interrupt := range rows {
+		row := []string{interrupt.ID}
+		counts := irqCountMap(interrupt.PerCPU)
+		global := ""
+		for _, count := range interrupt.PerCPU {
+			if count.CPU < 0 {
+				global = strconv.FormatUint(count.Count, 10)
+			}
+		}
+		for _, cpu := range cpus {
+			value := strconv.FormatUint(counts[cpu], 10)
+			if global != "" {
+				value = global
+				global = ""
+			}
+			row = append(row, value)
+		}
+		row = append(row,
+			strconv.FormatUint(interrupt.Total, 10),
+			strings.TrimSpace(interrupt.Description),
+		)
+		table = append(table, row)
+	}
+	return renderIRQCells(table)
+}
+
+func renderIRQCells(rows [][]string) []string {
+	if len(rows) == 0 {
+		return nil
+	}
+	widths := make([]int, len(rows[0]))
+	for _, row := range rows {
+		for column, value := range row {
+			widths[column] = max(widths[column], len([]rune(value)))
+		}
+	}
+	lines := make([]string, 0, len(rows)+1)
+	for rowIndex, row := range rows {
+		cells := make([]string, len(row))
+		for column, value := range row {
+			cells[column] = fmt.Sprintf("%-*s", widths[column], value)
+		}
+		lines = append(lines, strings.TrimRight(strings.Join(cells, " │ "), " "))
+		if rowIndex == 0 {
+			parts := make([]string, len(widths))
+			for column, width := range widths {
+				parts[column] = strings.Repeat("─", width)
+			}
+			lines = append(lines, strings.Join(parts, "─┼─"))
+		}
+	}
+	return lines
 }
 
 func (m Model) irqDeviceDetailHeight() int {
@@ -488,6 +673,8 @@ func (m *Model) scrollIRQDeviceDetail(direction int) {
 	current := m.currentSection()
 	var lines []string
 	switch current.action {
+	case actionIRQFullInterrupts:
+		lines = m.wrapIRQDeviceLines(m.irqFullInterruptLines())
 	case actionIRQDeviceSelect:
 		lines = m.wrapIRQDeviceLines(m.irqDeviceDetailLines(current.value))
 	case actionIRQKernelCounters:
