@@ -32,7 +32,6 @@ func TestDevToolsMainMenuPlacement(t *testing.T) {
 func TestDevToolsSubmenuStructure(t *testing.T) {
 	expected := []sectionAction{
 		actionInstallDevToolsAll,
-		actionInstallDevToolsGit,
 		actionInstallDevToolsVSCode,
 		actionInstallDevToolsCodex,
 		actionInstallDevToolsClaude,
@@ -184,7 +183,6 @@ func TestDevToolsConfirmationViewsDescribeSelectedComponent(t *testing.T) {
 			action: actionInstallDevToolsAll,
 			expected: []string{
 				"Install all developer tools?",
-				"Git",
 				"VS Code",
 				"Codex CLI",
 				"Claude Code",
@@ -194,17 +192,6 @@ func TestDevToolsConfirmationViewsDescribeSelectedComponent(t *testing.T) {
 				"Terminator",
 				"user lingering",
 				"sign-in on first run",
-			},
-		},
-		{
-			name:   "git",
-			action: actionInstallDevToolsGit,
-			expected: []string{
-				"Install Git and configure GitHub SSH?",
-				"cnc <cnc@cnc.cn>",
-				"Ed25519",
-				"GitHub",
-				"existing private key is not replaced",
 			},
 		},
 		{
@@ -303,7 +290,6 @@ func TestDevToolsComponentMapping(t *testing.T) {
 		component string
 	}{
 		{action: actionInstallDevToolsAll, component: "all"},
-		{action: actionInstallDevToolsGit, component: "git"},
 		{action: actionInstallDevToolsVSCode, component: "vscode"},
 		{action: actionInstallDevToolsCodex, component: "codex"},
 		{action: actionInstallDevToolsClaude, component: "claude"},
@@ -349,7 +335,6 @@ func TestDevToolsPlaybookVariables(t *testing.T) {
 		component string
 	}{
 		{action: actionInstallDevToolsAll, component: "all"},
-		{action: actionInstallDevToolsGit, component: "git"},
 		{action: actionInstallDevToolsVSCode, component: "vscode"},
 		{action: actionInstallDevToolsCodex, component: "codex"},
 		{action: actionInstallDevToolsClaude, component: "claude"},
@@ -391,10 +376,6 @@ func TestDevToolsCancellationNamesSelectedAction(t *testing.T) {
 		{
 			action: actionInstallDevToolsAll,
 			status: "Developer tools installation cancelled.",
-		},
-		{
-			action: actionInstallDevToolsGit,
-			status: "Git and GitHub SSH setup cancelled.",
 		},
 		{
 			action: actionInstallDevToolsVSCode,
@@ -469,14 +450,6 @@ func TestDevToolsActionMessages(t *testing.T) {
 			running:    "Installing all developer tools...",
 			cancelled:  "Developer tools installation cancelled.",
 			success:    "All developer tools installed successfully.",
-		},
-		{
-			name:       "git",
-			action:     actionInstallDevToolsGit,
-			actionName: "Git and GitHub SSH setup",
-			running:    "Installing Git and configuring GitHub SSH...",
-			cancelled:  "Git and GitHub SSH setup cancelled.",
-			success:    "Git and GitHub SSH configured successfully.",
 		},
 		{
 			name:       "vscode",

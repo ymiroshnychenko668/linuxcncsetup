@@ -15,6 +15,27 @@
       - "'lightdm' in ansible_facts.packages"
     fail_msg: LightDM installation did not complete.
 
+- name: Inspect the LightDM runtime and automatic-login PAM stack
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: true
+  loop:
+    - /usr/sbin/lightdm
+    - /etc/pam.d/lightdm-autologin
+  register: autologin_lightdm_runtime
+
+- name: Require the LightDM runtime and automatic-login PAM stack
+  ansible.builtin.assert:
+    that:
+      - autologin_lightdm_runtime.results[0].stat.exists
+      - autologin_lightdm_runtime.results[0].stat.isreg
+      - autologin_lightdm_runtime.results[0].stat.executable
+      - autologin_lightdm_runtime.results[1].stat.exists
+      - autologin_lightdm_runtime.results[1].stat.isreg
+    fail_msg: >-
+      LightDM must provide an executable daemon and the lightdm-autologin PAM
+      service before passwordless automatic login can be enabled.
+
 - name: Create the LightDM configuration directory
   ansible.builtin.file:
     path: /etc/lightdm/lightdm.conf.d
@@ -32,8 +53,51 @@
     content: |
       # Managed by linuxcncsetup.
       [Seat:*]
+      pam-autologin-service=lightdm-autologin
       autologin-user={{ target_user }}
       autologin-user-timeout=0
+
+- name: Read the effective LightDM configuration
+  ansible.builtin.command:
+    argv:
+      - /usr/sbin/lightdm
+      - --show-config
+  register: autologin_lightdm_effective_config
+  changed_when: false
+  check_mode: false
+  when: not ansible_check_mode
+
+- name: Require the managed automatic-login settings to be effective
+  ansible.builtin.assert:
+    that:
+      - >-
+        (
+          autologin_lightdm_effective_config.stdout
+          | regex_findall(
+              '(?m)^\S+\s+pam-autologin-service=(\S+)\s*$'
+            )
+        ) == ["lightdm-autologin"]
+      - >-
+        (
+          autologin_lightdm_effective_config.stdout
+          | regex_findall(
+              '(?m)^\S+\s+autologin-user=(\S+)\s*$'
+            )
+        ) == [target_user]
+      - >-
+        (
+          autologin_lightdm_effective_config.stdout
+          | regex_findall(
+              '(?m)^\S+\s+autologin-user-timeout=(\S+)\s*$'
+            )
+        ) == ["0"]
+      - >-
+        "/etc/lightdm/lightdm.conf.d/50-linuxcnc-autologin.conf" in
+        autologin_lightdm_effective_config.stdout
+    fail_msg: >-
+      LightDM did not load the managed automatic-login drop-in. Check for a
+      later configuration file overriding the selected user or timeout.
+  when: not ansible_check_mode
 
 - name: Refresh service facts after package installation
   ansible.builtin.service_facts:
@@ -62,8 +126,67 @@
     enabled: false
   when: "'greetd.service' in ansible_facts.services"
 
+- name: Unmask LightDM without starting it
+  ansible.builtin.systemd_service:
+    name: lightdm.service
+    masked: false
+
 - name: Enable LightDM at the next boot
   ansible.builtin.systemd_service:
     name: lightdm.service
     enabled: true
     force: true
+
+- name: Verify LightDM is enabled for the next boot
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/systemctl
+      - is-enabled
+      - lightdm.service
+  register: autologin_lightdm_enabled
+  changed_when: false
+  check_mode: false
+  failed_when: false
+  when: not ansible_check_mode
+
+- name: Resolve the display-manager boot alias
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/readlink
+      - --canonicalize
+      - /etc/systemd/system/display-manager.service
+  register: autologin_display_manager_alias
+  changed_when: false
+  check_mode: false
+  failed_when: false
+  when: not ansible_check_mode
+
+- name: Read LightDM's canonical systemd unit path
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/systemctl
+      - show
+      - --property=FragmentPath
+      - --value
+      - lightdm.service
+  register: autologin_lightdm_unit_path
+  changed_when: false
+  check_mode: false
+  failed_when: false
+  when: not ansible_check_mode
+
+- name: Require LightDM to own the display-manager boot alias
+  ansible.builtin.assert:
+    that:
+      - autologin_lightdm_enabled.rc == 0
+      - autologin_lightdm_enabled.stdout | trim == "enabled"
+      - autologin_display_manager_alias.rc == 0
+      - autologin_lightdm_unit_path.rc == 0
+      - autologin_lightdm_unit_path.stdout | trim | length > 0
+      - >-
+        autologin_display_manager_alias.stdout | trim ==
+        autologin_lightdm_unit_path.stdout | trim
+    fail_msg: >-
+      LightDM was configured but is not enabled as the display manager for the
+      next boot.
+  when: not ansible_check_mode

@@ -16,8 +16,11 @@ func TestMaterialize(t *testing.T) {
 		IRQAffinity,
 		GRUBRealtime,
 		InstallDevTools,
+		InstallGit,
 		InstallSway,
 		LinuxCNCAutostart,
+		LinuxCNCAutostartX11,
+		SMBMounts,
 	} {
 		t.Run(string(playbook), func(t *testing.T) {
 			playbookPath, cleanup, err := Materialize(playbook)
@@ -31,7 +34,6 @@ func TestMaterialize(t *testing.T) {
 				playbookPath,
 				filepath.Join(directory, "tasks", "devtools_claude.yml"),
 				filepath.Join(directory, "tasks", "devtools_codex.yml"),
-				filepath.Join(directory, "tasks", "devtools_git.yml"),
 				filepath.Join(directory, "tasks", "devtools_linger.yml"),
 				filepath.Join(directory, "tasks", "devtools_vscode.yml"),
 				filepath.Join(directory, "tasks", "devtools_warp.yml"),
@@ -41,12 +43,15 @@ func TestMaterialize(t *testing.T) {
 				filepath.Join(directory, "tasks", "irq_affinity_absent.yml"),
 				filepath.Join(directory, "tasks", "irq_affinity_present.yml"),
 				filepath.Join(directory, "tasks", "linuxcnc_autostart.yml"),
+				filepath.Join(directory, "tasks", "linuxcnc_autostart_x11.yml"),
 				filepath.Join(directory, "templates", "irq-affinity-policy.yml.j2"),
 				filepath.Join(directory, "templates", "linuxcncsetup-irq-affinity.py.j2"),
 				filepath.Join(directory, "templates", "linuxcncsetup-irq-affinity.service.j2"),
 				filepath.Join(directory, "templates", "linuxcncsetup-grub-rt.cfg.j2"),
 				filepath.Join(directory, "templates", "linuxcnc-autostart.sh.j2"),
 				filepath.Join(directory, "templates", "linuxcnc-autostart-sway.conf.j2"),
+				filepath.Join(directory, "templates", "linuxcnc-autostart-x11.sh.j2"),
+				filepath.Join(directory, "templates", "linuxcnc-autostart-x11.desktop.j2"),
 				filepath.Join(directory, "templates", "sway-config.j2"),
 			} {
 				if _, err := os.Stat(path); err != nil {
@@ -97,7 +102,7 @@ func TestDeveloperToolsSharedAPTOnlyInstallsMissingPackages(t *testing.T) {
 		t,
 		playbook,
 		"- name: Read installed developer package facts",
-		"- name: Configure Git and GitHub SSH",
+		"- name: Configure the Visual Studio Code repository",
 	)
 
 	for _, expected := range []string{
@@ -119,6 +124,151 @@ func TestDeveloperToolsSharedAPTOnlyInstallsMissingPackages(t *testing.T) {
 		`name: "{{ devtools_packages_by_component[devtools_component] }}"`,
 	) {
 		t.Fatal("shared APT task still installs the unfiltered component package list")
+	}
+}
+
+func TestGitSetupInstallsToolsWithoutManagingSSHKeys(t *testing.T) {
+	playbookPath, cleanup, err := Materialize(InstallGit)
+	if err != nil {
+		t.Fatalf("Materialize() error: %v", err)
+	}
+	t.Cleanup(cleanup)
+
+	data, err := os.ReadFile(playbookPath)
+	if err != nil {
+		t.Fatalf("read Git setup playbook: %v", err)
+	}
+	playbook := string(data)
+
+	for _, expected := range []string{
+		"- gh",
+		"- git",
+		"- openssh-client",
+		"git_setup_missing_packages",
+		`name: "{{ git_setup_missing_packages }}"`,
+		`become_user: "{{ target_user }}"`,
+		`HOME: "{{ git_setup_home }}"`,
+		"user.name",
+		"user.email",
+		"No SSH",
+		"key was created or modified",
+	} {
+		if !strings.Contains(playbook, expected) {
+			t.Errorf("Git setup playbook does not contain %q", expected)
+		}
+	}
+
+	for _, forbidden := range []string{
+		"ssh-keygen",
+		"id_ed25519",
+		"/.ssh",
+		"ansible.builtin.slurp:\n        src: \"{{ git_setup_home }}/.ssh",
+	} {
+		if strings.Contains(playbook, forbidden) {
+			t.Errorf("Git setup playbook directly manages SSH with %q", forbidden)
+		}
+	}
+}
+
+func TestDeveloperToolsNoLongerInstallsOrConfiguresGit(t *testing.T) {
+	playbookPath, cleanup, err := Materialize(InstallDevTools)
+	if err != nil {
+		t.Fatalf("Materialize() error: %v", err)
+	}
+	t.Cleanup(cleanup)
+
+	data, err := os.ReadFile(playbookPath)
+	if err != nil {
+		t.Fatalf("read developer-tools playbook: %v", err)
+	}
+	playbook := string(data)
+	for _, forbidden := range []string{
+		"\n      - git\n",
+		"\n        - git\n",
+		"openssh-client",
+		"devtools_git",
+		"GitHub SSH",
+		"ssh-keygen",
+	} {
+		if strings.Contains(playbook, forbidden) {
+			t.Errorf("developer-tools playbook still contains %q", forbidden)
+		}
+	}
+}
+
+func TestSMBMountPlaybookUsesGuardedOwnedFstabManagement(t *testing.T) {
+	playbookPath, cleanup, err := Materialize(SMBMounts)
+	if err != nil {
+		t.Fatalf("Materialize() error: %v", err)
+	}
+	t.Cleanup(cleanup)
+
+	data, err := os.ReadFile(playbookPath)
+	if err != nil {
+		t.Fatalf("read SMB mount playbook: %v", err)
+	}
+	playbook := string(data)
+
+	for _, expected := range []string{
+		"//10.0.1.246/share",
+		"/mnt/smb_share",
+		`smb_operation | default("")`,
+		`["mount", "unmount", "remove"]`,
+		"--mountpoint",
+		"--types",
+		"cifs",
+		"autofs",
+		"SourcePath=/etc/fstab",
+		"FragmentPath=/run/systemd/generator",
+		"DropInPaths=",
+		"Refuse native or overridden systemd mount units",
+		"Reinspect the configured systemd mount unit provenance",
+		"Require clean fstab-generated units before starting them",
+		"Roll back a newly-created managed fstab block",
+		"# {mark} LINUXCNCSETUP MANAGED SMB SHARE",
+		"smb_managed_begin_count",
+		"smb_managed_blocks",
+		"Validate ownership of the managed fstab block",
+		"ansible.builtin.blockinfile:",
+		"backup: true",
+		"guest,vers=3.0",
+		"file_mode=0644",
+		"dir_mode=0755",
+		"x-systemd.automount",
+		"Stop the SMB automount unit before unmounting",
+		"Unmount the SMB share normally",
+		"Remove only the managed SMB fstab block",
+		"smb_fstab_probe_after_remove.rc == 1",
+		`select("match", "^uid=")`,
+		`select("match", "^gid=")`,
+		`("uid=" ~ (smb_target_uid | string))`,
+		`("gid=" ~ (smb_target_gid | string))`,
+	} {
+		if !strings.Contains(playbook, expected) {
+			t.Errorf("SMB mount playbook does not contain %q", expected)
+		}
+	}
+
+	for _, forbidden := range []string{
+		"--target",
+		"ansible.posix.mount",
+		"/etc/cifs-credentials",
+		"password=",
+		".test_write",
+		"umount -f",
+		"umount -l",
+		"failed_when: false",
+	} {
+		if strings.Contains(playbook, forbidden) {
+			t.Errorf("SMB mount playbook contains unsafe or undeclared behavior %q", forbidden)
+		}
+	}
+
+	stopIndex := strings.Index(playbook, "Stop the SMB automount unit before unmounting")
+	unmountIndex := strings.Index(playbook, "Unmount the SMB share normally")
+	removeIndex := strings.Index(playbook, "Remove only the managed SMB fstab block")
+	if stopIndex < 0 || unmountIndex <= stopIndex || removeIndex <= unmountIndex {
+		t.Fatal("SMB playbook must stop automount before unmounting and remove fstab only afterward")
 	}
 }
 

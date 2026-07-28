@@ -27,16 +27,24 @@ type sectionAction int
 const (
 	actionNone sectionAction = iota
 	actionInstallAnsible
+	actionOpenGitSetup
+	actionInstallGitTools
+	actionGitHubLogin
 	actionInstallSway
 	actionOpenDevTools
 	actionOpenLinuxCNCAutostart
 	actionOpenLinuxCNCAutostartSway
-	actionLinuxCNCAutostartX11
+	actionOpenLinuxCNCAutostartX11
 	actionConfigureLinuxCNCAutostartSway
+	actionConfigureLinuxCNCAutostartX11
 	actionOpenAutologin
 	actionAutologinLightDM
 	actionAutologinSway
 	actionOpenConfiguration
+	actionOpenSMBMounts
+	actionSMBMount
+	actionSMBUnmount
+	actionSMBRemove
 	actionOpenGRUBRealtime
 	actionGRUBToggleCPU
 	actionGRUBContinue
@@ -62,7 +70,6 @@ const (
 	actionIRQApply
 	actionIRQDisable
 	actionInstallDevToolsAll
-	actionInstallDevToolsGit
 	actionInstallDevToolsVSCode
 	actionInstallDevToolsCodex
 	actionInstallDevToolsClaude
@@ -79,10 +86,12 @@ type menuPage int
 
 const (
 	menuMain menuPage = iota
+	menuGitSetup
 	menuLinuxCNCAutostart
 	menuLinuxCNCConfigs
 	menuAutologin
 	menuConfiguration
+	menuSMBMounts
 	menuGRUBRealtime
 	menuGRUBCPUs
 	menuGRUBReview
@@ -107,6 +116,11 @@ var mainSections = []section{
 		title:       "Install Ansible",
 		description: "Install Ansible from Debian's package repositories.",
 		action:      actionInstallAnsible,
+	},
+	{
+		title:       "Git setup",
+		description: "Install Git tools and sign in to GitHub interactively with gh.",
+		action:      actionOpenGitSetup,
 	},
 	{
 		title:       "Install CorvusCNC config",
@@ -160,9 +174,9 @@ var linuxCNCAutostartSections = []section{
 		action:      actionOpenLinuxCNCAutostartSway,
 	},
 	{
-		title:       "X11",
-		description: "X11 LinuxCNC autostart is not implemented yet.",
-		action:      actionLinuxCNCAutostartX11,
+		title:       "XFCE (X11)",
+		description: "Choose a LinuxCNC configuration to start on workspace 1 at the next XFCE X11 login.",
+		action:      actionOpenLinuxCNCAutostartX11,
 	},
 	{
 		title:       "← Back",
@@ -174,7 +188,7 @@ var linuxCNCAutostartSections = []section{
 var autologinSections = []section{
 	{
 		title:       "LightDM",
-		description: "Keep LightDM and automatically start the user's current or default session.",
+		description: "Use LightDM and automatically start the user's current or default session.",
 		action:      actionAutologinLightDM,
 	},
 	{
@@ -199,6 +213,11 @@ var configurationSections = []section{
 		title:       "IRQ affinity",
 		description: "Keep movable device interrupts off CPUs reserved for LinuxCNC real-time work.",
 		action:      actionOpenIRQAffinity,
+	},
+	{
+		title:       "SMB mounts",
+		description: "Mount, unmount, or remove the configured SMB network share with Ansible.",
+		action:      actionOpenSMBMounts,
 	},
 	{
 		title:       "← Back",
@@ -323,6 +342,7 @@ type Model struct {
 	confirming               bool
 	status                   string
 	linuxCNCSections         []section
+	linuxCNCDesktop          linuxCNCAutostartDesktop
 	irqSnapshot              IRQSnapshot
 	irqSnapshotLoaded        bool
 	irqProtectedCPUs         []int
@@ -346,6 +366,7 @@ type actionFinishedMsg struct {
 type commandSpec struct {
 	name string
 	args []string
+	env  []string
 }
 
 type commandSequence struct {
@@ -368,6 +389,9 @@ func (sequence *commandSequence) Run() error {
 		command.Stdin = sequence.stdin
 		command.Stdout = sequence.stdout
 		command.Stderr = sequence.stderr
+		if spec.env != nil {
+			command.Env = spec.env
+		}
 
 		if err := command.Run(); err != nil {
 			return fmt.Errorf("%s: %w", spec.name, err)
@@ -431,8 +455,9 @@ func (command *pausingCommand) SetStderr(writer io.Writer) {
 // New constructs the initial application model.
 func New() Model {
 	return Model{
-		width:  defaultWidth,
-		height: defaultHeight,
+		width:           defaultWidth,
+		height:          defaultHeight,
+		linuxCNCDesktop: linuxCNCDesktopSway,
 	}
 }
 
@@ -636,6 +661,10 @@ func (m Model) renderDetail() string {
 		} else {
 			lines = append(lines, "Press Enter to begin.")
 		}
+	case actionOpenGitSetup:
+		lines = append(lines, "Press Enter to install Git tools or sign in to GitHub.")
+	case actionInstallGitTools, actionGitHubLogin:
+		lines = append(lines, renderGitSetupAction(current.action, m.confirming)...)
 	case actionInstallSway:
 		if m.confirming {
 			lines = append(lines,
@@ -656,7 +685,6 @@ func (m Model) renderDetail() string {
 	case actionOpenDevTools:
 		lines = append(lines, "Press Enter to choose a developer-tools component.")
 	case actionInstallDevToolsAll,
-		actionInstallDevToolsGit,
 		actionInstallDevToolsVSCode,
 		actionInstallDevToolsCodex,
 		actionInstallDevToolsClaude,
@@ -673,8 +701,11 @@ func (m Model) renderDetail() string {
 			"Press Enter to scan the current user's",
 			"~/linuxcnc/configs directory.",
 		)
-	case actionLinuxCNCAutostartX11:
-		lines = append(lines, warningStyle.Render("X11 support is not implemented yet."))
+	case actionOpenLinuxCNCAutostartX11:
+		lines = append(lines,
+			"Press Enter to scan the current user's",
+			"~/linuxcnc/configs directory for XFCE X11.",
+		)
 	case actionConfigureLinuxCNCAutostartSway:
 		if m.confirming {
 			lines = append(lines,
@@ -695,6 +726,30 @@ func (m Model) renderDetail() string {
 			)
 		} else {
 			lines = append(lines, "Press Enter to configure with Ansible.")
+		}
+	case actionConfigureLinuxCNCAutostartX11:
+		if m.confirming {
+			lines = append(lines,
+				warningStyle.Render("Enable XFCE X11 autostart?"),
+				"",
+				"Selected configuration:",
+				"  "+current.value,
+				"",
+				"Ansible will install wmctrl and register",
+				"a per-user XFCE XDG autostart entry.",
+				"At the next XFCE X11 login, the launcher",
+				"selects workspace 1, focuses an existing",
+				"QtVCP window, or starts this configuration.",
+				"",
+				"It stays inactive in XFCE Wayland sessions.",
+				"LinuxCNC may initialize connected machine",
+				"hardware when the X11 session starts.",
+				"LinuxCNC will not be launched now.",
+				"sudo will ask for your account password.",
+				"Press y to continue or n to cancel.",
+			)
+		} else {
+			lines = append(lines, "Press Enter to configure XFCE X11 with Ansible.")
 		}
 	case actionOpenAutologin:
 		lines = append(lines, "Press Enter to choose an automatic-login method.")
@@ -733,6 +788,10 @@ func (m Model) renderDetail() string {
 		}
 	case actionOpenConfiguration:
 		lines = append(lines, "Press Enter to open configuration tools.")
+	case actionOpenSMBMounts:
+		lines = append(lines, "Press Enter to manage the configured SMB network share.")
+	case actionSMBMount, actionSMBUnmount, actionSMBRemove:
+		lines = append(lines, renderSMBMountAction(current.action, m.confirming)...)
 	case actionOpenGRUBRealtime:
 		lines = append(lines, renderGRUBIntroduction())
 	case actionGRUBToggleCPU:
@@ -957,6 +1016,10 @@ func (m *Model) moveSelection(delta int) {
 func (m *Model) prepareSelectedAction() {
 	current := m.currentSection()
 	switch current.action {
+	case actionOpenGitSetup:
+		m.openPage(menuGitSetup)
+		return
+
 	case actionOpenDevTools:
 		m.openPage(menuDevTools)
 		return
@@ -964,6 +1027,15 @@ func (m *Model) prepareSelectedAction() {
 	case actionOpenConfiguration:
 		m.openPage(menuConfiguration)
 		return
+
+	case actionOpenSMBMounts:
+		m.openPage(menuSMBMounts)
+		return
+
+	case actionSMBMount, actionSMBUnmount, actionSMBRemove:
+		if !m.prepareSMBMountAction(current.action) {
+			return
+		}
 
 	case actionOpenGRUBRealtime:
 		if !m.beginGRUBSetup() {
@@ -1079,22 +1151,11 @@ func (m *Model) prepareSelectedAction() {
 		return
 
 	case actionOpenLinuxCNCAutostartSway:
-		configs, root, err := discoverLinuxCNCConfigs()
-		if err != nil {
-			m.status = fmt.Sprintf("Cannot list LinuxCNC configurations: %v", err)
-			return
-		}
-		m.linuxCNCSections = linuxCNCConfigSections(configs)
-		m.openPage(menuLinuxCNCConfigs)
-		if len(configs) == 0 {
-			m.status = fmt.Sprintf("No .ini configurations found under %s.", root)
-		} else {
-			m.status = fmt.Sprintf("Found %d configuration(s) under %s.", len(configs), root)
-		}
+		m.openLinuxCNCConfigSelection(linuxCNCDesktopSway)
 		return
 
-	case actionLinuxCNCAutostartX11:
-		m.status = "X11 LinuxCNC autostart is not implemented yet."
+	case actionOpenLinuxCNCAutostartX11:
+		m.openLinuxCNCConfigSelection(linuxCNCDesktopXFCE)
 		return
 
 	case actionOpenAutologin:
@@ -1133,8 +1194,17 @@ func (m *Model) prepareSelectedAction() {
 			}
 		}
 
+	case actionInstallGitTools:
+		if !m.prepareGitToolsInstall() {
+			return
+		}
+
+	case actionGitHubLogin:
+		if !m.prepareGitHubLogin() {
+			return
+		}
+
 	case actionInstallDevToolsAll,
-		actionInstallDevToolsGit,
 		actionInstallDevToolsVSCode,
 		actionInstallDevToolsCodex,
 		actionInstallDevToolsClaude,
@@ -1152,7 +1222,8 @@ func (m *Model) prepareSelectedAction() {
 			return
 		}
 
-	case actionConfigureLinuxCNCAutostartSway:
+	case actionConfigureLinuxCNCAutostartSway,
+		actionConfigureLinuxCNCAutostartX11:
 		if _, err := exec.LookPath("ansible-playbook"); err != nil {
 			m.status = "Install Ansible first, then retry this action."
 			return
@@ -1275,17 +1346,21 @@ func (m *Model) prepareSelectedAction() {
 
 func (m Model) visibleSections() []section {
 	switch m.page {
+	case menuGitSetup:
+		return gitSetupSections
 	case menuLinuxCNCAutostart:
 		return linuxCNCAutostartSections
 	case menuLinuxCNCConfigs:
 		if len(m.linuxCNCSections) == 0 {
-			return linuxCNCConfigSections(nil)
+			return linuxCNCConfigSections(nil, m.linuxCNCDesktop)
 		}
 		return m.linuxCNCSections
 	case menuAutologin:
 		return autologinSections
 	case menuConfiguration:
 		return configurationSections
+	case menuSMBMounts:
+		return smbMountSections
 	case menuGRUBRealtime:
 		return grubRealtimeSections
 	case menuGRUBCPUs:
@@ -1338,14 +1413,18 @@ func (m Model) currentSection() section {
 
 func (m Model) pageTitle() string {
 	switch m.page {
+	case menuGitSetup:
+		return "Git setup"
 	case menuLinuxCNCAutostart:
 		return "LinuxCNC autostart"
 	case menuLinuxCNCConfigs:
-		return "Sway configuration"
+		return m.linuxCNCDesktop.pageTitle()
 	case menuAutologin:
 		return "Automatic login"
 	case menuConfiguration:
 		return "Configuration"
+	case menuSMBMounts:
+		return "SMB mounts"
 	case menuGRUBRealtime:
 		return "GRUB real-time setup"
 	case menuGRUBCPUs:
@@ -1379,11 +1458,37 @@ func (m *Model) openPage(page menuPage) {
 	m.irqDeviceDetailOffset = 0
 }
 
+func (m *Model) openLinuxCNCConfigSelection(
+	desktop linuxCNCAutostartDesktop,
+) {
+	configs, root, err := discoverLinuxCNCConfigs()
+	if err != nil {
+		m.status = fmt.Sprintf("Cannot list LinuxCNC configurations: %v", err)
+		return
+	}
+
+	m.linuxCNCDesktop = desktop
+	m.linuxCNCSections = linuxCNCConfigSections(configs, desktop)
+	m.openPage(menuLinuxCNCConfigs)
+	if len(configs) == 0 {
+		m.status = fmt.Sprintf("No .ini configurations found under %s.", root)
+	} else {
+		m.status = fmt.Sprintf(
+			"Found %d configuration(s) under %s.",
+			len(configs),
+			root,
+		)
+	}
+}
+
 func (m *Model) back() {
 	switch m.page {
+	case menuGitSetup:
+		m.openPage(menuMain)
+		m.selectAction(actionOpenGitSetup)
 	case menuLinuxCNCConfigs:
 		m.openPage(menuLinuxCNCAutostart)
-		m.selectAction(actionOpenLinuxCNCAutostartSway)
+		m.selectAction(m.linuxCNCDesktop.openerAction())
 	case menuLinuxCNCAutostart:
 		m.openPage(menuMain)
 		m.selectAction(actionOpenLinuxCNCAutostart)
@@ -1393,6 +1498,9 @@ func (m *Model) back() {
 	case menuConfiguration:
 		m.openPage(menuMain)
 		m.selectAction(actionOpenConfiguration)
+	case menuSMBMounts:
+		m.openPage(menuConfiguration)
+		m.selectAction(actionOpenSMBMounts)
 	case menuGRUBRealtime:
 		m.openPage(menuConfiguration)
 		m.selectAction(actionOpenGRUBRealtime)
@@ -1439,12 +1547,15 @@ func (m Model) executeAction(action sectionAction, value string) tea.Cmd {
 	switch action {
 	case actionInstallAnsible:
 		return installAnsible()
+	case actionInstallGitTools:
+		return runGitToolsInstallPlaybook()
+	case actionGitHubLogin:
+		return runGitHubLogin()
 	case actionInstallSway:
 		return runSwayInstallPlaybook()
 	case actionInstallLinuxCNCConfig:
 		return runLinuxCNCConfigInstallPlaybook()
 	case actionInstallDevToolsAll,
-		actionInstallDevToolsGit,
 		actionInstallDevToolsVSCode,
 		actionInstallDevToolsCodex,
 		actionInstallDevToolsClaude,
@@ -1455,11 +1566,23 @@ func (m Model) executeAction(action sectionAction, value string) tea.Cmd {
 		actionEnableUserLinger:
 		return runDevToolsInstallPlaybook(action)
 	case actionConfigureLinuxCNCAutostartSway:
-		return runLinuxCNCAutostartPlaybook(value)
+		return runLinuxCNCAutostartPlaybook(
+			action,
+			playbooks.LinuxCNCAutostart,
+			value,
+		)
+	case actionConfigureLinuxCNCAutostartX11:
+		return runLinuxCNCAutostartPlaybook(
+			action,
+			playbooks.LinuxCNCAutostartX11,
+			value,
+		)
 	case actionAutologinLightDM:
 		return runAutologinPlaybook(action, "lightdm")
 	case actionAutologinSway:
 		return runAutologinPlaybook(action, "sway")
+	case actionSMBMount, actionSMBUnmount, actionSMBRemove:
+		return runSMBMountPlaybook(action)
 	case actionGRUBApply:
 		return m.runGRUBPlaybook(action)
 	case actionIRQDevicePreview:
@@ -1519,17 +1642,21 @@ func runSwayInstallPlaybook() tea.Cmd {
 	)
 }
 
-func runLinuxCNCAutostartPlaybook(configPath string) tea.Cmd {
+func runLinuxCNCAutostartPlaybook(
+	action sectionAction,
+	playbook playbooks.Playbook,
+	configPath string,
+) tea.Cmd {
 	targetUser, err := targetUsername()
 	if err != nil {
 		return func() tea.Msg {
-			return actionFinishedMsg{action: actionConfigureLinuxCNCAutostartSway, err: err}
+			return actionFinishedMsg{action: action, err: err}
 		}
 	}
 
 	return runEmbeddedPlaybook(
-		actionConfigureLinuxCNCAutostartSway,
-		playbooks.LinuxCNCAutostart,
+		action,
+		playbook,
 		map[string]any{
 			"target_user":     targetUser,
 			"linuxcnc_config": configPath,
@@ -1645,16 +1772,25 @@ func actionName(action sectionAction) string {
 	if name, ok := devToolsActionName(action); ok {
 		return name
 	}
+	if name, ok := smbMountActionName(action); ok {
+		return name
+	}
 
 	switch action {
 	case actionInstallAnsible:
 		return "Ansible installation"
+	case actionInstallGitTools:
+		return "Git tools installation"
+	case actionGitHubLogin:
+		return "GitHub CLI sign-in"
 	case actionInstallSway:
 		return "Wayland and Sway installation"
 	case actionInstallLinuxCNCConfig:
 		return "CorvusCNC configuration installation"
 	case actionConfigureLinuxCNCAutostartSway:
 		return "LinuxCNC Sway autostart configuration"
+	case actionConfigureLinuxCNCAutostartX11:
+		return "LinuxCNC XFCE X11 autostart configuration"
 	case actionAutologinLightDM:
 		return "LightDM auto-login configuration"
 	case actionAutologinSway:
@@ -1686,16 +1822,25 @@ func actionRunningMessage(action sectionAction) string {
 	if message, ok := devToolsRunningMessage(action); ok {
 		return message
 	}
+	if message, ok := smbMountRunningMessage(action); ok {
+		return message
+	}
 
 	switch action {
 	case actionInstallAnsible:
 		return "Installing Ansible..."
+	case actionInstallGitTools:
+		return "Installing Git, OpenSSH client, and GitHub CLI..."
+	case actionGitHubLogin:
+		return "Starting the interactive GitHub CLI sign-in..."
 	case actionInstallSway:
 		return "Running the Wayland and Sway installation playbook..."
 	case actionInstallLinuxCNCConfig:
 		return "Running the CorvusCNC configuration installation playbook..."
 	case actionConfigureLinuxCNCAutostartSway:
 		return "Running the LinuxCNC Sway autostart playbook..."
+	case actionConfigureLinuxCNCAutostartX11:
+		return "Running the LinuxCNC XFCE X11 autostart playbook..."
 	case actionAutologinLightDM:
 		return "Running the LightDM auto-login playbook..."
 	case actionAutologinSway:
@@ -1727,16 +1872,25 @@ func actionCancelledMessage(action sectionAction) string {
 	if message, ok := devToolsCancelledMessage(action); ok {
 		return message
 	}
+	if message, ok := smbMountCancelledMessage(action); ok {
+		return message
+	}
 
 	switch action {
 	case actionInstallAnsible:
 		return "Ansible installation cancelled."
+	case actionInstallGitTools:
+		return "Git tools installation cancelled."
+	case actionGitHubLogin:
+		return "GitHub CLI sign-in cancelled."
 	case actionInstallSway:
 		return "Wayland and Sway installation cancelled."
 	case actionInstallLinuxCNCConfig:
 		return "CorvusCNC configuration installation cancelled."
 	case actionConfigureLinuxCNCAutostartSway:
 		return "LinuxCNC Sway autostart configuration cancelled."
+	case actionConfigureLinuxCNCAutostartX11:
+		return "LinuxCNC XFCE X11 autostart configuration cancelled."
 	case actionAutologinLightDM:
 		return "LightDM auto-login configuration cancelled."
 	case actionAutologinSway:
@@ -1768,16 +1922,25 @@ func actionSuccessMessage(action sectionAction) string {
 	if message, ok := devToolsSuccessMessage(action); ok {
 		return message
 	}
+	if message, ok := smbMountSuccessMessage(action); ok {
+		return message
+	}
 
 	switch action {
 	case actionInstallAnsible:
 		return "Ansible installed successfully."
+	case actionInstallGitTools:
+		return "Git tools installed. Use GitHub sign-in to authenticate with gh."
+	case actionGitHubLogin:
+		return "GitHub CLI sign-in completed successfully."
 	case actionInstallSway:
 		return "Wayland and Sway installed. Log out and validate Sway before enabling auto-login."
 	case actionInstallLinuxCNCConfig:
 		return "CorvusCNC configuration installed in ~/linuxcnc/configs/corvuscnc and ready to select."
 	case actionConfigureLinuxCNCAutostartSway:
 		return "LinuxCNC autostart configured for Sway workspace 1. It will start at the next Sway login."
+	case actionConfigureLinuxCNCAutostartX11:
+		return "LinuxCNC autostart configured for XFCE X11 workspace 1. It will start at the next XFCE X11 login."
 	case actionAutologinLightDM:
 		return "LightDM auto-login configured. Reboot when ready."
 	case actionAutologinSway:

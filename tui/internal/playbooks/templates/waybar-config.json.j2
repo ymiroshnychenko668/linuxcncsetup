@@ -5,7 +5,7 @@
     "spacing": 6,
     "modules-left": ["sway/workspaces", "sway/mode"],
     "modules-center": ["sway/window"],
-    "modules-right": ["tray", "pulseaudio", "network", "cpu", "memory", "clock"],
+    "modules-right": ["tray", "network", "cpu", "memory", "clock"],
     "sway/workspaces": {
         "disable-scroll": true,
         "all-outputs": true,
@@ -21,13 +21,6 @@
     "tray": {
         "icon-size": 18,
         "spacing": 8
-    },
-    "pulseaudio": {
-        "format": "VOL {volume}%",
-        "format-muted": "VOL muted",
-        "format-bluetooth": "BT {volume}%",
-        "on-click": "pavucontrol",
-        "tooltip": true
     },
     "network": {
         "format-wifi": "WIFI {essid} {signalStrength}%",

@@ -1,0 +1,170 @@
+---
+- name: Inspect managed XFCE autostart directories without following links
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+  loop:
+    - "{{ linuxcnc_x11_home }}/.local"
+    - "{{ linuxcnc_x11_home }}/.local/bin"
+    - "{{ linuxcnc_x11_home }}/.config"
+    - "{{ linuxcnc_x11_home }}/.config/autostart"
+  register: linuxcnc_x11_managed_directories
+
+- name: Refuse symlinked or non-directory XFCE autostart paths
+  ansible.builtin.assert:
+    that:
+      - >-
+        not item.stat.exists or
+        (
+          item.stat.isdir | default(false) and
+          not (item.stat.islnk | default(false))
+        )
+    fail_msg: >-
+      Refusing to use {{ item.item }} because it is a symlink or is not a
+      directory.
+  loop: "{{ linuxcnc_x11_managed_directories.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Inspect existing managed XFCE autostart files without following links
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+  loop:
+    - "{{ linuxcnc_x11_home }}/.local/bin/linuxcnc-autostart-x11"
+    - "{{ linuxcnc_x11_home }}/.config/autostart/linuxcncsetup-linuxcnc-x11.desktop"
+  register: linuxcnc_x11_managed_paths
+
+- name: Refuse symlinked or non-regular managed XFCE autostart files
+  ansible.builtin.assert:
+    that:
+      - >-
+        not item.stat.exists or
+        (
+          item.stat.isreg | default(false) and
+          not (item.stat.islnk | default(false))
+        )
+    fail_msg: >-
+      Refusing to replace {{ item.item }} because it is a symlink or is not a
+      regular file.
+  loop: "{{ linuxcnc_x11_managed_paths.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Read installed XFCE launcher package facts
+  ansible.builtin.package_facts:
+    manager: auto
+
+- name: Select missing XFCE launcher packages
+  ansible.builtin.set_fact:
+    linuxcnc_x11_missing_packages: >-
+      {{
+        ["desktop-file-utils", "wmctrl"]
+        | difference(ansible_facts.packages.keys() | list)
+      }}
+
+- name: Install missing XFCE launcher packages
+  ansible.builtin.apt:
+    name: "{{ linuxcnc_x11_missing_packages }}"
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+    lock_timeout: 120
+  when: linuxcnc_x11_missing_packages | length > 0
+
+- name: Inspect installed XFCE launcher commands
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: true
+  loop:
+    - /usr/bin/desktop-file-validate
+    - /usr/bin/wmctrl
+  register: linuxcnc_x11_installed_commands
+
+- name: Require the XFCE launcher commands
+  ansible.builtin.assert:
+    that:
+      - linuxcnc_x11_installed_commands.results[0].stat.exists | default(false)
+      - linuxcnc_x11_installed_commands.results[0].stat.isreg | default(false)
+      - linuxcnc_x11_installed_commands.results[0].stat.executable | default(false)
+      - linuxcnc_x11_installed_commands.results[1].stat.exists | default(false)
+      - linuxcnc_x11_installed_commands.results[1].stat.isreg | default(false)
+      - linuxcnc_x11_installed_commands.results[1].stat.executable | default(false)
+    fail_msg: The XFCE launcher requires desktop-file-validate and wmctrl.
+
+- name: Create the target user's XFCE autostart directories
+  ansible.builtin.file:
+    path: "{{ item.item }}"
+    state: directory
+    owner: "{{ target_user }}"
+    group: "{{ linuxcnc_x11_group.stdout }}"
+    mode: "0755"
+  become_user: "{{ target_user }}"
+  loop: "{{ linuxcnc_x11_managed_directories.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when: not item.stat.exists
+
+- name: Install the LinuxCNC XFCE X11 launcher
+  ansible.builtin.template:
+    src: templates/linuxcnc-autostart-x11.sh.j2
+    dest: "{{ linuxcnc_x11_home }}/.local/bin/linuxcnc-autostart-x11"
+    owner: "{{ target_user }}"
+    group: "{{ linuxcnc_x11_group.stdout }}"
+    mode: "0755"
+    backup: true
+    validate: /bin/sh -n %s
+
+- name: Install the LinuxCNC XFCE XDG autostart entry
+  ansible.builtin.template:
+    src: templates/linuxcnc-autostart-x11.desktop.j2
+    dest: "{{ linuxcnc_x11_home }}/.config/autostart/linuxcncsetup-linuxcnc-x11.desktop"
+    owner: "{{ target_user }}"
+    group: "{{ linuxcnc_x11_group.stdout }}"
+    mode: "0644"
+    backup: true
+    validate: /usr/bin/desktop-file-validate %s
+
+- name: Inspect the installed XFCE autostart files
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: true
+  loop:
+    - "{{ linuxcnc_x11_home }}/.local/bin/linuxcnc-autostart-x11"
+    - "{{ linuxcnc_x11_home }}/.config/autostart/linuxcncsetup-linuxcnc-x11.desktop"
+  register: linuxcnc_x11_installed_paths
+  when: not ansible_check_mode
+
+- name: Require valid owned XFCE autostart files
+  ansible.builtin.assert:
+    that:
+      - linuxcnc_x11_installed_paths.results[0].stat.exists | default(false)
+      - linuxcnc_x11_installed_paths.results[0].stat.isreg | default(false)
+      - linuxcnc_x11_installed_paths.results[0].stat.executable | default(false)
+      - (linuxcnc_x11_installed_paths.results[0].stat.pw_name | default("")) == target_user
+      - linuxcnc_x11_installed_paths.results[1].stat.exists | default(false)
+      - linuxcnc_x11_installed_paths.results[1].stat.isreg | default(false)
+      - (linuxcnc_x11_installed_paths.results[1].stat.pw_name | default("")) == target_user
+    fail_msg: The managed XFCE autostart files were not installed correctly.
+  when: not ansible_check_mode
+
+- name: Validate the installed XFCE launcher as the target user
+  ansible.builtin.command:
+    argv:
+      - /bin/sh
+      - -n
+      - "{{ linuxcnc_x11_home }}/.local/bin/linuxcnc-autostart-x11"
+  become_user: "{{ target_user }}"
+  changed_when: false
+  check_mode: false
+  when: not ansible_check_mode
+
+- name: Validate the installed XFCE XDG autostart entry as the target user
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/desktop-file-validate
+      - "{{ linuxcnc_x11_home }}/.config/autostart/linuxcncsetup-linuxcnc-x11.desktop"
+  become_user: "{{ target_user }}"
+  changed_when: false
+  check_mode: false
+  when: not ansible_check_mode

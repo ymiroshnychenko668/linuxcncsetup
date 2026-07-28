@@ -1,0 +1,773 @@
+---
+- name: Manage the LinuxCNC SMB network share
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  become: true
+
+  pre_tasks:
+    - name: Validate the SMB mount request
+      ansible.builtin.assert:
+        that:
+          - ansible_facts["distribution"] == "Debian"
+          - (smb_operation | default("")) in ["mount", "unmount", "remove"]
+          - (smb_source | default("")) == "//10.0.1.246/share"
+          - (smb_mount_point | default("")) == "/mnt/smb_share"
+          - (target_user | default("")) is match("^[a-zA-Z_][a-zA-Z0-9_.-]*[$]?$")
+          - (target_user | default("")) != "root"
+        fail_msg: >-
+          This playbook requires Debian, smb_operation=mount|unmount|remove,
+          the fixed //10.0.1.246/share source and /mnt/smb_share mount point,
+          and a regular non-root target_user.
+
+    - name: Read the target account
+      ansible.builtin.getent:
+        database: passwd
+        key: "{{ target_user }}"
+
+    - name: Read regular-user UID bounds
+      ansible.builtin.slurp:
+        src: /etc/login.defs
+      register: smb_login_defs
+
+    - name: Derive target account details
+      ansible.builtin.set_fact:
+        smb_target_uid: "{{ ansible_facts['getent_passwd'][target_user][1] | int }}"
+        smb_target_gid: "{{ ansible_facts['getent_passwd'][target_user][2] | int }}"
+        smb_target_home: "{{ ansible_facts['getent_passwd'][target_user][4] }}"
+        smb_target_shell: "{{ ansible_facts['getent_passwd'][target_user][5] }}"
+        smb_uid_min_matches: >-
+          {{
+            smb_login_defs.content
+            | b64decode
+            | regex_findall('(?m)^\s*UID_MIN\s+(\d+)\s*$')
+          }}
+        smb_uid_max_matches: >-
+          {{
+            smb_login_defs.content
+            | b64decode
+            | regex_findall('(?m)^\s*UID_MAX\s+(\d+)\s*$')
+          }}
+
+    - name: Validate the target account
+      ansible.builtin.assert:
+        that:
+          - smb_uid_min_matches | length == 1
+          - smb_uid_max_matches | length == 1
+          - smb_target_uid >= (smb_uid_min_matches[0] | int)
+          - smb_target_uid <= (smb_uid_max_matches[0] | int)
+          - smb_target_home is match("^/")
+          - not (smb_target_shell is match("^.*/(nologin|false)$"))
+        fail_msg: >-
+          target_user must be a regular login account with an absolute home
+          directory and a usable shell.
+
+    - name: Derive the CIFS mount options
+      ansible.builtin.set_fact:
+        smb_mount_options: >-
+          username=guest,guest,vers=3.0,uid={{ smb_target_uid }},gid={{ smb_target_gid }},
+          iocharset=utf8,file_mode=0644,dir_mode=0755,_netdev,nofail,
+          x-systemd.automount,x-systemd.device-timeout=10s,
+          x-systemd.mount-timeout=10s
+
+    - name: Resolve the exact systemd unit name
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/systemd-escape
+          - --path
+          - "{{ smb_mount_point }}"
+      register: smb_systemd_escape
+      changed_when: false
+      check_mode: false
+
+    - name: Store the exact systemd unit names
+      ansible.builtin.set_fact:
+        smb_mount_unit: "{{ smb_systemd_escape.stdout | trim }}.mount"
+        smb_automount_unit: "{{ smb_systemd_escape.stdout | trim }}.automount"
+        smb_mount_options_compact: "{{ smb_mount_options | regex_replace('\\s+', '') }}"
+
+    - name: Refresh systemd unit discovery before provenance checks
+      ansible.builtin.systemd_service:
+        daemon_reload: true
+      when: not ansible_check_mode
+
+    - name: Inspect the systemd mount unit provenance
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/systemctl
+          - show
+          - "{{ smb_mount_unit }}"
+          - --property=LoadState
+          - --property=FragmentPath
+          - --property=SourcePath
+          - --property=DropInPaths
+      register: smb_mount_unit_provenance
+      changed_when: false
+      check_mode: false
+
+    - name: Inspect the systemd automount unit provenance
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/systemctl
+          - show
+          - "{{ smb_automount_unit }}"
+          - --property=LoadState
+          - --property=FragmentPath
+          - --property=SourcePath
+          - --property=DropInPaths
+      register: smb_automount_unit_provenance
+      changed_when: false
+      check_mode: false
+
+    - name: Refuse native or overridden systemd mount units
+      ansible.builtin.assert:
+        that:
+          - >-
+            smb_mount_unit_provenance.stdout
+            is search('(?m)^LoadState=not-found$') or
+            (
+              smb_mount_unit_provenance.stdout
+              is search('(?m)^LoadState=loaded$') and
+              smb_mount_unit_provenance.stdout
+              is search('(?m)^SourcePath=/etc/fstab$') and
+              smb_mount_unit_provenance.stdout
+              is search(
+                '(?m)^FragmentPath=/run/systemd/generator'
+                ~ '(?:[.](?:early|late))?/'
+                ~ (smb_mount_unit | regex_escape)
+                ~ '$'
+              ) and
+              smb_mount_unit_provenance.stdout
+              is search('(?m)^DropInPaths=$')
+            )
+          - >-
+            smb_automount_unit_provenance.stdout
+            is search('(?m)^LoadState=not-found$') or
+            (
+              smb_automount_unit_provenance.stdout
+              is search('(?m)^LoadState=loaded$') and
+              smb_automount_unit_provenance.stdout
+              is search('(?m)^SourcePath=/etc/fstab$') and
+              smb_automount_unit_provenance.stdout
+              is search(
+                '(?m)^FragmentPath=/run/systemd/generator'
+                ~ '(?:[.](?:early|late))?/'
+                ~ (smb_automount_unit | regex_escape)
+                ~ '$'
+              ) and
+              smb_automount_unit_provenance.stdout
+              is search('(?m)^DropInPaths=$')
+            )
+        fail_msg: >-
+          A native, overridden, or non-fstab systemd mount unit owns
+          /mnt/smb_share. LinuxCNC Setup will not start or stop that unit.
+
+    - name: Read the static fstab entry for the exact mount point
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/findmnt
+          - --fstab
+          - --mountpoint
+          - "{{ smb_mount_point }}"
+          - --noheadings
+          - --raw
+          - --output
+          - SOURCE,FSTYPE,OPTIONS
+      register: smb_fstab_probe
+      changed_when: false
+      failed_when: smb_fstab_probe.rc not in [0, 1]
+      check_mode: false
+
+    - name: Read every active filesystem at the exact mount point
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/findmnt
+          - --kernel
+          - --mountpoint
+          - "{{ smb_mount_point }}"
+          - --noheadings
+          - --raw
+          - --output
+          - SOURCE,FSTYPE
+      register: smb_kernel_probe
+      changed_when: false
+      failed_when: smb_kernel_probe.rc not in [0, 1]
+      check_mode: false
+
+    - name: Read an active CIFS filesystem at the exact mount point
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/findmnt
+          - --kernel
+          - --mountpoint
+          - "{{ smb_mount_point }}"
+          - --types
+          - cifs
+          - --noheadings
+          - --raw
+          - --output
+          - SOURCE,FSTYPE
+      register: smb_kernel_cifs_probe
+      changed_when: false
+      failed_when: smb_kernel_cifs_probe.rc not in [0, 1]
+      check_mode: false
+
+    - name: Read an active autofs filesystem at the exact mount point
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/findmnt
+          - --kernel
+          - --mountpoint
+          - "{{ smb_mount_point }}"
+          - --types
+          - autofs
+          - --noheadings
+          - --raw
+          - --output
+          - SOURCE,FSTYPE
+      register: smb_kernel_autofs_probe
+      changed_when: false
+      failed_when: smb_kernel_autofs_probe.rc not in [0, 1]
+      check_mode: false
+
+    - name: Read fstab without following the mount point
+      ansible.builtin.slurp:
+        src: /etc/fstab
+      register: smb_fstab_file
+
+    - name: Parse the current SMB mount state
+      ansible.builtin.set_fact:
+        smb_fstab_fields: >-
+          {{
+            (smb_fstab_probe.stdout | trim).split()
+            if smb_fstab_probe.rc == 0
+            else []
+          }}
+        smb_kernel_cifs_fields: >-
+          {{
+            (smb_kernel_cifs_probe.stdout | trim).split()
+            if smb_kernel_cifs_probe.rc == 0
+            else []
+          }}
+        smb_cifs_active: "{{ smb_kernel_cifs_probe.rc == 0 }}"
+        smb_autofs_active: "{{ smb_kernel_autofs_probe.rc == 0 }}"
+        smb_fstab_text: "{{ smb_fstab_file.content | b64decode }}"
+
+    - name: Identify managed fstab markers and blocks
+      ansible.builtin.set_fact:
+        smb_managed_begin_count: >-
+          {{
+            smb_fstab_text
+            | regex_findall('(?m)^# BEGIN LINUXCNCSETUP MANAGED SMB SHARE$')
+            | length
+          }}
+        smb_managed_end_count: >-
+          {{
+            smb_fstab_text
+            | regex_findall('(?m)^# END LINUXCNCSETUP MANAGED SMB SHARE$')
+            | length
+          }}
+        smb_managed_blocks: >-
+          {{
+            smb_fstab_text
+            | regex_findall(
+                '(?ms)^# BEGIN LINUXCNCSETUP MANAGED SMB SHARE\n'
+                ~ '(.*?)'
+                ~ '^# END LINUXCNCSETUP MANAGED SMB SHARE$'
+              )
+          }}
+
+    - name: Validate ownership of the managed fstab block
+      ansible.builtin.assert:
+        that:
+          - smb_managed_begin_count == smb_managed_end_count
+          - smb_managed_begin_count <= 1
+          - smb_managed_blocks | length == smb_managed_begin_count
+          - >-
+            smb_managed_blocks | length == 0 or
+            (
+              smb_managed_blocks[0] | trim
+              is match(
+                '^'
+                ~ (smb_source | regex_escape)
+                ~ '[ \t]+'
+                ~ (smb_mount_point | regex_escape)
+                ~ '[ \t]+cifs[ \t]+\S+[ \t]+0[ \t]+0$'
+              )
+            )
+        fail_msg: >-
+          The LinuxCNC Setup SMB markers are duplicated, out of order, or do
+          not contain exactly the expected CIFS mount. They were not modified.
+
+    - name: Record managed fstab ownership
+      ansible.builtin.set_fact:
+        smb_managed_begin_present: "{{ smb_managed_begin_count == 1 }}"
+        smb_managed_end_present: "{{ smb_managed_end_count == 1 }}"
+
+    - name: Reject ambiguous or unrelated fstab state
+      ansible.builtin.assert:
+        that:
+          - smb_fstab_probe.stdout_lines | length <= 1
+          - >-
+            smb_fstab_fields | length == 0 or
+            (
+              smb_fstab_fields | length >= 3 and
+              smb_fstab_fields[0] == smb_source and
+              smb_fstab_fields[1] == "cifs"
+            )
+          - >-
+            smb_operation != "remove" or
+            smb_fstab_fields | length == 0 or
+            smb_managed_begin_present
+        fail_msg: >-
+          The mount point has an unrelated, ambiguous, or legacy unmanaged
+          fstab entry. It was left unchanged. A legacy entry may be mounted or
+          unmounted here, but LinuxCNC Setup will not remove it.
+
+    - name: Reject unrelated active filesystems
+      ansible.builtin.assert:
+        that:
+          - smb_kernel_probe.stdout_lines | length <= 2
+          - smb_kernel_cifs_probe.stdout_lines | length <= 1
+          - smb_kernel_autofs_probe.stdout_lines | length <= 1
+          - >-
+            smb_kernel_probe.stdout_lines | length ==
+            (
+              (smb_kernel_cifs_probe.stdout_lines | length) +
+              (smb_kernel_autofs_probe.stdout_lines | length)
+            )
+          - >-
+            not smb_cifs_active or
+            (
+              smb_kernel_cifs_fields | length >= 2 and
+              smb_kernel_cifs_fields[0] == smb_source and
+              smb_kernel_cifs_fields[1] == "cifs"
+            )
+          - >-
+            not smb_autofs_active or
+            (
+              smb_fstab_fields | length >= 3 and
+              smb_fstab_fields[0] == smb_source and
+              smb_fstab_fields[1] == "cifs"
+            )
+        fail_msg: >-
+          Another active filesystem owns /mnt/smb_share. It was not touched.
+
+    - name: Require compatible options on an unmanaged matching entry
+      ansible.builtin.assert:
+        that:
+          - >-
+            smb_managed_begin_present or
+            smb_fstab_fields | length == 0 or
+            "x-systemd.automount" in smb_fstab_fields[2].split(",")
+          - >-
+            smb_managed_begin_present or
+            smb_fstab_fields | length == 0 or
+            (
+              smb_fstab_fields[2].split(",")
+              | select("match", "^uid=")
+              | list
+              | length
+            ) == 1
+          - >-
+            smb_managed_begin_present or
+            smb_fstab_fields | length == 0 or
+            ("uid=" ~ (smb_target_uid | string))
+            in smb_fstab_fields[2].split(",")
+          - >-
+            smb_managed_begin_present or
+            smb_fstab_fields | length == 0 or
+            (
+              smb_fstab_fields[2].split(",")
+              | select("match", "^gid=")
+              | list
+              | length
+            ) == 1
+          - >-
+            smb_managed_begin_present or
+            smb_fstab_fields | length == 0 or
+            ("gid=" ~ (smb_target_gid | string))
+            in smb_fstab_fields[2].split(",")
+        fail_msg: >-
+          The matching legacy fstab entry does not use compatible automount,
+          uid, and gid options. It was not modified.
+      when: smb_operation == "mount"
+
+    - name: Inspect an inactive mount point
+      ansible.builtin.stat:
+        path: "{{ smb_mount_point }}"
+        follow: false
+      register: smb_mount_point_status
+      when:
+        - smb_operation == "mount"
+        - not smb_cifs_active
+        - not smb_autofs_active
+
+    - name: Reject an unsafe mount point
+      ansible.builtin.assert:
+        that:
+          - not smb_mount_point_status.stat.exists or smb_mount_point_status.stat.isdir
+          - not smb_mount_point_status.stat.exists or not smb_mount_point_status.stat.islnk
+        fail_msg: >-
+          /mnt/smb_share exists but is not a real directory. It was not
+          modified.
+      when:
+        - smb_operation == "mount"
+        - not smb_cifs_active
+        - not smb_autofs_active
+
+    - name: Inspect local contents that mounting would hide
+      ansible.builtin.find:
+        paths: "{{ smb_mount_point }}"
+        recurse: false
+        hidden: true
+        file_type: any
+      register: smb_local_mount_contents
+      when:
+        - smb_operation == "mount"
+        - not smb_cifs_active
+        - not smb_autofs_active
+        - smb_mount_point_status.stat.exists
+        - smb_mount_point_status.stat.isdir
+        - not smb_mount_point_status.stat.islnk
+
+    - name: Refuse to cover a non-empty local directory
+      ansible.builtin.assert:
+        that:
+          - smb_local_mount_contents.matched | int == 0
+        fail_msg: >-
+          /mnt/smb_share contains local files or directories. Mounting would
+          hide them, so nothing was changed.
+      when:
+        - smb_operation == "mount"
+        - not smb_cifs_active
+        - not smb_autofs_active
+        - smb_mount_point_status.stat.exists
+        - smb_mount_point_status.stat.isdir
+        - not smb_mount_point_status.stat.islnk
+
+  tasks:
+    - name: Configure and mount the SMB share
+      when: smb_operation == "mount"
+      block:
+        - name: Inspect the CIFS mount helper
+          ansible.builtin.stat:
+            path: /usr/sbin/mount.cifs
+            follow: true
+          register: smb_mount_cifs
+
+        - name: Install the CIFS mount helper
+          ansible.builtin.apt:
+            name: cifs-utils
+            state: present
+            update_cache: true
+            cache_valid_time: 3600
+            lock_timeout: 120
+          when: not smb_mount_cifs.stat.exists
+
+        - name: Create the inactive mount point
+          ansible.builtin.file:
+            path: "{{ smb_mount_point }}"
+            state: directory
+            owner: root
+            group: root
+            mode: "0755"
+          when:
+            - not smb_cifs_active
+            - not smb_autofs_active
+
+        - name: Install the managed SMB fstab block
+          ansible.builtin.blockinfile:
+            path: /etc/fstab
+            marker: "# {mark} LINUXCNCSETUP MANAGED SMB SHARE"
+            block: >-
+              {{ smb_source }} {{ smb_mount_point }} cifs
+              {{ smb_mount_options_compact }} 0 0
+            insertafter: EOF
+            backup: true
+          when:
+            - smb_fstab_fields | length == 0 or smb_managed_begin_present
+
+        - name: Validate generated units before activation
+          when: not ansible_check_mode
+          block:
+            - name: Reload systemd after configuring the mount
+              ansible.builtin.systemd_service:
+                daemon_reload: true
+
+            - name: Reinspect the configured systemd mount unit provenance
+              ansible.builtin.command:
+                argv:
+                  - /usr/bin/systemctl
+                  - show
+                  - "{{ smb_mount_unit }}"
+                  - --property=LoadState
+                  - --property=FragmentPath
+                  - --property=SourcePath
+                  - --property=DropInPaths
+              register: smb_configured_mount_unit_provenance
+              changed_when: false
+              check_mode: false
+
+            - name: Reinspect the configured systemd automount unit provenance
+              ansible.builtin.command:
+                argv:
+                  - /usr/bin/systemctl
+                  - show
+                  - "{{ smb_automount_unit }}"
+                  - --property=LoadState
+                  - --property=FragmentPath
+                  - --property=SourcePath
+                  - --property=DropInPaths
+              register: smb_configured_automount_unit_provenance
+              changed_when: false
+              check_mode: false
+
+            - name: Require clean fstab-generated units before starting them
+              ansible.builtin.assert:
+                that:
+                  - >-
+                    smb_configured_mount_unit_provenance.stdout
+                    is search('(?m)^LoadState=loaded$') and
+                    smb_configured_mount_unit_provenance.stdout
+                    is search('(?m)^SourcePath=/etc/fstab$') and
+                    smb_configured_mount_unit_provenance.stdout
+                    is search(
+                      '(?m)^FragmentPath=/run/systemd/generator'
+                      ~ '(?:[.](?:early|late))?/'
+                      ~ (smb_mount_unit | regex_escape)
+                      ~ '$'
+                    ) and
+                    smb_configured_mount_unit_provenance.stdout
+                    is search('(?m)^DropInPaths=$')
+                  - >-
+                    smb_configured_automount_unit_provenance.stdout
+                    is search('(?m)^LoadState=loaded$') and
+                    smb_configured_automount_unit_provenance.stdout
+                    is search('(?m)^SourcePath=/etc/fstab$') and
+                    smb_configured_automount_unit_provenance.stdout
+                    is search(
+                      '(?m)^FragmentPath=/run/systemd/generator'
+                      ~ '(?:[.](?:early|late))?/'
+                      ~ (smb_automount_unit | regex_escape)
+                      ~ '$'
+                    ) and
+                    smb_configured_automount_unit_provenance.stdout
+                    is search('(?m)^DropInPaths=$')
+                fail_msg: >-
+                  Native systemd drop-ins or unit overrides appeared after
+                  fstab generation. The SMB units were not started.
+          rescue:
+            - name: Roll back a newly-created managed fstab block
+              ansible.builtin.blockinfile:
+                path: /etc/fstab
+                marker: "# {mark} LINUXCNCSETUP MANAGED SMB SHARE"
+                state: absent
+                backup: true
+              when:
+                - smb_fstab_fields | length == 0
+                - not smb_managed_begin_present
+
+            - name: Reload systemd after rolling back unsafe units
+              ansible.builtin.systemd_service:
+                daemon_reload: true
+              when:
+                - smb_fstab_fields | length == 0
+                - not smb_managed_begin_present
+
+            - name: Stop after rejecting unsafe generated units
+              ansible.builtin.fail:
+                msg: >-
+                  The SMB mount was not activated because its generated
+                  systemd units were overridden. Any fstab entry created by
+                  this run was rolled back.
+
+        - name: Start the SMB automount unit
+          ansible.builtin.systemd_service:
+            name: "{{ smb_automount_unit }}"
+            state: started
+          when:
+            - not ansible_check_mode
+            - not smb_cifs_active
+
+        - name: Mount the SMB share now
+          ansible.builtin.systemd_service:
+            name: "{{ smb_mount_unit }}"
+            state: started
+          when:
+            - not ansible_check_mode
+            - not smb_cifs_active
+
+    - name: Reload systemd before an unmount operation
+      ansible.builtin.systemd_service:
+        daemon_reload: true
+      when:
+        - smb_operation in ["unmount", "remove"]
+        - smb_fstab_fields | length >= 3
+        - not ansible_check_mode
+
+    - name: Stop the SMB automount unit before unmounting
+      ansible.builtin.systemd_service:
+        name: "{{ smb_automount_unit }}"
+        state: stopped
+      when:
+        - smb_operation in ["unmount", "remove"]
+        - not ansible_check_mode
+        - >-
+          (
+            smb_fstab_fields | length >= 3 and
+            "x-systemd.automount" in smb_fstab_fields[2].split(",")
+          ) or
+          (
+            smb_autofs_active
+          )
+
+    - name: Unmount the SMB share normally
+      ansible.builtin.systemd_service:
+        name: "{{ smb_mount_unit }}"
+        state: stopped
+      when:
+        - smb_operation in ["unmount", "remove"]
+        - not ansible_check_mode
+        - smb_cifs_active
+
+    - name: Verify the SMB share is inactive before removal
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/findmnt
+          - --kernel
+          - --mountpoint
+          - "{{ smb_mount_point }}"
+          - --noheadings
+          - --raw
+          - --output
+          - SOURCE,FSTYPE
+      register: smb_unmount_verification
+      changed_when: false
+      failed_when: smb_unmount_verification.rc not in [0, 1]
+      check_mode: false
+      when:
+        - smb_operation in ["unmount", "remove"]
+        - not ansible_check_mode
+
+    - name: Require the SMB share and automount to be inactive
+      ansible.builtin.assert:
+        that:
+          - smb_unmount_verification.rc == 1
+        fail_msg: >-
+          /mnt/smb_share is still active. Its persistent configuration was not
+          removed.
+      when:
+        - smb_operation in ["unmount", "remove"]
+        - not ansible_check_mode
+
+    - name: Remove only the managed SMB fstab block
+      ansible.builtin.blockinfile:
+        path: /etc/fstab
+        marker: "# {mark} LINUXCNCSETUP MANAGED SMB SHARE"
+        state: absent
+        backup: true
+      when:
+        - smb_operation == "remove"
+        - smb_managed_begin_present
+
+    - name: Reload systemd after removing the mount
+      ansible.builtin.systemd_service:
+        daemon_reload: true
+      when:
+        - smb_operation == "remove"
+        - smb_managed_begin_present
+        - not ansible_check_mode
+
+    - name: Verify the SMB share is mounted
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/findmnt
+          - --kernel
+          - --mountpoint
+          - "{{ smb_mount_point }}"
+          - --types
+          - cifs
+          - --noheadings
+          - --raw
+          - --output
+          - SOURCE,FSTYPE
+      register: smb_mount_verification
+      changed_when: false
+      failed_when: smb_mount_verification.rc not in [0, 1]
+      check_mode: false
+      when:
+        - smb_operation == "mount"
+        - not ansible_check_mode
+
+    - name: Require the expected CIFS share to be mounted
+      ansible.builtin.assert:
+        that:
+          - >-
+            smb_mount_verification.rc == 0 and
+            smb_mount_verification.stdout_lines | length == 1 and
+            (smb_mount_verification.stdout | trim).split() | length >= 2 and
+            (smb_mount_verification.stdout | trim).split()[0] == smb_source and
+            (smb_mount_verification.stdout | trim).split()[1] == "cifs"
+        fail_msg: >-
+          The systemd mount operation completed without the expected CIFS
+          share becoming active at /mnt/smb_share.
+      when:
+        - smb_operation == "mount"
+        - not ansible_check_mode
+
+    - name: Verify the managed fstab block was removed
+      ansible.builtin.slurp:
+        src: /etc/fstab
+      register: smb_fstab_after_remove
+      when:
+        - smb_operation == "remove"
+        - not ansible_check_mode
+
+    - name: Verify no static SMB entry remains after removal
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/findmnt
+          - --fstab
+          - --mountpoint
+          - "{{ smb_mount_point }}"
+          - --noheadings
+          - --raw
+          - --output
+          - SOURCE,FSTYPE
+      register: smb_fstab_probe_after_remove
+      changed_when: false
+      failed_when: smb_fstab_probe_after_remove.rc not in [0, 1]
+      check_mode: false
+      when:
+        - smb_operation == "remove"
+        - not ansible_check_mode
+
+    - name: Require the managed fstab markers to be absent
+      ansible.builtin.assert:
+        that:
+          - >-
+            "# BEGIN LINUXCNCSETUP MANAGED SMB SHARE"
+            not in (smb_fstab_after_remove.content | b64decode)
+          - >-
+            "# END LINUXCNCSETUP MANAGED SMB SHARE"
+            not in (smb_fstab_after_remove.content | b64decode)
+          - smb_fstab_probe_after_remove.rc == 1
+        fail_msg: The LinuxCNC Setup SMB fstab block was not fully removed.
+      when:
+        - smb_operation == "remove"
+        - not ansible_check_mode
+
+  post_tasks:
+    - name: Report SMB mount result
+      ansible.builtin.debug:
+        msg: >-
+          {{
+            "The SMB share is mounted now and configured for systemd automount."
+            if smb_operation == "mount"
+            else
+            "The SMB share is unmounted for this boot; persistent configuration remains."
+            if smb_operation == "unmount"
+            else
+            "The SMB share is unmounted and the LinuxCNC Setup fstab block is removed."
+          }}

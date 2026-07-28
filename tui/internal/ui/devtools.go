@@ -17,11 +17,6 @@ var devToolsSections = []section{
 		action:      actionInstallDevToolsAll,
 	},
 	{
-		title:       "Git & GitHub SSH",
-		description: "Install Git, set the cnc identity, and prepare an Ed25519 key for GitHub.",
-		action:      actionInstallDevToolsGit,
-	},
-	{
 		title:       "Visual Studio Code",
 		description: "Add Microsoft's signed amd64 repository and install Visual Studio Code.",
 		action:      actionInstallDevToolsVSCode,
@@ -72,8 +67,6 @@ func devToolsComponent(action sectionAction) (string, bool) {
 	switch action {
 	case actionInstallDevToolsAll:
 		return "all", true
-	case actionInstallDevToolsGit:
-		return "git", true
 	case actionInstallDevToolsVSCode:
 		return "vscode", true
 	case actionInstallDevToolsCodex:
@@ -99,8 +92,6 @@ func devToolsActionName(action sectionAction) (string, bool) {
 	switch action {
 	case actionInstallDevToolsAll:
 		return "Developer tools installation", true
-	case actionInstallDevToolsGit:
-		return "Git and GitHub SSH setup", true
 	case actionInstallDevToolsVSCode:
 		return "Visual Studio Code installation", true
 	case actionInstallDevToolsCodex:
@@ -126,8 +117,6 @@ func devToolsRunningMessage(action sectionAction) (string, bool) {
 	switch action {
 	case actionInstallDevToolsAll:
 		return "Installing all developer tools...", true
-	case actionInstallDevToolsGit:
-		return "Installing Git and configuring GitHub SSH...", true
 	case actionInstallDevToolsVSCode:
 		return "Installing Visual Studio Code...", true
 	case actionInstallDevToolsCodex:
@@ -161,8 +150,6 @@ func devToolsSuccessMessage(action sectionAction) (string, bool) {
 	switch action {
 	case actionInstallDevToolsAll:
 		return "All developer tools installed successfully.", true
-	case actionInstallDevToolsGit:
-		return "Git and GitHub SSH configured successfully.", true
 	case actionInstallDevToolsVSCode:
 		return "Visual Studio Code installed successfully.", true
 	case actionInstallDevToolsCodex:
@@ -195,23 +182,13 @@ func renderDevToolsAction(action sectionAction, confirming bool) []string {
 		lines = []string{
 			warningStyle.Render("Install all developer tools?"),
 			"",
-			"Installs Git, VS Code, Codex CLI,",
-			"Claude Code, Warp Terminal, htop,",
-			"mc, Terminator, and supporting packages.",
-			"Configures cnc <cnc@cnc.cn>, GitHub",
-			"SSH, signed APT repositories, official",
-			"per-user installers, and user lingering.",
+			"Installs VS Code, Codex CLI, Claude Code,",
+			"Warp Terminal, htop, mc, Terminator,",
+			"and their supporting packages.",
+			"Configures signed APT repositories,",
+			"official per-user installers, and",
+			"user lingering.",
 			"Codex and Claude request sign-in on first run.",
-		}
-	case actionInstallDevToolsGit:
-		lines = []string{
-			warningStyle.Render("Install Git and configure GitHub SSH?"),
-			"",
-			"Installs Git and the OpenSSH client.",
-			"Sets global Git to cnc <cnc@cnc.cn>.",
-			"Creates an Ed25519 key if needed and",
-			"shows its public key for GitHub.",
-			"An existing private key is not replaced.",
 		}
 	case actionInstallDevToolsVSCode:
 		lines = []string{

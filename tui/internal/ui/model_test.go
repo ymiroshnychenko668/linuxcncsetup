@@ -57,23 +57,29 @@ func TestAnsibleConfirmationView(t *testing.T) {
 }
 
 func TestAutologinSubmenuStructure(t *testing.T) {
-	if mainSections[1].action != actionInstallLinuxCNCConfig {
-		t.Fatal("CorvusCNC installation should follow Ansible installation")
+	if mainSections[1].action != actionOpenGitSetup {
+		t.Fatal("Git setup should follow Ansible installation")
 	}
-	if mainSections[2].action != actionInstallSway {
+	if mainSections[2].action != actionInstallLinuxCNCConfig {
+		t.Fatal("CorvusCNC installation should follow Git setup")
+	}
+	if mainSections[3].action != actionInstallSway {
 		t.Fatal("Sway installation should follow CorvusCNC installation")
 	}
-	if mainSections[3].action != actionOpenDevTools {
+	if mainSections[4].action != actionOpenDevTools {
 		t.Fatal("developer-tools submenu should follow Sway installation")
 	}
-	if mainSections[4].action != actionOpenAutologin {
+	if mainSections[5].action != actionOpenAutologin {
 		t.Fatal("automatic login should follow Sway installation")
 	}
-	if mainSections[5].action != actionOpenLinuxCNCAutostart {
+	if mainSections[6].action != actionOpenLinuxCNCAutostart {
 		t.Fatal("LinuxCNC autostart should follow automatic login")
 	}
 	if autologinSections[0].action != actionAutologinLightDM {
 		t.Fatal("LightDM should be the first automatic-login option")
+	}
+	if !strings.Contains(autologinSections[0].description, "Use LightDM") {
+		t.Fatal("LightDM option should describe selecting LightDM")
 	}
 	if autologinSections[1].action != actionAutologinSway {
 		t.Fatal("Sway should be the second automatic-login option")
@@ -81,14 +87,15 @@ func TestAutologinSubmenuStructure(t *testing.T) {
 	if autologinSections[2].action != actionBack {
 		t.Fatal("automatic-login submenu should end with a back action")
 	}
-	if mainSections[6].action != actionReboot {
+	if mainSections[7].action != actionReboot {
 		t.Fatal("reboot should follow the LinuxCNC autostart submenu")
 	}
 }
 
 func TestEnterAndLeaveAutologinSubmenu(t *testing.T) {
+	mainIndex := mainMenuActionIndex(t, actionOpenAutologin)
 	model := New()
-	model.selected = 4
+	model.selected = mainIndex
 	model.prepareSelectedAction()
 
 	if model.page != menuAutologin || model.selected != 0 {
@@ -101,7 +108,7 @@ func TestEnterAndLeaveAutologinSubmenu(t *testing.T) {
 	}
 
 	result := updated.(Model)
-	if result.page != menuMain || result.selected != 4 {
+	if result.page != menuMain || result.selected != mainIndex {
 		t.Fatalf("Esc returned to page %d selection %d", result.page, result.selected)
 	}
 }
@@ -110,8 +117,14 @@ func TestLinuxCNCAutostartSubmenuStructure(t *testing.T) {
 	if linuxCNCAutostartSections[0].action != actionOpenLinuxCNCAutostartSway {
 		t.Fatal("Sway should be the first LinuxCNC autostart option")
 	}
-	if linuxCNCAutostartSections[1].action != actionLinuxCNCAutostartX11 {
-		t.Fatal("X11 should be the second LinuxCNC autostart option")
+	if linuxCNCAutostartSections[1].action != actionOpenLinuxCNCAutostartX11 {
+		t.Fatal("XFCE X11 should be the second LinuxCNC autostart option")
+	}
+	if linuxCNCAutostartSections[1].title != "XFCE (X11)" {
+		t.Fatalf(
+			"XFCE X11 title = %q",
+			linuxCNCAutostartSections[1].title,
+		)
 	}
 	if linuxCNCAutostartSections[2].action != actionBack {
 		t.Fatal("LinuxCNC autostart submenu should end with a back action")
@@ -119,7 +132,7 @@ func TestLinuxCNCAutostartSubmenuStructure(t *testing.T) {
 }
 
 func TestConfigurationSubmenuStructure(t *testing.T) {
-	if mainSections[8].action != actionOpenConfiguration {
+	if mainSections[mainMenuActionIndex(t, actionOpenConfiguration)].action != actionOpenConfiguration {
 		t.Fatal("Configuration should open its submenu")
 	}
 	if configurationSections[0].action != actionOpenGRUBRealtime {
@@ -128,7 +141,10 @@ func TestConfigurationSubmenuStructure(t *testing.T) {
 	if configurationSections[1].action != actionOpenIRQAffinity {
 		t.Fatal("IRQ affinity should follow GRUB real-time setup")
 	}
-	if configurationSections[2].action != actionBack {
+	if configurationSections[2].action != actionOpenSMBMounts {
+		t.Fatal("SMB mounts should follow IRQ affinity")
+	}
+	if configurationSections[3].action != actionBack {
 		t.Fatal("configuration submenu should end with a back action")
 	}
 	if irqAffinitySections[0].action != actionIRQDevices {
@@ -146,8 +162,9 @@ func TestConfigurationSubmenuStructure(t *testing.T) {
 }
 
 func TestEnterAndLeaveConfigurationSubmenu(t *testing.T) {
+	mainIndex := mainMenuActionIndex(t, actionOpenConfiguration)
 	model := New()
-	model.selected = 8
+	model.selected = mainIndex
 	model.prepareSelectedAction()
 
 	if model.page != menuConfiguration || model.selected != 0 {
@@ -159,7 +176,7 @@ func TestEnterAndLeaveConfigurationSubmenu(t *testing.T) {
 		t.Fatal("leaving Configuration should not execute a command")
 	}
 	result := updated.(Model)
-	if result.page != menuMain || result.selected != 8 {
+	if result.page != menuMain || result.selected != mainIndex {
 		t.Fatalf("Esc returned to page %d selection %d", result.page, result.selected)
 	}
 }
@@ -408,86 +425,215 @@ func TestEnterAndLeaveLinuxCNCAutostartMenus(t *testing.T) {
 	}
 	t.Setenv(linuxCNCConfigDirectoryEnvironment, root)
 
-	model := New()
-	model.selected = 5
-	model.prepareSelectedAction()
-	if model.page != menuLinuxCNCAutostart || model.selected != 0 {
-		t.Fatalf("entering platform menu produced page %d selection %d", model.page, model.selected)
-	}
+	mainIndex := mainMenuActionIndex(t, actionOpenLinuxCNCAutostart)
+	for _, test := range []struct {
+		name            string
+		desktop         linuxCNCAutostartDesktop
+		platformIndex   int
+		configureAction sectionAction
+	}{
+		{
+			name:            "Sway",
+			desktop:         linuxCNCDesktopSway,
+			platformIndex:   0,
+			configureAction: actionConfigureLinuxCNCAutostartSway,
+		},
+		{
+			name:            "XFCE X11",
+			desktop:         linuxCNCDesktopXFCE,
+			platformIndex:   1,
+			configureAction: actionConfigureLinuxCNCAutostartX11,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			model := New()
+			model.selected = mainIndex
+			model.prepareSelectedAction()
+			if model.page != menuLinuxCNCAutostart || model.selected != 0 {
+				t.Fatalf(
+					"entering platform menu produced page %d selection %d",
+					model.page,
+					model.selected,
+				)
+			}
 
-	model.prepareSelectedAction()
-	if model.page != menuLinuxCNCConfigs || model.selected != 0 {
-		t.Fatalf("entering config menu produced page %d selection %d", model.page, model.selected)
-	}
-	if len(model.visibleSections()) != 2 {
-		t.Fatalf("config menu has %d entries; want one config and Back", len(model.visibleSections()))
-	}
-	if model.currentSection().value != configPath {
-		t.Fatalf("selected config %q; want %q", model.currentSection().value, configPath)
-	}
+			model.selected = test.platformIndex
+			model.prepareSelectedAction()
+			if model.page != menuLinuxCNCConfigs || model.selected != 0 {
+				t.Fatalf(
+					"entering config menu produced page %d selection %d",
+					model.page,
+					model.selected,
+				)
+			}
+			if model.linuxCNCDesktop != test.desktop {
+				t.Fatalf(
+					"selected desktop = %d; want %d",
+					model.linuxCNCDesktop,
+					test.desktop,
+				)
+			}
+			if len(model.visibleSections()) != 2 {
+				t.Fatalf(
+					"config menu has %d entries; want one config and Back",
+					len(model.visibleSections()),
+				)
+			}
+			if model.currentSection().value != configPath {
+				t.Fatalf(
+					"selected config %q; want %q",
+					model.currentSection().value,
+					configPath,
+				)
+			}
+			if model.currentSection().action != test.configureAction {
+				t.Fatalf(
+					"configure action = %d; want %d",
+					model.currentSection().action,
+					test.configureAction,
+				)
+			}
+			if model.pageTitle() != test.desktop.pageTitle() {
+				t.Fatalf(
+					"page title = %q; want %q",
+					model.pageTitle(),
+					test.desktop.pageTitle(),
+				)
+			}
 
-	updated, command := model.Update(tea.KeyPressMsg{Code: tea.KeyEscape})
-	if command != nil {
-		t.Fatal("leaving the config menu should not execute a command")
-	}
-	result := updated.(Model)
-	if result.page != menuLinuxCNCAutostart || result.selected != 0 {
-		t.Fatalf("Esc returned to page %d selection %d", result.page, result.selected)
-	}
+			updated, command := model.Update(
+				tea.KeyPressMsg{Code: tea.KeyEscape},
+			)
+			if command != nil {
+				t.Fatal("leaving the config menu should not execute a command")
+			}
+			result := updated.(Model)
+			if result.page != menuLinuxCNCAutostart ||
+				result.selected != test.platformIndex {
+				t.Fatalf(
+					"Esc returned to page %d selection %d",
+					result.page,
+					result.selected,
+				)
+			}
 
-	updated, command = result.Update(tea.KeyPressMsg{Code: tea.KeyEscape})
-	if command != nil {
-		t.Fatal("leaving the platform menu should not execute a command")
-	}
-	result = updated.(Model)
-	if result.page != menuMain || result.selected != 5 {
-		t.Fatalf("second Esc returned to page %d selection %d", result.page, result.selected)
+			updated, command = result.Update(
+				tea.KeyPressMsg{Code: tea.KeyEscape},
+			)
+			if command != nil {
+				t.Fatal("leaving the platform menu should not execute a command")
+			}
+			result = updated.(Model)
+			if result.page != menuMain || result.selected != mainIndex {
+				t.Fatalf(
+					"second Esc returned to page %d selection %d",
+					result.page,
+					result.selected,
+				)
+			}
+		})
 	}
 }
 
-func TestLinuxCNCAutostartX11IsUnimplemented(t *testing.T) {
+func TestLinuxCNCAutostartX11ShowsEmptyConfigSelection(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv(linuxCNCConfigDirectoryEnvironment, root)
+
 	model := New()
 	model.page = menuLinuxCNCAutostart
 	model.selected = 1
 	model.prepareSelectedAction()
 
-	if model.confirming {
-		t.Fatal("X11 placeholder should not open a confirmation")
+	if model.page != menuLinuxCNCConfigs {
+		t.Fatalf("XFCE X11 opened page %d; want config selection", model.page)
 	}
-	if !strings.Contains(model.status, "not implemented") {
-		t.Fatalf("unexpected X11 placeholder status: %q", model.status)
+	if model.linuxCNCDesktop != linuxCNCDesktopXFCE {
+		t.Fatalf("XFCE X11 selected desktop %d", model.linuxCNCDesktop)
+	}
+	if len(model.visibleSections()) != 1 ||
+		model.currentSection().action != actionBack {
+		t.Fatalf("empty XFCE config selection = %#v", model.visibleSections())
+	}
+	if !strings.Contains(model.status, "No .ini configurations") {
+		t.Fatalf("unexpected empty XFCE status: %q", model.status)
 	}
 }
 
 func TestLinuxCNCAutostartConfirmationView(t *testing.T) {
 	configPath := "/home/user/linuxcnc/configs/mill profile/mill.ini"
-	model := New()
-	model.page = menuLinuxCNCConfigs
-	model.linuxCNCSections = linuxCNCConfigSections([]linuxCNCConfig{{
-		label: "mill",
-		path:  configPath,
-	}})
-	model.width = 160
-	model.confirming = true
-	view := model.View()
-
-	for _, expected := range []string{
-		"Enable LinuxCNC autostart?",
-		configPath,
-		"workspace 1",
-		"next Sway login",
-		"machine",
-		"will not be launched now",
+	for _, test := range []struct {
+		name     string
+		desktop  linuxCNCAutostartDesktop
+		expected []string
+	}{
+		{
+			name:    "Sway",
+			desktop: linuxCNCDesktopSway,
+			expected: []string{
+				"Enable LinuxCNC autostart?",
+				"next Sway login",
+			},
+		},
+		{
+			name:    "XFCE X11",
+			desktop: linuxCNCDesktopXFCE,
+			expected: []string{
+				"Enable XFCE X11 autostart?",
+				"per-user XFCE XDG autostart entry",
+				"focuses an existing",
+				"inactive in XFCE Wayland",
+			},
+		},
 	} {
-		if !strings.Contains(view.Content, expected) {
-			t.Fatalf("confirmation view does not contain %q", expected)
+		t.Run(test.name, func(t *testing.T) {
+			model := New()
+			model.page = menuLinuxCNCConfigs
+			model.linuxCNCDesktop = test.desktop
+			model.linuxCNCSections = linuxCNCConfigSections(
+				[]linuxCNCConfig{{
+					label: "mill",
+					path:  configPath,
+				}},
+				test.desktop,
+			)
+			model.width = 160
+			model.confirming = true
+			view := model.View()
+
+			expected := append([]string{
+				configPath,
+				"workspace 1",
+				"machine",
+				"will not be launched now",
+			}, test.expected...)
+			for _, text := range expected {
+				if !strings.Contains(view.Content, text) {
+					t.Fatalf("confirmation view does not contain %q", text)
+				}
+			}
+		})
+	}
+}
+
+func TestLinuxCNCAutostartX11ActionMessages(t *testing.T) {
+	action := actionConfigureLinuxCNCAutostartX11
+	for label, value := range map[string]string{
+		"name":      actionName(action),
+		"running":   actionRunningMessage(action),
+		"cancelled": actionCancelledMessage(action),
+		"success":   actionSuccessMessage(action),
+	} {
+		for _, expected := range []string{"LinuxCNC", "XFCE", "X11"} {
+			if !strings.Contains(value, expected) {
+				t.Errorf("%s message %q does not contain %q", label, value, expected)
+			}
 		}
 	}
 }
 
 func TestSwayInstallationConfirmationView(t *testing.T) {
 	model := New()
-	model.selected = 2
+	model.selected = mainMenuActionIndex(t, actionInstallSway)
 	model.confirming = true
 	view := model.View()
 
@@ -559,7 +705,7 @@ func TestAutologinCancellationNamesSelectedAction(t *testing.T) {
 
 func TestRebootConfirmationView(t *testing.T) {
 	model := New()
-	model.selected = 6
+	model.selected = mainMenuActionIndex(t, actionReboot)
 	model.confirming = true
 	view := model.View()
 

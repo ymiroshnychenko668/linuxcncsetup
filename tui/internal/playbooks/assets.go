@@ -20,8 +20,11 @@ const (
 	IRQAffinity           Playbook = "irq-affinity.yml"
 	GRUBRealtime          Playbook = "grub-realtime.yml"
 	InstallDevTools       Playbook = "install-devtools.yml"
+	InstallGit            Playbook = "install-git.yml"
 	InstallSway           Playbook = "install-sway.yml"
 	LinuxCNCAutostart     Playbook = "linuxcnc-autostart.yml"
+	LinuxCNCAutostartX11  Playbook = "linuxcnc-autostart-x11.yml"
+	SMBMounts             Playbook = "smb-mounts.yml"
 )
 
 // Materialize writes the embedded playbook tree to a temporary directory.
@@ -29,7 +32,7 @@ const (
 func Materialize(playbook Playbook) (playbookPath string, cleanup func(), err error) {
 	switch playbook {
 	case Autologin, InstallLinuxCNCConfig, IRQAffinity, GRUBRealtime, InstallDevTools,
-		InstallSway, LinuxCNCAutostart:
+		InstallGit, InstallSway, LinuxCNCAutostart, LinuxCNCAutostartX11, SMBMounts:
 	default:
 		return "", nil, fmt.Errorf("unknown embedded playbook: %q", playbook)
 	}

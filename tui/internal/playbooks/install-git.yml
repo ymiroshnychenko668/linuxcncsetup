@@ -1,0 +1,175 @@
+---
+- name: Install Git and GitHub CLI
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  become: false
+
+  vars:
+    git_setup_packages:
+      - gh
+      - git
+      - openssh-client
+    git_setup_name: cnc
+    git_setup_email: cnc@cnc.cn
+
+  pre_tasks:
+    - name: Validate the Git setup request
+      ansible.builtin.assert:
+        that:
+          - ansible_facts["distribution"] == "Debian"
+          - (target_user | default("")) is match("^[a-zA-Z_][a-zA-Z0-9_.-]*[$]?$")
+          - (target_user | default("")) != "root"
+        fail_msg: >-
+          This playbook requires Debian and a regular non-root target_user.
+
+    - name: Read the target account
+      ansible.builtin.getent:
+        database: passwd
+        key: "{{ target_user }}"
+
+    - name: Read regular-user UID bounds
+      ansible.builtin.slurp:
+        src: /etc/login.defs
+      register: git_setup_login_defs
+
+    - name: Derive target account details and UID bounds
+      ansible.builtin.set_fact:
+        git_setup_home: "{{ ansible_facts['getent_passwd'][target_user][4] }}"
+        git_setup_uid: "{{ ansible_facts['getent_passwd'][target_user][1] | int }}"
+        git_setup_shell: "{{ ansible_facts['getent_passwd'][target_user][5] }}"
+        git_setup_uid_min_matches: >-
+          {{
+            git_setup_login_defs.content
+            | b64decode
+            | regex_findall('(?m)^\s*UID_MIN\s+(\d+)\s*$')
+          }}
+        git_setup_uid_max_matches: >-
+          {{
+            git_setup_login_defs.content
+            | b64decode
+            | regex_findall('(?m)^\s*UID_MAX\s+(\d+)\s*$')
+          }}
+
+    - name: Inspect the target home
+      ansible.builtin.stat:
+        path: "{{ git_setup_home }}"
+        follow: true
+      register: git_setup_home_status
+
+    - name: Validate the target account
+      ansible.builtin.assert:
+        that:
+          - git_setup_uid_min_matches | length == 1
+          - git_setup_uid_max_matches | length == 1
+          - git_setup_uid >= (git_setup_uid_min_matches[0] | int)
+          - git_setup_uid <= (git_setup_uid_max_matches[0] | int)
+          - git_setup_home is match("^/")
+          - not (git_setup_shell is match("^.*/(nologin|false)$"))
+          - git_setup_home_status.stat.exists
+          - git_setup_home_status.stat.isdir
+        fail_msg: >-
+          target_user must be a regular login account with an existing home
+          directory and a usable shell.
+
+  tasks:
+    - name: Read installed Git-tool package facts
+      ansible.builtin.package_facts:
+        manager: auto
+
+    - name: Determine missing Git-tool packages
+      ansible.builtin.set_fact:
+        git_setup_missing_packages: >-
+          {{
+            git_setup_packages
+            | difference(ansible_facts.packages.keys() | list)
+          }}
+
+    - name: Install missing Git-tool packages
+      ansible.builtin.apt:
+        name: "{{ git_setup_missing_packages }}"
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+        lock_timeout: 120
+      become: true
+      when: git_setup_missing_packages | length > 0
+
+    - name: Read the configured global Git user name
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/git
+          - config
+          - --global
+          - --get
+          - user.name
+      become: true
+      become_user: "{{ target_user }}"
+      environment:
+        HOME: "{{ git_setup_home }}"
+      register: git_setup_current_name
+      changed_when: false
+      failed_when: git_setup_current_name.rc not in [0, 1]
+      check_mode: false
+      when: not ansible_check_mode or "git" not in git_setup_missing_packages
+
+    - name: Configure the global Git user name
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/git
+          - config
+          - --global
+          - user.name
+          - "{{ git_setup_name }}"
+      become: true
+      become_user: "{{ target_user }}"
+      environment:
+        HOME: "{{ git_setup_home }}"
+      changed_when: true
+      when:
+        - not ansible_check_mode or "git" not in git_setup_missing_packages
+        - git_setup_current_name.stdout | default("") | trim != git_setup_name
+
+    - name: Read the configured global Git email
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/git
+          - config
+          - --global
+          - --get
+          - user.email
+      become: true
+      become_user: "{{ target_user }}"
+      environment:
+        HOME: "{{ git_setup_home }}"
+      register: git_setup_current_email
+      changed_when: false
+      failed_when: git_setup_current_email.rc not in [0, 1]
+      check_mode: false
+      when: not ansible_check_mode or "git" not in git_setup_missing_packages
+
+    - name: Configure the global Git email
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/git
+          - config
+          - --global
+          - user.email
+          - "{{ git_setup_email }}"
+      become: true
+      become_user: "{{ target_user }}"
+      environment:
+        HOME: "{{ git_setup_home }}"
+      changed_when: true
+      when:
+        - not ansible_check_mode or "git" not in git_setup_missing_packages
+        - git_setup_current_email.stdout | default("") | trim != git_setup_email
+
+  post_tasks:
+    - name: Report the Git tools setup
+      ansible.builtin.debug:
+        msg: >-
+          Git, OpenSSH client, and GitHub CLI are available for {{ target_user }}.
+          Git identity is {{ git_setup_name }} <{{ git_setup_email }}>. No SSH
+          key was created or modified. Use the Git setup menu's GitHub sign-in
+          action to authenticate interactively with gh.

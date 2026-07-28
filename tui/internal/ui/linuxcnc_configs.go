@@ -17,6 +17,47 @@ type linuxCNCConfig struct {
 	path  string
 }
 
+type linuxCNCAutostartDesktop int
+
+const (
+	linuxCNCDesktopSway linuxCNCAutostartDesktop = iota
+	linuxCNCDesktopXFCE
+)
+
+func (desktop linuxCNCAutostartDesktop) configureAction() sectionAction {
+	if desktop == linuxCNCDesktopXFCE {
+		return actionConfigureLinuxCNCAutostartX11
+	}
+	return actionConfigureLinuxCNCAutostartSway
+}
+
+func (desktop linuxCNCAutostartDesktop) openerAction() sectionAction {
+	if desktop == linuxCNCDesktopXFCE {
+		return actionOpenLinuxCNCAutostartX11
+	}
+	return actionOpenLinuxCNCAutostartSway
+}
+
+func (desktop linuxCNCAutostartDesktop) pageTitle() string {
+	if desktop == linuxCNCDesktopXFCE {
+		return "XFCE X11 configuration"
+	}
+	return "Sway configuration"
+}
+
+func (desktop linuxCNCAutostartDesktop) configDescription(configPath string) string {
+	if desktop == linuxCNCDesktopXFCE {
+		return fmt.Sprintf(
+			"Start this LinuxCNC configuration automatically on XFCE X11 workspace 1.\n\nPath:\n%s",
+			configPath,
+		)
+	}
+	return fmt.Sprintf(
+		"Start this LinuxCNC configuration automatically on Sway workspace 1.\n\nPath:\n%s",
+		configPath,
+	)
+}
+
 func discoverLinuxCNCConfigs() ([]linuxCNCConfig, string, error) {
 	root, err := linuxCNCConfigDirectory()
 	if err != nil {
@@ -97,17 +138,17 @@ func linuxCNCConfigDirectory() (string, error) {
 	return filepath.Join(account.HomeDir, "linuxcnc", "configs"), nil
 }
 
-func linuxCNCConfigSections(configs []linuxCNCConfig) []section {
+func linuxCNCConfigSections(
+	configs []linuxCNCConfig,
+	desktop linuxCNCAutostartDesktop,
+) []section {
 	sections := make([]section, 0, len(configs)+1)
 	for _, config := range configs {
 		sections = append(sections, section{
-			title: config.label,
-			description: fmt.Sprintf(
-				"Start this LinuxCNC configuration automatically on Sway workspace 1.\n\nPath:\n%s",
-				config.path,
-			),
-			action: actionConfigureLinuxCNCAutostartSway,
-			value:  config.path,
+			title:       config.label,
+			description: desktop.configDescription(config.path),
+			action:      desktop.configureAction(),
+			value:       config.path,
 		})
 	}
 	sections = append(sections, section{

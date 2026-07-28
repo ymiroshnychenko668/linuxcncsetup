@@ -1,0 +1,182 @@
+---
+- name: Configure LinuxCNC autostart for XFCE on X11
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  become: false
+
+  pre_tasks:
+    - name: Validate the LinuxCNC XFCE autostart request
+      ansible.builtin.assert:
+        that:
+          - ansible_facts["distribution"] == "Debian"
+          - ansible_facts["distribution_major_version"] == "13"
+          - (target_user | default("")) is match("^[a-zA-Z_][a-zA-Z0-9_.-]*[$]?$")
+          - (target_user | default("")) != "root"
+          - (linuxcnc_config | default("")) is match("^/")
+          - (linuxcnc_config | default("")) is search("(?i)[.]ini$")
+        fail_msg: >-
+          This playbook requires Debian 13, a regular non-root target_user,
+          and linuxcnc_config set to an absolute .ini path.
+
+    - name: Read the target account
+      ansible.builtin.getent:
+        database: passwd
+        key: "{{ target_user }}"
+
+    - name: Read regular-user UID bounds
+      ansible.builtin.slurp:
+        src: /etc/login.defs
+      register: linuxcnc_x11_login_defs
+
+    - name: Derive target account details and UID bounds
+      ansible.builtin.set_fact:
+        linuxcnc_x11_home: "{{ ansible_facts['getent_passwd'][target_user][4] }}"
+        linuxcnc_x11_uid: "{{ ansible_facts['getent_passwd'][target_user][1] | int }}"
+        linuxcnc_x11_shell: "{{ ansible_facts['getent_passwd'][target_user][5] }}"
+        linuxcnc_x11_uid_min_matches: >-
+          {{
+            linuxcnc_x11_login_defs.content
+            | b64decode
+            | regex_findall('(?m)^\s*UID_MIN\s+(\d+)\s*$')
+          }}
+        linuxcnc_x11_uid_max_matches: >-
+          {{
+            linuxcnc_x11_login_defs.content
+            | b64decode
+            | regex_findall('(?m)^\s*UID_MAX\s+(\d+)\s*$')
+          }}
+
+    - name: Read the target account's primary group
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/id
+          - -gn
+          - --
+          - "{{ target_user }}"
+      register: linuxcnc_x11_group
+      changed_when: false
+      check_mode: false
+
+    - name: Inspect common LinuxCNC paths
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        follow: true
+      loop:
+        - "{{ linuxcnc_x11_home }}"
+        - "{{ linuxcnc_config }}"
+        - /usr/bin/linuxcnc
+        - /usr/bin/inivar
+      register: linuxcnc_x11_common_paths
+
+    - name: Validate the account and common LinuxCNC paths
+      ansible.builtin.assert:
+        that:
+          - linuxcnc_x11_uid_min_matches | length == 1
+          - linuxcnc_x11_uid_max_matches | length == 1
+          - linuxcnc_x11_uid >= (linuxcnc_x11_uid_min_matches[0] | int)
+          - linuxcnc_x11_uid <= (linuxcnc_x11_uid_max_matches[0] | int)
+          - linuxcnc_x11_home is match("^/[-A-Za-z0-9_./ ]+$")
+          - not (linuxcnc_x11_shell is match("^.*/(nologin|false)$"))
+          - linuxcnc_x11_common_paths.results[0].stat.exists | default(false)
+          - linuxcnc_x11_common_paths.results[0].stat.isdir | default(false)
+          - linuxcnc_x11_common_paths.results[1].stat.exists | default(false)
+          - linuxcnc_x11_common_paths.results[1].stat.isreg | default(false)
+          - linuxcnc_x11_common_paths.results[2].stat.exists | default(false)
+          - linuxcnc_x11_common_paths.results[2].stat.isreg | default(false)
+          - linuxcnc_x11_common_paths.results[2].stat.executable | default(false)
+          - linuxcnc_x11_common_paths.results[3].stat.exists | default(false)
+          - linuxcnc_x11_common_paths.results[3].stat.isreg | default(false)
+          - linuxcnc_x11_common_paths.results[3].stat.executable | default(false)
+        fail_msg: >-
+          target_user must be a regular login account with an Exec-safe
+          absolute home directory; linuxcnc_config must be a regular .ini
+          file; and LinuxCNC must be installed with inivar.
+
+    - name: Inspect XFCE X11 and launcher runtime paths
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        follow: true
+      loop:
+        - /usr/bin/xfce4-session
+        - /usr/bin/xfwm4
+        - /usr/share/xsessions/xfce.desktop
+        - /usr/bin/flock
+        - /usr/bin/pgrep
+        - /usr/bin/awk
+        - /usr/bin/sleep
+        - /usr/bin/id
+      register: linuxcnc_x11_runtime_paths
+
+    - name: Require an installed XFCE X11 session and launcher runtime
+      ansible.builtin.assert:
+        that:
+          - linuxcnc_x11_runtime_paths.results[0].stat.exists | default(false)
+          - linuxcnc_x11_runtime_paths.results[0].stat.isreg | default(false)
+          - linuxcnc_x11_runtime_paths.results[0].stat.executable | default(false)
+          - linuxcnc_x11_runtime_paths.results[1].stat.exists | default(false)
+          - linuxcnc_x11_runtime_paths.results[1].stat.isreg | default(false)
+          - linuxcnc_x11_runtime_paths.results[1].stat.executable | default(false)
+          - linuxcnc_x11_runtime_paths.results[2].stat.exists | default(false)
+          - linuxcnc_x11_runtime_paths.results[2].stat.isreg | default(false)
+          - linuxcnc_x11_runtime_paths.results[3].stat.executable | default(false)
+          - linuxcnc_x11_runtime_paths.results[4].stat.executable | default(false)
+          - linuxcnc_x11_runtime_paths.results[5].stat.executable | default(false)
+          - linuxcnc_x11_runtime_paths.results[6].stat.executable | default(false)
+          - linuxcnc_x11_runtime_paths.results[7].stat.executable | default(false)
+        fail_msg: >-
+          XFCE's X11 session, xfwm4, and the standard process and locking
+          tools must be installed before XFCE autostart can be configured.
+
+    - name: Check that the target user can read the selected configuration
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/test
+          - -r
+          - "{{ linuxcnc_config }}"
+      become: true
+      become_user: "{{ target_user }}"
+      changed_when: false
+      check_mode: false
+
+    - name: Read the selected LinuxCNC display configuration
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/inivar
+          - -ini
+          - "{{ linuxcnc_config }}"
+          - -sec
+          - DISPLAY
+          - -var
+          - DISPLAY
+      become: true
+      become_user: "{{ target_user }}"
+      register: linuxcnc_x11_display
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: Require a QtVCP LinuxCNC configuration
+      ansible.builtin.assert:
+        that:
+          - linuxcnc_x11_display.rc == 0
+          - linuxcnc_x11_display.stdout | trim | length > 0
+          - (linuxcnc_x11_display.stdout | trim) is match('(?i)^qtvcp(\s|$)')
+        fail_msg: >-
+          The selected .ini must define a QtVCP program in [DISPLAY] DISPLAY.
+          The XFCE launcher uses QtVCP's X11 window class to prevent duplicate
+          launches and place the operator window on workspace 1.
+
+  tasks:
+    - name: Persist LinuxCNC autostart for the next XFCE X11 session
+      ansible.builtin.import_tasks: tasks/linuxcnc_autostart_x11.yml
+      become: true
+
+  post_tasks:
+    - name: Report the configured XFCE X11 autostart
+      ansible.builtin.debug:
+        msg: >-
+          LinuxCNC will open {{ linuxcnc_config }} fullscreen on workspace 1 at
+          the next XFCE X11 login. The launcher focuses an existing QtVCP
+          window instead of starting a duplicate and does nothing in XFCE
+          Wayland sessions. LinuxCNC was not launched in the current session.

@@ -41,16 +41,34 @@ CGO_ENABLED=0 go build -trimpath -o bin/linuxcncsetup ./cmd/linuxcncsetup
 The initial scaffold uses Bubble Tea v2 for the application loop and Lip Gloss
 v2 for terminal layout and styling.
 
+## Git setup
+
+The main-menu **Git setup** submenu appears immediately after **Install
+Ansible** and keeps source-control authentication separate from the broader
+developer-tools installer:
+
+- **Install Git tools** runs an embedded Ansible playbook that installs missing
+  `git`, `openssh-client`, and `gh` packages and sets the global identity to
+  `cnc <cnc@cnc.cn>`. It does not create, replace, recover, display, or upload
+  SSH keys.
+- **Sign in to GitHub with gh** suspends the TUI and runs GitHub CLI's
+  interactive web login for `github.com` with the SSH Git protocol. GitHub CLI
+  owns the prompts for selecting, creating, or uploading a key; Ansible never
+  writes the key. The action must be run without `sudo` so the OAuth token and
+  any GitHub CLI configuration belong to the desktop user.
+
+The login action ignores inherited `GH_TOKEN`, `GITHUB_TOKEN`, enterprise-token,
+host, config-directory, and prompt-disabling variables so a stale headless
+credential cannot silently replace the requested interactive login. Existing
+SSH files are left untouched unless the user explicitly approves an action in
+GitHub CLI's own prompts.
+
 ## Developer tools installation
 
 The **Development tools** submenu uses one embedded, selection-aware Ansible
 playbook. **Install all** runs the complete TUI workflow, while the remaining
 items can be run independently:
 
-- **Git & GitHub SSH** installs Git and OpenSSH, sets the global identity to
-  `cnc <cnc@cnc.cn>`, and safely creates or recovers the Ed25519 public key.
-  It never overwrites an existing private key and waits after displaying the
-  public key so it can be copied to GitHub.
 - **Visual Studio Code** adds Microsoft's signed amd64 APT repository and
   installs VS Code.
 - **Codex CLI** downloads and runs
@@ -111,8 +129,8 @@ selecting Sway automatic login.
 
 ## CorvusCNC configuration installation
 
-The main-menu **Install CorvusCNC config** item, immediately after **Install
-Ansible**, runs an embedded Ansible playbook that installs Git or OpenSSH only
+The main-menu **Install CorvusCNC config** item, immediately after **Git
+setup**, runs an embedded Ansible playbook that installs Git or OpenSSH only
 when its executable is missing, creates the target user's
 `~/linuxcnc/configs` directory, and clones
 `git@github.com:ymiroshnychenko668/corvuscnc.git` directly to
@@ -122,8 +140,9 @@ introduced.
 
 The clone runs as the regular target user. It reuses the current SSH agent
 socket when one is available and otherwise uses that user's on-disk GitHub SSH
-configuration. Run **Development tools → Git & GitHub SSH** first and add the
-displayed public key to GitHub when SSH access has not already been configured.
+configuration. Run **Git setup → Install Git tools** and then **Git setup →
+Sign in to GitHub with gh** before cloning when GitHub access has not already
+been configured.
 An existing checkout is verified as the expected repository and left
 unchanged, preserving local machine configuration. An unrelated file,
 directory, or Git checkout at the destination causes the playbook to stop
@@ -135,27 +154,63 @@ LinuxCNC autostart scanner discovers the installed INI files when that menu is
 opened. The root-level `clonelinuxcncconfig.sh` remains as a compatibility
 script.
 
-## LinuxCNC autostart playbook
+## LinuxCNC autostart playbooks
 
-The **LinuxCNC autostart** menu first selects **Sway (Wayland)** or **X11**.
-X11 is intentionally left as an unimplemented placeholder. The Sway path
-recursively lists the current user's `~/linuxcnc/configs/*.ini` files by INI
-basename and passes the selected absolute path to the embedded
-`linuxcnc-autostart.yml` playbook.
+The **LinuxCNC autostart** menu first selects **Sway (Wayland)** or **XFCE
+(X11)**. Both paths recursively list the current user's
+`~/linuxcnc/configs/*.ini` files by INI basename and pass the selected absolute
+path to a desktop-specific embedded Ansible playbook.
 
-The playbook validates the account, LinuxCNC tools, Sway configuration, and
-the selected QtVCP INI. It then installs a safely quoted user wrapper and a
+The Sway playbook validates the account, LinuxCNC tools, Sway configuration,
+and selected QtVCP INI. It then installs a safely quoted user wrapper and a
 managed Sway snippet under `~/.config/sway/config.d/`. At the next Sway login,
 the wrapper selects workspace 1 immediately before launching LinuxCNC; it does
 not launch LinuxCNC or reload Sway during setup. The Waybar **CNC** button uses
 the same wrapper: when a QtVCP window is already open it focuses that window
 and returns to workspace 1; otherwise it selects workspace 1 and starts the
-configured LinuxCNC profile. Selecting another INI updates the same managed
-files idempotently.
+configured LinuxCNC profile.
+
+The XFCE X11 playbook validates the installed XFCE X11 session and selected
+QtVCP INI, installs the small `wmctrl` window-control dependency, and writes:
+
+- `~/.local/bin/linuxcnc-autostart-x11`
+- `~/.config/autostart/linuxcncsetup-linuxcnc-x11.desktop`
+
+XFCE consumes the standard XDG autostart entry at the next login. The launcher
+uses a per-user runtime lock, avoids starting a second LinuxCNC process when
+one is already opening, selects workspace 1, and moves, focuses, and
+fullscreens the QtVCP window. Because XFCE uses the same desktop identifier for
+its X11 and Wayland sessions, the launcher explicitly exits without doing
+anything unless `XDG_SESSION_TYPE=x11`.
+
+The Sway and XFCE files are separate and can coexist. Selecting another INI
+for either desktop updates that desktop's managed files idempotently. Neither
+playbook launches LinuxCNC or changes the current desktop session during
+setup.
 
 Automatic LinuxCNC startup can initialize connected machine hardware. The TUI
 therefore requires a separate confirmation after the configuration is
 selected.
+
+## SMB mount management
+
+**Configuration → SMB mounts** manages the existing
+`//10.0.1.246/share` guest share at `/mnt/smb_share` through an embedded
+Ansible playbook:
+
+- **Mount SMB share** installs `cifs-utils` when needed, adds a marked
+  LinuxCNC Setup block to `/etc/fstab`, enables systemd automounting, and mounts
+  the share immediately.
+- **Unmount SMB share** stops the automount unit before performing a normal
+  unmount. It retains the persistent entry, so the share becomes available
+  again after the next reboot.
+- **Remove SMB mount** performs the same safe unmount and removes only the
+  marked fstab block owned by LinuxCNC Setup. It refuses to delete unrelated or
+  legacy entries.
+
+The workflow never force-unmounts a busy share and does not create a remote
+write-test file. The root-level SMB shell scripts remain compatibility tools;
+the Go TUI does not invoke them.
 
 ## IRQ affinity playbook
 
@@ -200,13 +255,18 @@ The **Automatic login** submenu offers two modes. The TUI embeds
 `internal/playbooks/autologin.yml` and launches it after confirmation by
 running `ansible-playbook` through `sudo`:
 
-- **LightDM:** preserves the selected/default desktop session and configures
-  automatic login through a LightDM drop-in.
+- **LightDM:** installs LightDM without starting it, verifies its daemon and
+  `lightdm-autologin` PAM service, and configures the selected regular user
+  through `/etc/lightdm/lightdm.conf.d/50-linuxcnc-autologin.conf`. It checks
+  LightDM's effective configuration, records it as Debian's default display
+  manager, disables greetd for the next boot, unmasks LightDM, and enables its
+  `display-manager.service` alias. The selected/default desktop session is
+  preserved.
 - **Sway:** installs Sway, greetd, and tuigreet, then configures one automatic
   Sway login per boot. Select it only after a manual Sway login has succeeded.
 
-Neither mode starts or stops a display manager during the current session.
-Service selection takes effect after reboot.
+Neither mode starts, stops, or restarts a display manager during the current
+session. Service selection takes effect after reboot.
 
 The root-level `autologin.sh` remains as a compatibility launcher. Its Sway
 mode requires `LINUXCNCSETUP_SWAY_VALIDATED=1` to acknowledge the same
