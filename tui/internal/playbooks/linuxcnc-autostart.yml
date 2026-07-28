@@ -257,6 +257,7 @@
       ansible.builtin.debug:
         msg: >-
           LinuxCNC will open {{ linuxcnc_config }} fullscreen on workspace 1 at
-          the next Sway login. The Waybar CNC button launches the same selected
-          configuration through the same wrapper. LinuxCNC was not launched in
-          the current session.
+          the next Sway login. The Waybar CNC button returns to the existing
+          QtVCP window on workspace 1, or launches the same selected
+          configuration when no QtVCP window is open. LinuxCNC was not launched
+          in the current session.

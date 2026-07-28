@@ -1,4 +1,13 @@
 #!/bin/sh
 # Managed by linuxcncsetup. Changes will be replaced.
+
+# The Waybar button and Sway autostart share this launcher. If QtVCP already
+# has a window, focusing it also switches to its assigned workspace.
+if /usr/bin/swaymsg -q '[app_id="(?i)^qtvcp$"] focus' ||
+    /usr/bin/swaymsg -q '[class="(?i)^qtvcp$"] focus'
+then
+    exit 0
+fi
+
 /usr/bin/swaymsg -q 'workspace number 1' || exit 1
 exec /usr/bin/linuxcnc {{ linuxcnc_config | ansible.builtin.quote }}

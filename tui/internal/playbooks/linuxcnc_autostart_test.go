@@ -88,6 +88,7 @@ func TestLinuxCNCAutostartSharesFullscreenLauncherWithWaybar(t *testing.T) {
 
 	playbook := read("linuxcnc-autostart.yml")
 	tasks := read("tasks/linuxcnc_autostart.yml")
+	launcher := read("templates/linuxcnc-autostart.sh.j2")
 	swaySnippet := read("templates/linuxcnc-autostart-sway.conf.j2")
 
 	for _, expected := range []string{
@@ -106,12 +107,28 @@ func TestLinuxCNCAutostartSharesFullscreenLauncherWithWaybar(t *testing.T) {
 		`"modules-left"`,
 		`"on-click"`,
 		sharedLauncher,
+		"Open LinuxCNC or switch to workspace 1",
 		"to_nice_json",
 		"validate: /usr/bin/python3 -m json.tool %s",
 	} {
 		if !strings.Contains(tasks, expected) {
 			t.Errorf("Waybar launcher tasks do not contain %q", expected)
 		}
+	}
+
+	for _, expected := range []string{
+		`[app_id="(?i)^qtvcp$"] focus`,
+		`[class="(?i)^qtvcp$"] focus`,
+		`'workspace number 1'`,
+		`exec /usr/bin/linuxcnc`,
+	} {
+		if !strings.Contains(launcher, expected) {
+			t.Errorf("shared LinuxCNC launcher does not contain %q", expected)
+		}
+	}
+	if focusAt, launchAt := strings.Index(launcher, `] focus`),
+		strings.Index(launcher, `exec /usr/bin/linuxcnc`); focusAt > launchAt {
+		t.Error("shared LinuxCNC launcher starts LinuxCNC before checking for its window")
 	}
 
 	for _, expected := range []string{

@@ -147,8 +147,11 @@ The playbook validates the account, LinuxCNC tools, Sway configuration, and
 the selected QtVCP INI. It then installs a safely quoted user wrapper and a
 managed Sway snippet under `~/.config/sway/config.d/`. At the next Sway login,
 the wrapper selects workspace 1 immediately before launching LinuxCNC; it does
-not launch LinuxCNC or reload Sway during setup. Selecting another INI updates
-the same managed files idempotently.
+not launch LinuxCNC or reload Sway during setup. The Waybar **CNC** button uses
+the same wrapper: when a QtVCP window is already open it focuses that window
+and returns to workspace 1; otherwise it selects workspace 1 and starts the
+configured LinuxCNC profile. Selecting another INI updates the same managed
+files idempotently.
 
 Automatic LinuxCNC startup can initialize connected machine hardware. The TUI
 therefore requires a separate confirmation after the configuration is

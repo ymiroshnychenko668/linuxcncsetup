@@ -79,7 +79,7 @@
                     "on-click": linuxcnc_autostart_home
                       + "/.local/bin/linuxcnc-autostart",
                     "tooltip": true,
-                    "tooltip-format": "Launch the selected LinuxCNC configuration"
+                    "tooltip-format": "Open LinuxCNC or switch to workspace 1"
                   }
                 }
               )
