@@ -58,10 +58,13 @@ type fakeSessionManager struct {
 	createErr      error
 	deleteErr      error
 	connectErr     error
+	selectionErr   error
 	proxyErr       error
 	proxyCalled    int
 	deletedID      string
 	connectedID    string
+	selectionID    string
+	selectionText  string
 	active         int
 	proxiedRequest *http.Request
 	proxyHandler   http.Handler
@@ -92,6 +95,10 @@ func (f *fakeSessionManager) Connect(_ context.Context, id string) (sessions.Ses
 		return sessions.Session{}, "", f.connectErr
 	}
 	return sessions.Session{ID: id, Name: "Main", TerminalConnected: true}, "/terminal/" + id + "/", nil
+}
+func (f *fakeSessionManager) LatestSelection(_ context.Context, id string) (string, error) {
+	f.selectionID = id
+	return f.selectionText, f.selectionErr
 }
 func (f *fakeSessionManager) Proxy(_ context.Context, _ string) (http.Handler, error) {
 	f.proxyCalled++
@@ -404,6 +411,51 @@ func TestSessionConnectDeleteAndErrors(t *testing.T) {
 	h.server.ServeHTTP(response, request)
 	if response.Code != http.StatusConflict || !strings.Contains(response.Body.String(), `"code":"session_limit"`) {
 		t.Fatalf("limit response = %d %s", response.Code, response.Body.String())
+	}
+}
+
+func TestLatestSelectionRequiresAuthenticationAndReturnsNoStoreJSON(t *testing.T) {
+	h := newHarness(t)
+	h.manager.selectionText = "line one\nрядок два"
+
+	request := httptest.NewRequest(http.MethodGet, "http://example.test/api/sessions/"+testID+"/clipboard", nil)
+	response := httptest.NewRecorder()
+	h.server.ServeHTTP(response, request)
+	if response.Code != http.StatusUnauthorized || h.manager.selectionID != "" {
+		t.Fatalf("unauthenticated clipboard response = %d, manager id = %q", response.Code, h.manager.selectionID)
+	}
+
+	credentials := login(t, h.server, "operator", "secret")
+	request = authenticatedRequest(http.MethodGet, "/api/sessions/"+testID+"/clipboard", credentials.cookie, "", nil)
+	response = httptest.NewRecorder()
+	h.server.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || h.manager.selectionID != testID ||
+		!strings.Contains(response.Body.String(), `"text":"line one\nрядок два"`) {
+		t.Fatalf("clipboard response = %d %s, manager id = %q", response.Code, response.Body.String(), h.manager.selectionID)
+	}
+	if response.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("clipboard Cache-Control = %q", response.Header().Get("Cache-Control"))
+	}
+
+	h.manager.selectionErr = sessions.ErrNoSelection
+	response = httptest.NewRecorder()
+	h.server.ServeHTTP(response, request)
+	if response.Code != http.StatusConflict || !strings.Contains(response.Body.String(), `"code":"no_selection"`) {
+		t.Fatalf("no-selection response = %d %s", response.Code, response.Body.String())
+	}
+
+	h.manager.selectionErr = sessions.ErrInvalidSelection
+	response = httptest.NewRecorder()
+	h.server.ServeHTTP(response, request)
+	if response.Code != http.StatusUnprocessableEntity || !strings.Contains(response.Body.String(), `"code":"selection_invalid"`) {
+		t.Fatalf("invalid-selection response = %d %s", response.Code, response.Body.String())
+	}
+
+	request = authenticatedRequest(http.MethodPost, "/api/sessions/"+testID+"/clipboard", credentials.cookie, "", nil)
+	response = httptest.NewRecorder()
+	h.server.ServeHTTP(response, request)
+	if response.Code != http.StatusMethodNotAllowed || response.Header().Get("Allow") != http.MethodGet {
+		t.Fatalf("clipboard POST response = %d Allow=%q", response.Code, response.Header().Get("Allow"))
 	}
 }
 

@@ -2,12 +2,16 @@ import {
   useCallback,
   useEffect,
   useMemo,
+  useRef,
   useState,
   type KeyboardEvent,
+  type PointerEvent,
 } from 'react'
 import { ApiError, api, type TerminalSession } from '../api'
 import {
   AlertIcon,
+  CheckIcon,
+  CopyIcon,
   KeyboardIcon,
   LogOutIcon,
   MenuIcon,
@@ -58,6 +62,13 @@ function connectionLabel(state: TerminalState | undefined): string {
   return 'Ready to open'
 }
 
+type CopyState = 'idle' | 'loading' | 'ready' | 'copied' | 'error'
+
+interface CachedSelection {
+  sessionId: string
+  text: string
+}
+
 export function Workspace({ machineName, username, onLogout }: WorkspaceProps) {
   const [sessions, setSessions] = useState<TerminalSession[] | null>(null)
   const [openIds, setOpenIds] = useState<string[]>([])
@@ -73,6 +84,11 @@ export function Workspace({ machineName, username, onLogout }: WorkspaceProps) {
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [loggingOut, setLoggingOut] = useState(false)
   const [restored, setRestored] = useState(false)
+  const [copyState, setCopyState] = useState<CopyState>('idle')
+  const [copyMessage, setCopyMessage] = useState<string | null>(null)
+  const cachedSelectionRef = useRef<CachedSelection | null>(null)
+  const selectionRequestRef = useRef<Promise<CachedSelection> | null>(null)
+  const suppressNextFocusWarmRef = useRef(false)
 
   const loadSessions = useCallback(async (signal?: AbortSignal) => {
     setLoadError(null)
@@ -122,6 +138,93 @@ export function Workspace({ machineName, username, onLogout }: WorkspaceProps) {
   })
   const closedSessions = (sessions ?? []).filter((session) => !openIds.includes(session.id))
   const activeSession = selectedId ? sessionById.get(selectedId) ?? null : null
+
+  useEffect(() => {
+    cachedSelectionRef.current = null
+    selectionRequestRef.current = null
+    setCopyState('idle')
+    setCopyMessage(null)
+  }, [selectedId])
+
+  const loadSelection = useCallback((sessionId: string, refresh = false) => {
+    if (selectionRequestRef.current) return selectionRequestRef.current
+    const cached = cachedSelectionRef.current
+    if (!refresh && cached?.sessionId === sessionId) return Promise.resolve(cached)
+    if (refresh) cachedSelectionRef.current = null
+
+    setCopyState('loading')
+    setCopyMessage('Loading the yellow tmux selection…')
+    const pending = api.getLatestSelection(sessionId).then((text) => {
+      const result = { sessionId, text }
+      if (selectionRequestRef.current !== pending) return result
+      cachedSelectionRef.current = result
+      setCopyState('ready')
+      setCopyMessage('Selection loaded. Click Copy selection again to copy it.')
+      return result
+    }).catch((cause) => {
+      if (selectionRequestRef.current === pending) {
+        setCopyState('error')
+        setCopyMessage(cause instanceof ApiError ? cause.message : 'The terminal selection could not be loaded.')
+      }
+      throw cause
+    }).finally(() => {
+      if (selectionRequestRef.current === pending) selectionRequestRef.current = null
+    })
+    selectionRequestRef.current = pending
+    return pending
+  }, [])
+
+  const prepareSelection = (event: PointerEvent<HTMLButtonElement>) => {
+    if (event.pointerType === 'mouse' && event.button !== 0) return
+    if (!activeSession) return
+    suppressNextFocusWarmRef.current = true
+    window.setTimeout(() => {
+      suppressNextFocusWarmRef.current = false
+    }, 0)
+    if (cachedSelectionRef.current?.sessionId === activeSession.id) return
+    void loadSelection(activeSession.id).catch(() => {})
+  }
+
+  const warmSelection = () => {
+    if (!activeSession || selectionRequestRef.current) return
+    void loadSelection(activeSession.id, true).catch(() => {})
+  }
+
+  const warmSelectionOnFocus = () => {
+    if (suppressNextFocusWarmRef.current) {
+      suppressNextFocusWarmRef.current = false
+      return
+    }
+    warmSelection()
+  }
+
+  const copySelection = async () => {
+    if (!activeSession) return
+    const cached = cachedSelectionRef.current
+    if (cached?.sessionId !== activeSession.id) {
+      void loadSelection(activeSession.id).catch(() => {})
+      return
+    }
+
+    try {
+      await navigator.clipboard.writeText(cached.text)
+      cachedSelectionRef.current = null
+      setCopyState('copied')
+      setCopyMessage('Copied to this device.')
+    } catch {
+      setCopyState('error')
+      setCopyMessage('The browser blocked clipboard access. Hold Shift while dragging, then press Ctrl+C.')
+    }
+  }
+
+  useEffect(() => {
+    if (copyState !== 'copied') return
+    const timeout = window.setTimeout(() => {
+      setCopyState('idle')
+      setCopyMessage(null)
+    }, 2500)
+    return () => window.clearTimeout(timeout)
+  }, [copyState])
 
   const activateSession = useCallback((id: string) => {
     setActivatedIds((current) => current.includes(id) ? current : [...current, id])
@@ -345,6 +448,22 @@ export function Workspace({ machineName, username, onLogout }: WorkspaceProps) {
             </div>
           </div>
           <div className="topbar__actions">
+            {activeSession ? (
+              <button
+                className="button button--ghost"
+                type="button"
+                aria-label={copyState === 'ready' ? 'Copy selection now' : 'Copy selection'}
+                aria-busy={copyState === 'loading'}
+                title={copyMessage ?? 'Copy the latest yellow tmux selection'}
+                onPointerEnter={warmSelection}
+                onPointerDown={prepareSelection}
+                onFocus={warmSelectionOnFocus}
+                onClick={() => void copySelection()}
+              >
+                {copyState === 'copied' ? <CheckIcon /> : copyState === 'loading' ? <span className="spinner" aria-hidden="true" /> : <CopyIcon />}
+                <span>{copyState === 'ready' ? 'Copy now' : copyState === 'copied' ? 'Copied' : 'Copy selection'}</span>
+              </button>
+            ) : null}
             <button className="button button--ghost" type="button" onClick={() => setShowHelp(true)}>
               <KeyboardIcon /> <span>Copy &amp; paste</span>
             </button>
@@ -383,6 +502,16 @@ export function Workspace({ machineName, username, onLogout }: WorkspaceProps) {
             <button className="icon-button" type="button" aria-label="Dismiss error" onClick={() => setActionError(null)}><XIcon /></button>
           </div>
         ) : null}
+        {copyMessage ? (
+          <div
+            className={`workspace-notice notice ${copyState === 'error' ? 'notice--error' : 'notice--info'}`}
+            role={copyState === 'error' ? 'alert' : 'status'}
+          >
+            {copyState === 'copied' ? <CheckIcon /> : copyState === 'error' ? <AlertIcon /> : <CopyIcon />}
+            <span>{copyMessage}</span>
+            <button className="icon-button" type="button" aria-label="Dismiss copy message" onClick={() => setCopyMessage(null)}><XIcon /></button>
+          </div>
+        ) : null}
 
         <div className="terminal-stage">
           {openSessions.map((session) => activatedIds.includes(session.id) ? (
@@ -415,7 +544,7 @@ export function Workspace({ machineName, username, onLogout }: WorkspaceProps) {
               <button className="button button--primary button--large" type="button" onClick={() => setShowCreate(true)}>
                 <PlusIcon /> Create a session
               </button>
-              <div className="shortcut-note"><KeyboardIcon /> Copy: drag over text and release. If needed, hold <kbd>Shift</kbd> while dragging. Paste: <kbd>Ctrl</kbd>+<kbd>V</kbd>.</div>
+              <div className="shortcut-note"><KeyboardIcon /> Copy: drag to make a yellow selection, then click Copy selection. Or hold <kbd>Shift</kbd>, drag, and press <kbd>Ctrl</kbd>+<kbd>C</kbd>.</div>
             </section>
           ) : null}
         </div>
@@ -426,12 +555,13 @@ export function Workspace({ machineName, username, onLogout }: WorkspaceProps) {
       {showHelp ? (
         <Modal title="Terminal copy and paste" onClose={() => setShowHelp(false)}>
           <div className="shortcut-grid">
-            <div><span>Copy with tmux</span><span>drag</span></div>
-            <div><span>Browser selection fallback</span><kbd>Shift</kbd><span>+</span><span>drag</span></div>
+            <div><span>Select with tmux</span><span>drag</span></div>
+            <div><span>Copy yellow selection</span><span>Copy selection button</span></div>
+            <div><span>Native browser copy</span><kbd>Shift</kbd><span>+</span><span>drag, then Ctrl+C</span></div>
             <div><span>Paste from this device</span><kbd>Ctrl</kbd><span>+</span><kbd>V</kbd></div>
             <div><span>Alternative paste</span><kbd>Shift</kbd><span>+</span><kbd>Insert</kbd></div>
           </div>
-          <p className="modal-note">Yellow highlighting is tmux copy mode. Release to copy it to this device. If your browser blocks clipboard access, allow it for this HTTPS site or hold <kbd>Shift</kbd> while dragging. Press <kbd>Esc</kbd> to clear a selection.</p>
+          <p className="modal-note">Yellow highlighting is tmux copy mode. After dragging, click <strong>Copy selection</strong>; Firefox may ask for a second click labeled <strong>Copy now</strong>. For native browser copy, hold <kbd>Shift</kbd> while dragging and press <kbd>Ctrl</kbd>+<kbd>C</kbd>. Press <kbd>Esc</kbd> to clear a selection.</p>
         </Modal>
       ) : null}
     </div>

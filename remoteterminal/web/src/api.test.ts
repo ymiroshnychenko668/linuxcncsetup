@@ -76,4 +76,16 @@ describe('api security contract', () => {
     await api.login('operator', 'password')
     await expect(api.connectSession('session-id')).rejects.toMatchObject({ code: 'invalid_response' })
   })
+
+  it('loads the latest tmux selection without placing it in browser storage', async () => {
+    const fetchMock = vi.mocked(fetch)
+    fetchMock.mockResolvedValueOnce(jsonResponse({ text: 'selected text\nрядок' }))
+
+    await expect(api.getLatestSelection('session/id')).resolves.toBe('selected text\nрядок')
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/sessions/session%2Fid/clipboard',
+      expect.objectContaining({ cache: 'no-store', credentials: 'same-origin' }),
+    )
+    expect(localStorage.length).toBe(0)
+  })
 })

@@ -133,9 +133,13 @@ func TestManagerRealProcessLifecycle(t *testing.T) {
 		StartTimeout: 5 * time.Second,
 	})
 	createdID := ""
+	otherID := ""
 	t.Cleanup(func() {
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
+		if ValidID(otherID) {
+			_ = manager.Delete(cleanupCtx, otherID)
+		}
 		if ValidID(createdID) {
 			_ = manager.Delete(cleanupCtx, createdID)
 		}
@@ -180,6 +184,15 @@ func TestManagerRealProcessLifecycle(t *testing.T) {
 	if output, err := exec.CommandContext(ctx, tmuxBinary, "-S", manager.tmuxSocket(),
 		"show-options", "-sv", tmuxClipboardModeOption).CombinedOutput(); err != nil || strings.TrimSpace(string(output)) != tmuxClipboardMode {
 		t.Fatalf("Connect did not restrict browser clipboard integration: %v (%s)", err, strings.TrimSpace(string(output)))
+	}
+	for _, table := range []string{"copy-mode", "copy-mode-vi"} {
+		output, err := exec.CommandContext(ctx, tmuxBinary, "-S", manager.tmuxSocket(),
+			"list-keys", "-T", table).CombinedOutput()
+		if err != nil || !bytes.Contains(output, []byte("MouseDragEnd1Pane")) ||
+			!bytes.Contains(output, []byte("copy-selection-and-cancel")) ||
+			!bytes.Contains(output, []byte(tmuxSelectionBindingPrefix)) {
+			t.Fatalf("Connect did not scope %s drag selection buffers: %v (%s)", table, err, strings.TrimSpace(string(output)))
+		}
 	}
 	firstManaged, ttydPID := integrationManagedProcess(t, manager, created.ID)
 	ttydSocket := manager.ttydSocket(created.ID)
@@ -245,16 +258,53 @@ func TestManagerRealProcessLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("distinctive command output: %v; output=%q", err, firstOutput)
 	}
-	clipboardText := []byte("__REMOTE_TERMINAL_CLIPBOARD_" + value + "__")
-	clipboardSequence := []byte("\x1b]52;c;" + base64.StdEncoding.EncodeToString(clipboardText) + "\a")
-	clipboardCommand := exec.CommandContext(ctx, tmuxBinary, "-S", manager.tmuxSocket(), "load-buffer", "-w", "-")
-	clipboardCommand.Stdin = bytes.NewReader(clipboardText)
-	if output, err := clipboardCommand.CombinedOutput(); err != nil {
-		t.Fatalf("request tmux clipboard write: %v (%s)", err, strings.TrimSpace(string(output)))
+	copyTmuxLineWithMouseBinding(t, ctx, tmuxBinary, manager.tmuxSocket(), tmuxTarget(created.ID), string(executedMarker))
+	clipboardText, err := manager.LatestSelection(ctx, created.ID)
+	if err != nil {
+		t.Fatalf("read session-scoped mouse selection: %v", err)
 	}
+	if clipboardText != string(executedMarker) {
+		t.Fatalf("session-scoped mouse selection = %q, want %q", clipboardText, executedMarker)
+	}
+	clipboardSequence := []byte("\x1b]52;c;" + base64.StdEncoding.EncodeToString([]byte(clipboardText)) + "\a")
 	clipboardOutput, err := firstWS.readTTydOutputUntil(clipboardSequence, 8*time.Second)
 	if err != nil {
 		t.Fatalf("OSC 52 browser clipboard output: %v; output=%q", err, clipboardOutput)
+	}
+
+	other, err := manager.Create(ctx, "Other clipboard integration")
+	if err != nil {
+		t.Fatalf("create second session for clipboard isolation: %v", err)
+	}
+	otherID = other.ID
+	otherMarker := "__REMOTE_TERMINAL_OTHER_CLIPBOARD_" + value + "__"
+	otherTarget := tmuxTarget(other.ID)
+	otherCommand := "printf '\\n%s\\n' '" + otherMarker + "'"
+	if output, err := exec.CommandContext(ctx, tmuxBinary, "-S", manager.tmuxSocket(),
+		"send-keys", "-t", otherTarget, otherCommand, "Enter").CombinedOutput(); err != nil {
+		t.Fatalf("write second session marker: %v (%s)", err, strings.TrimSpace(string(output)))
+	}
+	if err := integrationEventually(3*time.Second, func() error {
+		output, captureErr := exec.CommandContext(ctx, tmuxBinary, "-S", manager.tmuxSocket(),
+			"capture-pane", "-p", "-t", otherTarget, "-S", "-20").CombinedOutput()
+		if captureErr != nil {
+			return captureErr
+		}
+		if !bytes.Contains(output, []byte(otherMarker)) {
+			return errors.New("second session marker has not appeared")
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	copyTmuxLineWithMouseBinding(t, ctx, tmuxBinary, manager.tmuxSocket(), otherTarget, otherMarker)
+	otherClipboardText, err := manager.LatestSelection(ctx, other.ID)
+	if err != nil || otherClipboardText != otherMarker {
+		t.Fatalf("second session selection = %q, %v; want %q", otherClipboardText, err, otherMarker)
+	}
+	firstClipboardText, err := manager.LatestSelection(ctx, created.ID)
+	if err != nil || firstClipboardText != clipboardText {
+		t.Fatalf("newer selection from another session replaced first selection: got %q, %v; want %q", firstClipboardText, err, clipboardText)
 	}
 	t.Logf("WebSocket: HTTP=101 subprotocol=%s command_marker=%s", firstWS.subprotocol, executedMarker)
 	if err := firstWS.Close(); err != nil {
@@ -354,12 +404,37 @@ func TestManagerRealProcessLifecycle(t *testing.T) {
 		"has-session", "-t", tmuxTarget(created.ID)).CombinedOutput(); err == nil {
 		t.Fatalf("Delete left managed tmux target %s (%s)", tmuxTarget(created.ID), strings.TrimSpace(string(output)))
 	}
+	if err := manager.Delete(ctx, other.ID); err != nil {
+		t.Fatalf("delete second clipboard-isolation session: %v", err)
+	}
+	otherID = ""
 	listed, err := manager.List(ctx)
 	if err != nil || len(listed) != 0 {
 		t.Fatalf("List after Delete = %+v, %v", listed, err)
 	}
 	requireTmuxSession(t, tmuxBinary, unrelatedSocket, unrelatedName)
 	t.Logf("Delete: ttyd_pid=%d reaped=true ttyd_socket_removed=true managed_tmux_removed=true unrelated_tmux_present=true", ttydPID)
+}
+
+func copyTmuxLineWithMouseBinding(t *testing.T, ctx context.Context, binary, socket, target, marker string) {
+	t.Helper()
+	commands := [][]string{
+		{"copy-mode", "-t", target},
+		{"send-keys", "-t", target, "-X", "search-backward", marker},
+		{"send-keys", "-t", target, "-X", "start-of-line"},
+		{"send-keys", "-t", target, "-X", "begin-selection"},
+		{"send-keys", "-t", target, "-X", "end-of-line"},
+		// Injecting the key name dispatches the configured copy-mode binding,
+		// just as the end of a browser mouse drag does.
+		{"send-keys", "-t", target, "MouseDragEnd1Pane"},
+	}
+	for _, arguments := range commands {
+		commandArguments := append([]string{"-S", socket}, arguments...)
+		if output, err := exec.CommandContext(ctx, binary, commandArguments...).CombinedOutput(); err != nil {
+			t.Fatalf("copy marker %q through tmux mouse binding (%s): %v (%s)",
+				marker, strings.Join(arguments, " "), err, strings.TrimSpace(string(output)))
+		}
+	}
 }
 
 func requireIntegrationExecutable(t *testing.T, environment, path string) {

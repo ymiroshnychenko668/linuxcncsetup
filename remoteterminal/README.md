@@ -116,7 +116,7 @@ Persistence in version 1 is limited to browser disconnects, tab closure, and log
 
 ### Copy and paste
 
-Because tmux handles mouse scrolling, a normal drag creates a yellow tmux copy-mode selection. Release to copy it to the browser device through ttyd's OSC 52 clipboard support, and press `Esc` if a selection needs to be cleared. If the browser blocks clipboard access, allow it for the HTTPS site or hold `Shift` while dragging to use ttyd's browser-selection fallback. Use `Ctrl+V` to paste, with `Shift+Insert` as an alternative.
+Because tmux handles mouse scrolling, a normal drag creates a yellow tmux copy-mode selection. Release the mouse, then click **Copy selection** in the terminal header. The first click may load the selection and change the button to **Copy now**; click that button to perform the browser-authorized clipboard write. Press `Esc` to clear a yellow selection. As a browser-native fallback, hold `Shift` while dragging and then press `Ctrl+C`. Use `Ctrl+V` to paste, with `Shift+Insert` as an alternative.
 
 ## Local development
 

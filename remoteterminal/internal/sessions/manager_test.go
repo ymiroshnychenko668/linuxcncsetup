@@ -2,6 +2,7 @@ package sessions
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -25,17 +27,31 @@ type fakeTmuxSession struct {
 	created int64
 }
 
+type fakeTmuxBuffer struct {
+	name       string
+	data       []byte
+	sizeOutput string
+}
+
 type fakeRunner struct {
 	mu                         sync.Mutex
 	sessions                   map[string]*fakeTmuxSession
 	calls                      [][]string
 	clipboardMode              string
 	clipboardTerminalOverride  string
+	selectionBuffers           []fakeTmuxBuffer
+	selectionListOutput        []byte
+	selectionInspectError      error
+	selectionReadError         error
+	selectionBindings          map[string]string
 	newSessionErrorAfterCreate error
 }
 
 func newFakeRunner() *fakeRunner {
-	return &fakeRunner{sessions: make(map[string]*fakeTmuxSession)}
+	return &fakeRunner{
+		sessions:          make(map[string]*fakeTmuxSession),
+		selectionBindings: make(map[string]string),
+	}
 }
 
 func (f *fakeRunner) Run(_ context.Context, binary string, args ...string) ([]byte, error) {
@@ -53,7 +69,7 @@ func (f *fakeRunner) Run(_ context.Context, binary string, args ...string) ([]by
 		}
 		commandArgs = commandArgs[2:]
 	}
-	if len(commandArgs) < 4 || commandArgs[0] != "-S" {
+	if len(commandArgs) < 3 || commandArgs[0] != "-S" {
 		return nil, fmt.Errorf("unexpected command: %v", call)
 	}
 	socket := commandArgs[1]
@@ -74,6 +90,49 @@ func (f *fakeRunner) Run(_ context.Context, binary string, args ...string) ([]by
 			lines = append(lines, fmt.Sprintf("%s\t%s\t%s\t0\t1\t%d", target, session.id, session.name, session.created))
 		}
 		return []byte(strings.Join(lines, "\n")), nil
+	case "list-buffers":
+		if len(commandArgs) != 5 || commandArgs[3] != "-F" || commandArgs[4] != tmuxSelectionListFormat {
+			return nil, fmt.Errorf("unsafe selection list args: %v", call)
+		}
+		if f.selectionInspectError != nil {
+			return append([]byte(nil), f.selectionListOutput...), f.selectionInspectError
+		}
+		if f.selectionListOutput != nil {
+			return append([]byte(nil), f.selectionListOutput...), nil
+		}
+		lines := make([]string, 0, len(f.selectionBuffers))
+		for _, buffer := range f.selectionBuffers {
+			size := buffer.sizeOutput
+			if size == "" {
+				size = strconv.Itoa(len(buffer.data))
+			}
+			lines = append(lines, buffer.name+"\t"+size)
+		}
+		return []byte(strings.Join(lines, "\n")), nil
+	case "show-buffer":
+		if len(commandArgs) != 5 || commandArgs[3] != "-b" {
+			return nil, fmt.Errorf("unsafe show-buffer args: %v", call)
+		}
+		for _, buffer := range f.selectionBuffers {
+			if buffer.name != commandArgs[4] {
+				continue
+			}
+			if f.selectionReadError != nil {
+				return append([]byte(nil), buffer.data...), f.selectionReadError
+			}
+			return append([]byte(nil), buffer.data...), nil
+		}
+		return []byte("no buffer " + commandArgs[4]), errors.New("exit status 1")
+	case "bind-key":
+		if len(commandArgs) != 10 || commandArgs[3] != "-T" ||
+			(commandArgs[4] != "copy-mode" && commandArgs[4] != "copy-mode-vi") ||
+			commandArgs[5] != "MouseDragEnd1Pane" || commandArgs[6] != "send-keys" ||
+			commandArgs[7] != "-X" || commandArgs[8] != "copy-selection-and-cancel" ||
+			commandArgs[9] != tmuxSelectionBindingPrefix {
+			return nil, fmt.Errorf("unsafe selection binding args: %v", call)
+		}
+		f.selectionBindings[commandArgs[4]] = strings.Join(commandArgs[6:], "\x00")
+		return nil, nil
 	case "new-session":
 		if len(args) != 8 || args[0] != "-f" || args[1] != "/dev/null" ||
 			len(commandArgs) != 6 || commandArgs[3] != "-d" || commandArgs[4] != "-s" {
@@ -274,6 +333,10 @@ func TestCreateListConnectDeleteLifecycle(t *testing.T) {
 	mouseEnabled := runner.sessions[tmuxTarget(created.ID)].mouse
 	clipboardMode := runner.clipboardMode
 	clipboardTerminalOverride := runner.clipboardTerminalOverride
+	selectionBindings := make(map[string]string, len(runner.selectionBindings))
+	for table, binding := range runner.selectionBindings {
+		selectionBindings[table] = binding
+	}
 	runner.mu.Unlock()
 	if !mouseEnabled {
 		t.Fatal("Connect() did not enable tmux mouse scrolling")
@@ -284,10 +347,19 @@ func TestCreateListConnectDeleteLifecycle(t *testing.T) {
 	if clipboardMode != tmuxClipboardMode {
 		t.Fatalf("Connect() clipboard mode = %q, want %q", clipboardMode, tmuxClipboardMode)
 	}
+	wantSelectionBinding := strings.Join([]string{
+		"send-keys", "-X", "copy-selection-and-cancel", tmuxSelectionBindingPrefix,
+	}, "\x00")
+	for _, table := range []string{"copy-mode", "copy-mode-vi"} {
+		if selectionBindings[table] != wantSelectionBinding {
+			t.Fatalf("Connect() %s selection binding = %q, want %q", table, selectionBindings[table], wantSelectionBinding)
+		}
+	}
 	runner.mu.Lock()
 	runner.sessions[tmuxTarget(created.ID)].mouse = false
 	runner.clipboardMode = ""
 	runner.clipboardTerminalOverride = ""
+	runner.selectionBindings = make(map[string]string)
 	runner.mu.Unlock()
 	if _, _, err := manager.Connect(context.Background(), created.ID); err != nil {
 		t.Fatal(err)
@@ -299,6 +371,10 @@ func TestCreateListConnectDeleteLifecycle(t *testing.T) {
 	mouseEnabled = runner.sessions[tmuxTarget(created.ID)].mouse
 	clipboardMode = runner.clipboardMode
 	clipboardTerminalOverride = runner.clipboardTerminalOverride
+	selectionBindings = make(map[string]string, len(runner.selectionBindings))
+	for table, binding := range runner.selectionBindings {
+		selectionBindings[table] = binding
+	}
 	runner.mu.Unlock()
 	if !mouseEnabled {
 		t.Fatal("repeated Connect() did not restore tmux mouse scrolling before reusing ttyd")
@@ -308,6 +384,11 @@ func TestCreateListConnectDeleteLifecycle(t *testing.T) {
 	}
 	if clipboardMode != tmuxClipboardMode {
 		t.Fatalf("repeated Connect() clipboard mode = %q, want %q", clipboardMode, tmuxClipboardMode)
+	}
+	for _, table := range []string{"copy-mode", "copy-mode-vi"} {
+		if selectionBindings[table] != wantSelectionBinding {
+			t.Fatalf("repeated Connect() did not restore %s selection binding", table)
+		}
 	}
 	if err := manager.Delete(context.Background(), created.ID); err != nil {
 		t.Fatal(err)
@@ -359,6 +440,168 @@ func TestCreateCleansHiddenSessionWhenNewSessionReturnsErrorAfterSideEffect(t *t
 	if err != nil || len(listed) != 0 {
 		t.Fatalf("List() after canceled create = %+v, %v", listed, err)
 	}
+}
+
+func TestLatestSelectionReturnsNewestBufferForRequestedSession(t *testing.T) {
+	manager, runner, _ := testManager(t, 2)
+	created, err := manager.Create(context.Background(), "Clipboard")
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := manager.Create(context.Background(), "Other terminal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "first line\nУкраїнський текст\n"
+	wantName := tmuxSelectionPrefix(created.ID) + "12"
+	otherName := tmuxSelectionPrefix(other.ID) + "13"
+	runner.mu.Lock()
+	// list-buffers is newest-first. The other terminal's newer selection must
+	// be skipped, as must a manually named buffer with a nonnumeric suffix.
+	runner.selectionBuffers = []fakeTmuxBuffer{
+		{name: otherName, data: []byte("other terminal secret")},
+		{name: tmuxSelectionPrefix(created.ID) + "manual", data: []byte("not automatic")},
+		{name: wantName, data: []byte(want)},
+		{name: tmuxSelectionPrefix(created.ID) + "7", data: []byte("older")},
+		{name: "buffer14", data: []byte("global")},
+	}
+	runner.mu.Unlock()
+
+	got, err := manager.LatestSelection(context.Background(), created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Fatalf("LatestSelection() = %q, want %q", got, want)
+	}
+	otherGot, err := manager.LatestSelection(context.Background(), other.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if otherGot != "other terminal secret" {
+		t.Fatalf("LatestSelection(other) = %q, want session-scoped buffer", otherGot)
+	}
+
+	runner.mu.Lock()
+	calls := append([][]string(nil), runner.calls...)
+	runner.mu.Unlock()
+	wantListCall := []string{"tmux", "-S", manager.tmuxSocket(), "list-buffers", "-F", tmuxSelectionListFormat}
+	wantReadCall := []string{"tmux", "-S", manager.tmuxSocket(), "show-buffer", "-b", wantName}
+	wantOtherReadCall := []string{"tmux", "-S", manager.tmuxSocket(), "show-buffer", "-b", otherName}
+	if !containsCommand(calls, wantListCall) || !containsCommand(calls, wantReadCall) || !containsCommand(calls, wantOtherReadCall) {
+		t.Fatalf("LatestSelection() calls = %#v", calls)
+	}
+}
+
+func TestLatestSelectionValidatesSessionAndBufferState(t *testing.T) {
+	manager, runner, _ := testManager(t, 1)
+	created, err := manager.Create(context.Background(), "Clipboard")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := manager.LatestSelection(context.Background(), "invalid"); !errors.Is(err, ErrInvalidID) {
+		t.Fatalf("invalid ID error = %v, want ErrInvalidID", err)
+	}
+	if _, err := manager.LatestSelection(context.Background(), "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("missing session error = %v, want ErrNotFound", err)
+	}
+	if _, err := manager.LatestSelection(context.Background(), created.ID); !errors.Is(err, ErrNoSelection) {
+		t.Fatalf("no-buffer error = %v, want ErrNoSelection", err)
+	}
+
+	runner.mu.Lock()
+	runner.selectionBuffers = []fakeTmuxBuffer{{
+		name: tmuxSelectionPrefix(created.ID) + "0", sizeOutput: "0",
+	}}
+	runner.mu.Unlock()
+	if _, err := manager.LatestSelection(context.Background(), created.ID); !errors.Is(err, ErrNoSelection) {
+		t.Fatalf("empty-buffer error = %v, want ErrNoSelection", err)
+	}
+}
+
+func TestLatestSelectionBoundsAndValidatesTmuxOutput(t *testing.T) {
+	manager, runner, _ := testManager(t, 1)
+	created, err := manager.Create(context.Background(), "Clipboard")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	bufferName := tmuxSelectionPrefix(created.ID) + "0"
+	runner.mu.Lock()
+	runner.selectionBuffers = []fakeTmuxBuffer{{
+		name: bufferName, data: []byte("small"), sizeOutput: strconv.Itoa(maxSelectionBytes + 1),
+	}}
+	runner.mu.Unlock()
+	if _, err := manager.LatestSelection(context.Background(), created.ID); !errors.Is(err, ErrSelectionTooLarge) {
+		t.Fatalf("preflight size error = %v, want ErrSelectionTooLarge", err)
+	}
+
+	runner.mu.Lock()
+	runner.selectionBuffers = []fakeTmuxBuffer{{
+		name: bufferName, data: bytes.Repeat([]byte{'x'}, maxSelectionBytes+1), sizeOutput: "1",
+	}}
+	runner.mu.Unlock()
+	if _, err := manager.LatestSelection(context.Background(), created.ID); !errors.Is(err, ErrSelectionTooLarge) {
+		t.Fatalf("post-read size error = %v, want ErrSelectionTooLarge", err)
+	}
+
+	runner.mu.Lock()
+	runner.selectionBuffers = []fakeTmuxBuffer{{
+		name: bufferName, data: []byte{0xff}, sizeOutput: "1",
+	}}
+	runner.mu.Unlock()
+	if _, err := manager.LatestSelection(context.Background(), created.ID); !errors.Is(err, ErrInvalidSelection) {
+		t.Fatalf("invalid UTF-8 error = %v, want ErrInvalidSelection", err)
+	}
+}
+
+func TestLatestSelectionRejectsMalformedSizeAndWrapsTmuxFailures(t *testing.T) {
+	manager, runner, _ := testManager(t, 1)
+	created, err := manager.Create(context.Background(), "Clipboard")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	bufferName := tmuxSelectionPrefix(created.ID) + "0"
+	runner.mu.Lock()
+	runner.selectionBuffers = []fakeTmuxBuffer{{
+		name: bufferName, data: []byte("small"), sizeOutput: "not-a-size",
+	}}
+	runner.mu.Unlock()
+	if _, err := manager.LatestSelection(context.Background(), created.ID); err == nil || !strings.Contains(err.Error(), "invalid tmux buffer size") {
+		t.Fatalf("malformed size error = %v", err)
+	}
+
+	runner.mu.Lock()
+	runner.selectionListOutput = []byte("tmux inspect failed")
+	runner.selectionInspectError = context.DeadlineExceeded
+	runner.mu.Unlock()
+	if _, err := manager.LatestSelection(context.Background(), created.ID); !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "tmux inspect failed") {
+		t.Fatalf("inspect error = %v", err)
+	}
+
+	runner.mu.Lock()
+	runner.selectionInspectError = nil
+	runner.selectionListOutput = nil
+	secretSelection := "SECRET_SELECTION_MUST_NOT_REACH_LOGS"
+	runner.selectionBuffers = []fakeTmuxBuffer{{
+		name: bufferName, data: []byte(secretSelection), sizeOutput: "5",
+	}}
+	runner.selectionReadError = context.Canceled
+	runner.mu.Unlock()
+	if _, err := manager.LatestSelection(context.Background(), created.ID); !errors.Is(err, context.Canceled) || strings.Contains(err.Error(), secretSelection) {
+		t.Fatalf("read error = %v", err)
+	}
+}
+
+func containsCommand(calls [][]string, want []string) bool {
+	for _, call := range calls {
+		if strings.Join(call, "\x00") == strings.Join(want, "\x00") {
+			return true
+		}
+	}
+	return false
 }
 
 func TestListStopsTtydWhenTmuxSessionEndsOutOfBand(t *testing.T) {

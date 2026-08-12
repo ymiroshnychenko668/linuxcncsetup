@@ -36,6 +36,7 @@ type SessionManager interface {
 	Create(context.Context, string) (sessions.Session, error)
 	Delete(context.Context, string) error
 	Connect(context.Context, string) (sessions.Session, string, error)
+	LatestSelection(context.Context, string) (string, error)
 	Proxy(context.Context, string) (http.Handler, error)
 	ActiveTerminals() int
 }
@@ -343,12 +344,26 @@ func (s *Server) sessionItem(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	if len(parts) == 2 && parts[1] == "clipboard" && r.Method == http.MethodGet {
+		selection, err := s.sessions.LatestSelection(r.Context(), id)
+		if err != nil {
+			s.sessionError(w, "read tmux selection", err)
+			return
+		}
+		w.Header().Set("Cache-Control", "no-store")
+		writeJSON(w, http.StatusOK, map[string]string{"text": selection})
+		return
+	}
 	if len(parts) == 1 {
 		methodNotAllowed(w, http.MethodDelete)
 		return
 	}
 	if len(parts) == 2 && parts[1] == "connect" {
 		methodNotAllowed(w, http.MethodPost)
+		return
+	}
+	if len(parts) == 2 && parts[1] == "clipboard" {
+		methodNotAllowed(w, http.MethodGet)
 		return
 	}
 	writeError(w, http.StatusNotFound, "not_found", "The requested resource was not found.")
@@ -460,6 +475,12 @@ func (s *Server) sessionError(w http.ResponseWriter, action string, err error) {
 		writeError(w, http.StatusConflict, "session_exists", "A session with that name already exists.")
 	case errors.Is(err, sessions.ErrLimitReached):
 		writeError(w, http.StatusConflict, "session_limit", "The maximum number of sessions has been reached.")
+	case errors.Is(err, sessions.ErrNoSelection):
+		writeError(w, http.StatusConflict, "no_selection", "Select terminal text with the mouse first.")
+	case errors.Is(err, sessions.ErrSelectionTooLarge):
+		writeError(w, http.StatusRequestEntityTooLarge, "selection_too_large", "The terminal selection is too large to copy.")
+	case errors.Is(err, sessions.ErrInvalidSelection):
+		writeError(w, http.StatusUnprocessableEntity, "selection_invalid", "The terminal selection is not valid text.")
 	case errors.Is(err, sessions.ErrShuttingDown):
 		writeError(w, http.StatusServiceUnavailable, "shutting_down", "The service is shutting down.")
 	default:

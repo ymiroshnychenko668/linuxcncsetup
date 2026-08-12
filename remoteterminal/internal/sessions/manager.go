@@ -32,11 +32,18 @@ var (
 	ErrNameExists         = errors.New("session name already exists")
 	ErrLimitReached       = errors.New("session limit reached")
 	ErrTerminalNotRunning = errors.New("terminal is not connected")
+	ErrNoSelection        = errors.New("no terminal text has been selected")
+	ErrSelectionTooLarge  = errors.New("terminal selection is too large")
+	ErrInvalidSelection   = errors.New("terminal selection is not valid UTF-8")
 	ErrShuttingDown       = errors.New("service is shutting down")
 )
 
 const (
+	maxSelectionBytes             = 1 << 20
 	tmuxListFormat                = "#{session_name}\t#{@remoteterminal-id}\t#{@remoteterminal-name}\t#{session_attached}\t#{session_windows}\t#{session_created}"
+	tmuxSelectionListFormat       = "#{buffer_name}\t#{buffer_size}"
+	tmuxSelectionBufferPrefix     = "rtclip-"
+	tmuxSelectionBindingPrefix    = tmuxSelectionBufferPrefix + "#{session_name}-"
 	tmuxClipboardModeOption       = "set-clipboard"
 	tmuxClipboardMode             = "external"
 	tmuxClipboardOption           = "terminal-overrides"
@@ -201,6 +208,99 @@ func (m *Manager) List(ctx context.Context) ([]Session, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.listLocked(ctx)
+}
+
+// LatestSelection returns the newest paste buffer created by a mouse selection
+// in the requested session. tmux paste buffers are server-global, so Connect
+// gives drag selections a prefix derived from tmux's private, immutable session
+// name. This method only considers that prefix and reads the chosen buffer by
+// its exact name, preventing a selection from another session being returned.
+func (m *Manager) LatestSelection(ctx context.Context, id string) (string, error) {
+	if !ValidID(id) {
+		return "", ErrInvalidID
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.shuttingDown {
+		return "", ErrShuttingDown
+	}
+	if _, err := m.findLocked(ctx, id); err != nil {
+		return "", err
+	}
+
+	bufferOutput, err := m.runner.Run(ctx, m.config.TmuxBinary,
+		"-S", m.tmuxSocket(), "list-buffers", "-F", tmuxSelectionListFormat)
+	if err != nil {
+		return "", commandError("inspect terminal selections", bufferOutput, err)
+	}
+	bufferName, size, err := latestSelectionBuffer(bufferOutput, id)
+	if err != nil {
+		return "", err
+	}
+	if bufferName == "" {
+		return "", ErrNoSelection
+	}
+	if size == 0 {
+		return "", ErrNoSelection
+	}
+	if size > maxSelectionBytes {
+		return "", ErrSelectionTooLarge
+	}
+
+	selection, err := m.runner.Run(ctx, m.config.TmuxBinary,
+		"-S", m.tmuxSocket(), "show-buffer", "-b", bufferName)
+	if err != nil {
+		// show-buffer may return part or all of the user's selected text along
+		// with an error. Never include that output in an error which the HTTP
+		// layer records in the service log.
+		return "", fmt.Errorf("read terminal selection: %w", err)
+	}
+	if len(selection) == 0 {
+		return "", ErrNoSelection
+	}
+	if len(selection) > maxSelectionBytes {
+		return "", ErrSelectionTooLarge
+	}
+	if !utf8.Valid(selection) {
+		return "", ErrInvalidSelection
+	}
+	return string(selection), nil
+}
+
+// latestSelectionBuffer selects the first matching entry because tmux lists
+// buffers newest first. Automatic paste-buffer names end in a decimal counter;
+// requiring that suffix avoids accepting an unrelated manually named buffer
+// which only happens to share the prefix.
+func latestSelectionBuffer(output []byte, id string) (string, uint64, error) {
+	prefix := tmuxSelectionPrefix(id)
+	for _, line := range strings.Split(string(output), "\n") {
+		name, rawSize, ok := strings.Cut(line, "\t")
+		if !ok || !validSelectionBufferName(name, prefix) {
+			continue
+		}
+		size, err := strconv.ParseUint(rawSize, 10, 64)
+		if err != nil {
+			return "", 0, fmt.Errorf("inspect terminal selection: invalid tmux buffer size %q", rawSize)
+		}
+		return name, size, nil
+	}
+	return "", 0, nil
+}
+
+func tmuxSelectionPrefix(id string) string {
+	return tmuxSelectionBufferPrefix + tmuxTarget(id) + "-"
+}
+
+func validSelectionBufferName(name, prefix string) bool {
+	if !strings.HasPrefix(name, prefix) || len(name) == len(prefix) {
+		return false
+	}
+	for _, character := range name[len(prefix):] {
+		if character < '0' || character > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func (m *Manager) listLocked(ctx context.Context) ([]Session, error) {
@@ -380,6 +480,21 @@ func (m *Manager) Connect(ctx context.Context, id string) (Session, string, erro
 	if output, err := m.runner.Run(ctx, m.config.TmuxBinary,
 		"-S", m.tmuxSocket(), "set-option", "-s", tmuxClipboardOption, tmuxClipboardTerminalOverride); err != nil {
 		return Session{}, "", commandError("enable browser clipboard integration", output, err)
+	}
+	// tmux paste buffers are shared by every session in a server. Copy the drag
+	// selection directly with a format-expanded prefix based on the private tmux
+	// session name. copy-selection-and-cancel creates the paste buffer and emits
+	// OSC 52 when set-clipboard is external; unlike copy-pipe-and-cancel, it does
+	// not require a command argument on tmux 3.1. The API can then retrieve this
+	// session's selection without exposing another terminal's most recent
+	// buffer. Configure both stock copy-mode key tables because the mode-keys
+	// option may select either one.
+	for _, table := range []string{"copy-mode", "copy-mode-vi"} {
+		if output, err := m.runner.Run(ctx, m.config.TmuxBinary,
+			"-S", m.tmuxSocket(), "bind-key", "-T", table, "MouseDragEnd1Pane",
+			"send-keys", "-X", "copy-selection-and-cancel", tmuxSelectionBindingPrefix); err != nil {
+			return Session{}, "", commandError("scope tmux mouse selections", output, err)
+		}
 	}
 	// tmux owns the scrollback while attached through ttyd. Without mouse
 	// handling, xterm.js sees tmux's alternate screen and converts wheel input

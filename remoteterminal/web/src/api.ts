@@ -47,6 +47,10 @@ interface ConnectResponse {
   terminalUrl: string
 }
 
+interface ClipboardResponse {
+  text?: string
+}
+
 interface AuthResponse {
   authenticated?: boolean
   user?: AuthenticatedUser | null
@@ -245,6 +249,17 @@ export const api = {
         throw new ApiError('The service did not identify the connected session.', 0, 'invalid_response')
       }
       return { session, terminalUrl: normalizeTerminalUrl(response.terminalUrl) }
+    }),
+
+  getLatestSelection: (id: string, signal?: AbortSignal) =>
+    request<ClipboardResponse>(
+      `/api/sessions/${encodeURIComponent(id)}/clipboard`,
+      { signal, cache: 'no-store' },
+    ).then((response) => {
+      if (typeof response.text !== 'string' || response.text.length === 0) {
+        throw new ApiError('The service returned an invalid terminal selection.', 0, 'invalid_response')
+      }
+      return response.text
     }),
 
   deleteSession: (id: string) =>
