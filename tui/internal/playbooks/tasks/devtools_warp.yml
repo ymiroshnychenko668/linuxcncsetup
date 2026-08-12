@@ -1,0 +1,153 @@
+---
+- name: Inspect the Warp Terminal package
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/dpkg-query
+      - -W
+      - '-f=${Status}'
+      - warp-terminal
+  register: devtools_warp_package
+  changed_when: false
+  failed_when: devtools_warp_package.rc not in [0, 1]
+  check_mode: false
+
+- name: Determine whether Warp Terminal is already installed
+  ansible.builtin.set_fact:
+    devtools_warp_installed: >-
+      {{
+        devtools_warp_package.rc == 0 and
+        devtools_warp_package.stdout | trim == "install ok installed"
+      }}
+
+- name: Read the native Debian package architecture
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/dpkg
+      - --print-architecture
+  register: devtools_warp_native_architecture
+  changed_when: false
+  check_mode: false
+  when: not devtools_warp_installed
+
+- name: Validate the native Warp package architecture
+  ansible.builtin.assert:
+    that:
+      - devtools_warp_native_architecture.stdout | trim in ["amd64", "arm64"]
+    fail_msg: Warp supports only native amd64 and arm64 Debian packages.
+  when: not devtools_warp_installed
+
+- name: Install Warp Terminal from the official Debian package
+  when:
+    - not ansible_check_mode
+    - not devtools_warp_installed
+  block:
+    - name: Create a temporary Warp package directory
+      ansible.builtin.tempfile:
+        state: directory
+        prefix: linuxcncsetup-warp-
+      become: true
+      register: devtools_warp_package_directory
+
+    - name: Download the official Warp Debian package
+      ansible.builtin.get_url:
+        url: >-
+          {{
+            devtools_warp_deb_urls[
+              devtools_warp_native_architecture.stdout | trim
+            ]
+          }}
+        dest: "{{ devtools_warp_package_directory.path }}/warp-terminal.deb"
+        mode: "0644"
+        timeout: 120
+      become: true
+
+    - name: Inspect the Warp Debian package metadata
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/dpkg-deb
+          - --field
+          - "{{ devtools_warp_package_directory.path }}/warp-terminal.deb"
+          - "{{ item }}"
+      loop:
+        - Package
+        - Architecture
+        - Version
+      register: devtools_warp_package_metadata
+      changed_when: false
+
+    - name: Validate the Warp Debian package metadata
+      ansible.builtin.assert:
+        that:
+          - devtools_warp_package_metadata.results[0].stdout | trim == "warp-terminal"
+          - >-
+            devtools_warp_package_metadata.results[1].stdout | trim ==
+            devtools_warp_native_architecture.stdout | trim
+          - devtools_warp_package_metadata.results[2].stdout | trim is match("^[0-9]")
+        fail_msg: >-
+          The downloaded file is not the official Warp package for this
+          system's native architecture.
+
+    - name: Remove repository files from the interrupted legacy Warp setup
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      become: true
+      loop: "{{ devtools_warp_legacy_paths }}"
+
+    - name: Install the local Warp Debian package without refreshing APT
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/apt-get
+          - -o
+          - DPkg::Lock::Timeout=120
+          - -o
+          - Dpkg::Options::=--force-confdef
+          - -o
+          - Dpkg::Options::=--force-confold
+          - --assume-yes
+          - --no-install-recommends
+          - --no-remove
+          - install
+          - "{{ devtools_warp_package_directory.path }}/warp-terminal.deb"
+      become: true
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+      changed_when: true
+
+    - name: Verify the installed Warp Terminal package
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/dpkg-query
+          - -W
+          - '-f=${Status}'
+          - warp-terminal
+      register: devtools_warp_installed_package
+      changed_when: false
+      check_mode: false
+
+    - name: Validate the installed Warp Terminal package
+      ansible.builtin.assert:
+        that:
+          - >-
+            devtools_warp_installed_package.stdout | trim ==
+            "install ok installed"
+        fail_msg: Warp Terminal did not finish installing.
+  always:
+    - name: Remove the temporary Warp package directory
+      ansible.builtin.file:
+        path: "{{ devtools_warp_package_directory.path }}"
+        state: absent
+      become: true
+      when:
+        - devtools_warp_package_directory is defined
+        - devtools_warp_package_directory.path is defined
+
+- name: Preview the Warp Terminal installation in check mode
+  ansible.builtin.debug:
+    msg: >-
+      Warp's official native Debian package would be downloaded and installed
+      without refreshing the global APT package indexes.
+  changed_when: true
+  when:
+    - ansible_check_mode
+    - not devtools_warp_installed

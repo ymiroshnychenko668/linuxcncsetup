@@ -1,0 +1,359 @@
+---
+- name: Capture package selections before Sway
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/dpkg
+      - --get-selections
+  register: sway_package_selections
+  changed_when: false
+  check_mode: false
+
+- name: Capture manually installed packages before Sway
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/apt-mark
+      - showmanual
+  register: sway_manual_packages
+  changed_when: false
+  check_mode: false
+
+- name: Capture the package listing before Sway
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/dpkg
+      - --list
+  register: sway_package_listing
+  changed_when: false
+  check_mode: false
+
+- name: Preserve package baselines without overwriting earlier snapshots
+  ansible.builtin.copy:
+    dest: "{{ sway_target_home }}/{{ item.name }}"
+    content: "{{ item.content }}\n"
+    owner: "{{ target_user }}"
+    group: "{{ sway_target_group_result.stdout }}"
+    mode: "0644"
+    force: false
+  diff: false
+  loop:
+    - name: pkg-selections-pre-sway.txt
+      content: "{{ sway_package_selections.stdout }}"
+    - name: apt-manual-pre-sway.txt
+      content: "{{ sway_manual_packages.stdout }}"
+    - name: dpkg-l-pre-sway.txt
+      content: "{{ sway_package_listing.stdout }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Simulate the additive Sway package installation
+  ansible.builtin.apt:
+    name: "{{ sway_packages }}"
+    state: present
+  register: sway_package_simulation
+  check_mode: true
+  changed_when: false
+
+- name: Refuse a package transaction that removes software
+  ansible.builtin.assert:
+    that:
+      - "'The following packages will be REMOVED:' not in (sway_package_simulation.stdout | default(''))"
+      - >-
+        sway_package_simulation.stdout_lines
+        | default([])
+        | select("match", "^Remv ")
+        | list
+        | length == 0
+    fail_msg: The simulated Sway installation would remove packages.
+
+- name: Install the Wayland and Sway packages without starting services
+  ansible.builtin.apt:
+    name: "{{ sway_packages }}"
+    state: present
+    policy_rc_d: 101
+
+- name: Read installed package facts
+  ansible.builtin.package_facts:
+    manager: auto
+
+- name: Find missing Sway packages
+  ansible.builtin.set_fact:
+    sway_missing_packages: >-
+      {{
+        sway_packages
+        | difference(ansible_facts.packages.keys() | list)
+      }}
+
+- name: Require the complete Sway package set
+  ansible.builtin.assert:
+    that:
+      - sway_missing_packages | length == 0
+    fail_msg: "Sway installation is incomplete; missing: {{ sway_missing_packages | join(', ') }}"
+
+- name: Check whether Warp terminal is available
+  ansible.builtin.stat:
+    path: /usr/bin/warp-terminal
+  register: sway_warp_terminal
+
+- name: Select the primary terminal
+  ansible.builtin.set_fact:
+    sway_effective_terminal: >-
+      {{
+        (
+          'warp-terminal'
+          if sway_warp_terminal.stat.exists
+          else 'foot'
+        )
+        if sway_primary_terminal == 'auto'
+        else sway_primary_terminal
+      }}
+
+- name: Verify the selected primary terminal
+  ansible.builtin.stat:
+    path: "/usr/bin/{{ sway_effective_terminal }}"
+  register: sway_primary_terminal_binary
+
+- name: Require the selected primary terminal
+  ansible.builtin.assert:
+    that:
+      - sway_primary_terminal_binary.stat.exists
+      - sway_primary_terminal_binary.stat.executable
+    fail_msg: "Primary terminal not found: /usr/bin/{{ sway_effective_terminal }}"
+
+- name: Create a private user configuration root
+  ansible.builtin.file:
+    path: "{{ sway_target_home }}/.config"
+    state: directory
+    owner: "{{ target_user }}"
+    group: "{{ sway_target_group_result.stdout }}"
+    mode: "0700"
+
+- name: Create Sway configuration directories
+  ansible.builtin.file:
+    path: "{{ sway_target_home }}/{{ item }}"
+    state: directory
+    owner: "{{ target_user }}"
+    group: "{{ sway_target_group_result.stdout }}"
+    mode: "0755"
+  loop:
+    - .config/environment.d
+    - .config/mako
+    - .config/sway
+    - .config/sway/config.d
+    - .config/systemd
+    - .config/systemd/user
+    - .config/waybar
+    - .config/xdg-desktop-portal
+
+- name: Install and validate the Sway configuration atomically
+  block:
+    - name: Create a private runtime directory for Sway validation
+      ansible.builtin.tempfile:
+        state: directory
+        prefix: linuxcncsetup-sway-validate-
+      become_user: "{{ target_user }}"
+      register: sway_validation_runtime
+      check_mode: false
+      changed_when: false
+
+    - name: Enforce private validation-runtime permissions
+      ansible.builtin.file:
+        path: "{{ sway_validation_runtime.path }}"
+        state: directory
+        mode: "0700"
+      become_user: "{{ target_user }}"
+      changed_when: false
+
+    - name: Install the Sway desktop configuration
+      ansible.builtin.template:
+        src: templates/sway-config.j2
+        dest: "{{ sway_target_home }}/.config/sway/config"
+        backup: true
+        validate: /usr/bin/sway --validate --config %s
+      become_user: "{{ target_user }}"
+      environment:
+        HOME: "{{ sway_target_home }}"
+        XDG_RUNTIME_DIR: "{{ sway_validation_runtime.path }}"
+        WLR_BACKENDS: headless
+        WLR_RENDERER: pixman
+        WLR_LIBINPUT_NO_DEVICES: "1"
+        WAYLAND_DISPLAY: ""
+        DISPLAY: ""
+        SWAYSOCK: ""
+
+    # The TUI launches ansible-playbook through sudo, so its staged template is
+    # root-owned even though this task becomes the target user. Asking the
+    # unprivileged template module to chmod/chown that staged source fails with
+    # EPERM before its validated atomic move. Enforce final metadata separately
+    # as root after the target-user validation and replacement succeed.
+    - name: Enforce Sway configuration ownership and permissions
+      ansible.builtin.file:
+        path: "{{ sway_target_home }}/.config/sway/config"
+        state: file
+        owner: "{{ target_user }}"
+        group: "{{ sway_target_group_result.stdout }}"
+        mode: "0644"
+
+    - name: Validate the installed Sway configuration and included snippets
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/sway
+          - --validate
+          - --config
+          - "{{ sway_target_home }}/.config/sway/config"
+      become_user: "{{ target_user }}"
+      environment:
+        HOME: "{{ sway_target_home }}"
+        XDG_RUNTIME_DIR: "{{ sway_validation_runtime.path }}"
+        WLR_BACKENDS: headless
+        WLR_RENDERER: pixman
+        WLR_LIBINPUT_NO_DEVICES: "1"
+        WAYLAND_DISPLAY: ""
+        DISPLAY: ""
+        SWAYSOCK: ""
+      register: sway_config_validation
+      changed_when: false
+      check_mode: false
+      failed_when: >-
+        sway_config_validation.rc != 0 or
+        "Error(s) loading config!" in
+        (
+          (sway_config_validation.stdout | default("")) +
+          (sway_config_validation.stderr | default(""))
+        )
+      when: not ansible_check_mode
+  always:
+    - name: Remove the temporary Sway validation runtime
+      ansible.builtin.file:
+        path: "{{ sway_validation_runtime.path }}"
+        state: absent
+      when:
+        - sway_validation_runtime is defined
+        - sway_validation_runtime.path is defined
+      check_mode: false
+      changed_when: false
+
+- name: Install the remaining Sway desktop configuration
+  ansible.builtin.template:
+    src: "templates/{{ item.src }}"
+    dest: "{{ sway_target_home }}/{{ item.dest }}"
+    owner: "{{ target_user }}"
+    group: "{{ sway_target_group_result.stdout }}"
+    mode: "0644"
+    backup: true
+    validate: "{{ item.validate | default(omit) }}"
+  loop:
+    - src: waybar-config.json.j2
+      dest: .config/waybar/config
+      validate: /usr/bin/python3 -m json.tool %s
+    - src: waybar-style.css.j2
+      dest: .config/waybar/style.css
+    - src: mako-config.j2
+      dest: .config/mako/config
+    - src: sway-session.target.j2
+      dest: .config/systemd/user/sway-session.target
+    - src: wayland-environment.conf.j2
+      dest: .config/environment.d/90-wayland.conf
+    - src: sway-portals.conf.j2
+      dest: .config/xdg-desktop-portal/sway-portals.conf
+
+- name: Add guarded Wayland environment variables to the login profile
+  ansible.builtin.blockinfile:
+    path: "{{ sway_target_home }}/.profile"
+    create: true
+    owner: "{{ target_user }}"
+    group: "{{ sway_target_group_result.stdout }}"
+    mode: "0644"
+    backup: true
+    marker: "# {mark} wayland/sway env {mark}"
+    marker_begin: ">>>"
+    marker_end: "<<<"
+    block: |
+      # Skipped while an X11 session is active so the XFCE transition is unaffected.
+      if [ "${XDG_SESSION_TYPE:-}" != "x11" ]; then
+          export XDG_CURRENT_DESKTOP=sway
+          export QT_QPA_PLATFORM="wayland;xcb"
+          export QT_WAYLAND_DISABLE_WINDOWDECORATION=1
+          export MOZ_ENABLE_WAYLAND=1
+          export _JAVA_AWT_WM_NONREPARENTING=1
+          export SDL_VIDEODRIVER=wayland
+          export CLUTTER_BACKEND=wayland
+      fi
+
+- name: Inspect local PulseAudio user-unit overrides
+  ansible.builtin.stat:
+    path: "{{ sway_target_home }}/.config/systemd/user/{{ item }}"
+    follow: false
+  loop:
+    - pulseaudio.service
+    - pulseaudio.socket
+  register: sway_pulseaudio_overrides
+  when: sway_mask_pulseaudio | bool
+
+- name: Refuse to replace custom PulseAudio user units
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - not item.stat.exists or (item.stat.islnk and item.stat.lnk_source == "/dev/null")
+    fail_msg: >-
+      {{ item.item }} is a custom user unit. Back it up or remove it before
+      allowing this playbook to mask PulseAudio.
+  loop: "{{ sway_pulseaudio_overrides.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when: sway_mask_pulseaudio | bool
+
+- name: Mask PulseAudio at future user-session starts
+  ansible.builtin.file:
+    src: /dev/null
+    dest: "{{ sway_target_home }}/.config/systemd/user/{{ item }}"
+    state: link
+    force: true
+    owner: "{{ target_user }}"
+    group: "{{ sway_target_group_result.stdout }}"
+  loop:
+    - pulseaudio.service
+    - pulseaudio.socket
+  when: sway_mask_pulseaudio | bool
+
+- name: Reload the target user's service manager when available
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/systemctl
+      - --user
+      - daemon-reload
+  become_user: "{{ target_user }}"
+  environment:
+    HOME: "{{ sway_target_home }}"
+    XDG_RUNTIME_DIR: "/run/user/{{ sway_target_uid }}"
+    DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ sway_target_uid }}/bus"
+  register: sway_user_daemon_reload
+  changed_when: false
+  failed_when: false
+
+- name: Validate the Waybar JSON configuration
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/python3
+      - -m
+      - json.tool
+      - "{{ sway_target_home }}/.config/waybar/config"
+  become_user: "{{ target_user }}"
+  environment:
+    HOME: "{{ sway_target_home }}"
+  changed_when: false
+  check_mode: false
+
+- name: Check the package database after installation
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/dpkg
+      - --audit
+  register: sway_dpkg_audit_after
+  changed_when: false
+  check_mode: false
+
+- name: Require a clean package database after installation
+  ansible.builtin.assert:
+    that:
+      - sway_dpkg_audit_after.stdout | trim | length == 0
+    fail_msg: Resolve the issues reported by `dpkg --audit`.

@@ -1,0 +1,140 @@
+---
+- name: Install and configure the Wayland and Sway desktop
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  become: false
+
+  vars:
+    sway_output_name: DP-1
+    sway_output_mode: 1920x1080
+    sway_output_position: 0,0
+    sway_keyboard_layout: us
+    sway_primary_terminal: auto
+    sway_require_drm: true
+    sway_mask_pulseaudio: true
+    sway_packages:
+      - adwaita-icon-theme
+      - brightnessctl
+      - dbus-bin
+      - dbus-user-session
+      - fonts-font-awesome
+      - foot
+      - gnome-keyring
+      - grim
+      - libnotify-bin
+      - lxpolkit
+      - mako-notifier
+      - network-manager-applet
+      - pavucontrol
+      - pipewire
+      - pipewire-pulse
+      - pulseaudio-utils
+      - qt6-wayland
+      - qtwayland5
+      - slurp
+      - sway
+      - swaybg
+      - swayidle
+      - swaylock
+      - waybar
+      - wireplumber
+      - wl-clipboard
+      - wofi
+      - xdg-desktop-portal
+      - xdg-desktop-portal-gtk
+      - xdg-desktop-portal-wlr
+      - xwayland
+
+  pre_tasks:
+    - name: Validate the Sway installation request
+      ansible.builtin.assert:
+        that:
+          - ansible_facts["distribution"] == "Debian"
+          - ansible_facts["distribution_major_version"] == "13"
+          - (target_user | default("")) is match("^[a-zA-Z_][a-zA-Z0-9_.-]*[$]?$")
+          - (target_user | default("")) != "root"
+          - sway_output_name is match("^[a-zA-Z0-9_.-]+$")
+          - sway_output_mode is match("^[0-9]+x[0-9]+([@][0-9.]+Hz)?$")
+          - sway_output_position is match("^-?[0-9]+,-?[0-9]+$")
+          - sway_keyboard_layout is match("^[a-zA-Z0-9_,+-]+$")
+          - sway_primary_terminal == "auto" or sway_primary_terminal is match("^[a-zA-Z0-9_.+-]+$")
+        fail_msg: >-
+          This playbook requires Debian 13, a regular non-root target_user, and
+          safe Sway output, keyboard, and terminal values.
+
+    - name: Read the target account
+      ansible.builtin.getent:
+        database: passwd
+        key: "{{ target_user }}"
+
+    - name: Derive target account details
+      ansible.builtin.set_fact:
+        sway_target_home: "{{ ansible_facts['getent_passwd'][target_user][4] }}"
+        sway_target_uid: "{{ ansible_facts['getent_passwd'][target_user][1] | int }}"
+        sway_target_shell: "{{ ansible_facts['getent_passwd'][target_user][5] }}"
+
+    - name: Read the target account's primary group
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/id
+          - -gn
+          - --
+          - "{{ target_user }}"
+      register: sway_target_group_result
+      changed_when: false
+      check_mode: false
+
+    - name: Inspect the target home and DRM devices
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop:
+        - "{{ sway_target_home }}"
+        - /dev/dri/card0
+        - /dev/dri/renderD128
+      register: sway_preflight_paths
+
+    - name: Validate the target account and graphics devices
+      ansible.builtin.assert:
+        that:
+          - sway_target_uid >= 1000
+          - sway_target_uid <= 60000
+          - sway_target_home is match("^/")
+          - not (sway_target_shell is match("^.*/(nologin|false)$"))
+          - sway_preflight_paths.results[0].stat.exists
+          - sway_preflight_paths.results[0].stat.isdir
+          - not (sway_require_drm | bool) or sway_preflight_paths.results[1].stat.exists
+          - not (sway_require_drm | bool) or sway_preflight_paths.results[2].stat.exists
+        fail_msg: >-
+          target_user must be a regular login account with an existing home.
+          A DRM card and render node are also required unless
+          sway_require_drm=false is explicitly supplied.
+
+    - name: Check the package database before installation
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/dpkg
+          - --audit
+      register: sway_dpkg_audit_before
+      changed_when: false
+      check_mode: false
+
+    - name: Require a clean package database
+      ansible.builtin.assert:
+        that:
+          - sway_dpkg_audit_before.stdout | trim | length == 0
+        fail_msg: Resolve the issues reported by `dpkg --audit` before installing Sway.
+
+  tasks:
+    - name: Apply the additive Wayland and Sway installation
+      ansible.builtin.import_tasks: tasks/install_sway.yml
+      become: true
+
+  post_tasks:
+    - name: Report the manual validation gate
+      ansible.builtin.debug:
+        msg: >-
+          Wayland and Sway are installed and configured for {{ target_user }}.
+          The current display manager, XFCE, and Xorg were not changed. Log
+          out, choose Sway in the current greeter, and verify the session
+          before configuring greetd or automatic login.

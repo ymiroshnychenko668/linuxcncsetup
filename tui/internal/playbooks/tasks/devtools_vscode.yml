@@ -1,0 +1,55 @@
+---
+- name: Download the Microsoft repository signing key
+  ansible.builtin.get_url:
+    url: "{{ devtools_microsoft_key_url }}"
+    dest: "{{ devtools_microsoft_key_source }}"
+    owner: root
+    group: root
+    mode: "0644"
+  become: true
+  register: devtools_microsoft_key_download
+
+- name: Inspect the Microsoft binary keyring
+  ansible.builtin.stat:
+    path: "{{ devtools_microsoft_keyring }}"
+  register: devtools_microsoft_keyring_status
+
+- name: Build the Microsoft binary keyring
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/gpg
+      - --batch
+      - --yes
+      - --dearmor
+      - --output
+      - "{{ devtools_microsoft_keyring }}"
+      - "{{ devtools_microsoft_key_source }}"
+  become: true
+  when:
+    - devtools_microsoft_key_download.changed or not devtools_microsoft_keyring_status.stat.exists
+  changed_when: true
+
+- name: Set Microsoft keyring permissions
+  ansible.builtin.file:
+    path: "{{ devtools_microsoft_keyring }}"
+    state: file
+    owner: root
+    group: root
+    mode: "0644"
+  become: true
+
+- name: Configure the Visual Studio Code repository
+  ansible.builtin.copy:
+    dest: /etc/apt/sources.list.d/vscode.list
+    content: "{{ devtools_vscode_repository }}\n"
+    owner: root
+    group: root
+    mode: "0644"
+  become: true
+
+- name: Install Visual Studio Code
+  ansible.builtin.apt:
+    name: code
+    state: present
+    update_cache: true
+  become: true

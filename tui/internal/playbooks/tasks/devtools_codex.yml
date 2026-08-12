@@ -1,0 +1,209 @@
+---
+- name: Inspect the Codex command path
+  ansible.builtin.stat:
+    path: "{{ devtools_target_home }}/.local/bin/codex"
+    follow: false
+  register: devtools_codex_command_entry
+  check_mode: false
+
+- name: Inspect the resolved Codex command
+  ansible.builtin.stat:
+    path: "{{ devtools_target_home }}/.local/bin/codex"
+    follow: true
+  register: devtools_codex_command_target
+  check_mode: false
+  when: devtools_codex_command_entry.stat.exists
+
+- name: Resolve the Codex command path
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/readlink
+      - -f
+      - --
+      - "{{ devtools_target_home }}/.local/bin/codex"
+  register: devtools_codex_resolved_command
+  changed_when: false
+  check_mode: false
+  when: devtools_codex_command_entry.stat.exists
+
+- name: Validate an existing Codex installation
+  ansible.builtin.assert:
+    that:
+      - >-
+        devtools_codex_command_entry.stat.isreg | default(false) or
+        devtools_codex_command_entry.stat.islnk | default(false)
+      - devtools_codex_command_target.stat.exists
+      - devtools_codex_command_target.stat.isreg | default(false)
+      - devtools_codex_command_target.stat.executable | default(false)
+      - devtools_codex_command_target.stat.pw_name | default("") == target_user
+      - >-
+        devtools_codex_resolved_command.stdout == devtools_target_home or
+        devtools_codex_resolved_command.stdout.startswith(
+          devtools_target_home + "/"
+        )
+    fail_msg: >-
+      The existing Codex command is not a target-user-owned executable inside
+      the target user's home. It was not executed or replaced.
+  when: devtools_codex_command_entry.stat.exists
+
+- name: Inspect Codex installation directories
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+  loop:
+    - "{{ devtools_target_home }}/.local"
+    - "{{ devtools_target_home }}/.local/bin"
+  register: devtools_codex_install_directories
+  when: not devtools_codex_command_entry.stat.exists
+
+- name: Reject unsafe Codex installation directories
+  ansible.builtin.assert:
+    that:
+      - not item.stat.exists or item.stat.isdir | default(false)
+      - not item.stat.exists or not item.stat.islnk | default(false)
+      - not item.stat.exists or item.stat.pw_name | default("") == target_user
+    fail_msg: >-
+      An existing Codex installation directory is not a target-user-owned
+      regular directory. It was not modified.
+  loop: "{{ devtools_codex_install_directories.results }}"
+  when: not devtools_codex_command_entry.stat.exists
+
+- name: Read packages required by the Codex installer
+  ansible.builtin.package_facts:
+    manager: auto
+  when: not devtools_codex_command_entry.stat.exists
+
+- name: Determine missing Codex installer packages
+  ansible.builtin.set_fact:
+    devtools_codex_missing_packages: >-
+      {{
+        devtools_codex_required_packages
+        | difference(ansible_facts.packages.keys() | list)
+      }}
+  when: not devtools_codex_command_entry.stat.exists
+
+- name: Install missing Codex installer packages
+  ansible.builtin.apt:
+    name: "{{ devtools_codex_missing_packages }}"
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+    lock_timeout: 120
+  become: true
+  when:
+    - not ansible_check_mode
+    - not devtools_codex_command_entry.stat.exists
+    - devtools_codex_missing_packages | length > 0
+
+- name: Check for a Codex installer downloader
+  ansible.builtin.command:
+    argv:
+      - /bin/sh
+      - -c
+      - command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1
+  become: true
+  become_user: "{{ target_user }}"
+  environment:
+    HOME: "{{ devtools_target_home }}"
+    PATH: /usr/local/bin:/usr/bin:/bin
+  register: devtools_codex_downloader
+  changed_when: false
+  failed_when: devtools_codex_downloader.rc not in [0, 1]
+  check_mode: false
+  when: not devtools_codex_command_entry.stat.exists
+
+- name: Install curl when no Codex installer downloader exists
+  ansible.builtin.apt:
+    name: curl
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+    lock_timeout: 120
+  become: true
+  when:
+    - not ansible_check_mode
+    - not devtools_codex_command_entry.stat.exists
+    - devtools_codex_downloader.rc != 0
+
+- name: Preview the Codex installation in check mode
+  ansible.builtin.debug:
+    msg: >-
+      Codex CLI would be installed for {{ target_user }} from the official
+      standalone installer.
+  changed_when: true
+  when:
+    - ansible_check_mode
+    - not devtools_codex_command_entry.stat.exists
+
+- name: Install Codex CLI from the official standalone installer
+  when:
+    - not ansible_check_mode
+    - not devtools_codex_command_entry.stat.exists
+  block:
+    - name: Create a private Codex installer directory
+      ansible.builtin.tempfile:
+        state: directory
+        prefix: linuxcncsetup-codex-
+      become: true
+      become_user: "{{ target_user }}"
+      register: devtools_codex_installer_directory
+
+    - name: Set private Codex installer directory permissions
+      ansible.builtin.file:
+        path: "{{ devtools_codex_installer_directory.path }}"
+        state: directory
+        mode: "0700"
+      become: true
+      become_user: "{{ target_user }}"
+
+    - name: Download the official Codex installer
+      ansible.builtin.get_url:
+        url: "{{ devtools_codex_installer_url }}"
+        dest: "{{ devtools_codex_installer_directory.path }}/install.sh"
+        mode: "0700"
+      become: true
+      become_user: "{{ target_user }}"
+
+    - name: Run the official Codex installer as the target user
+      ansible.builtin.command:
+        argv:
+          - /bin/sh
+          - "{{ devtools_codex_installer_directory.path }}/install.sh"
+        creates: "{{ devtools_target_home }}/.local/bin/codex"
+      become: true
+      become_user: "{{ target_user }}"
+      environment:
+        HOME: "{{ devtools_target_home }}"
+        SHELL: "{{ devtools_target_shell }}"
+        USER: "{{ target_user }}"
+        LOGNAME: "{{ target_user }}"
+        PATH: /usr/local/bin:/usr/bin:/bin
+        CODEX_NON_INTERACTIVE: "true"
+        CODEX_INSTALL_DIR: "{{ devtools_target_home }}/.local/bin"
+        CODEX_HOME: "{{ devtools_target_home }}/.codex"
+  always:
+    - name: Remove the private Codex installer directory
+      ansible.builtin.file:
+        path: "{{ devtools_codex_installer_directory.path }}"
+        state: absent
+      become: true
+      when:
+        - devtools_codex_installer_directory is defined
+        - devtools_codex_installer_directory.path is defined
+
+- name: Verify the managed Codex command
+  ansible.builtin.command:
+    argv:
+      - "{{ devtools_target_home }}/.local/bin/codex"
+      - --version
+  become: true
+  become_user: "{{ target_user }}"
+  environment:
+    HOME: "{{ devtools_target_home }}"
+    USER: "{{ target_user }}"
+    LOGNAME: "{{ target_user }}"
+    PATH: "{{ devtools_target_home }}/.local/bin:/usr/local/bin:/usr/bin:/bin"
+  changed_when: false
+  check_mode: false
+  when:
+    - devtools_codex_command_entry.stat.exists or not ansible_check_mode

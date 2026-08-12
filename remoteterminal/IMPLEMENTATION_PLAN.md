@@ -91,7 +91,7 @@ remoteterminal/
    `- build.sh
 ```
 
-There is no root-level `install-remoteterminal.sh`. The supported TUI calls `remoteterminal/ansible/install.yml` through its Ansible runner. The repository-root `setup.sh` shell menu is deprecated and retained only for compatibility.
+There is no root-level `install-remoteterminal.sh`. The supported TUI embeds the Remote Terminal production sources and materializes `ansible/install.yml` for its Ansible runner, so the installed TUI does not depend on the repository checkout. The repository-root `setup.sh` shell menu is deprecated and retained only as a compatibility launcher for the TUI.
 
 ## TUI and Ansible installation
 

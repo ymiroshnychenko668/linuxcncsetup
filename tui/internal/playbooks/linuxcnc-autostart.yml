@@ -1,0 +1,263 @@
+---
+- name: Configure LinuxCNC autostart for Sway
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  become: false
+
+  pre_tasks:
+    - name: Validate the LinuxCNC autostart request
+      ansible.builtin.assert:
+        that:
+          - ansible_facts["distribution"] == "Debian"
+          - ansible_facts["distribution_major_version"] == "13"
+          - (target_user | default("")) is match("^[a-zA-Z_][a-zA-Z0-9_.-]*[$]?$")
+          - (target_user | default("")) != "root"
+          - (linuxcnc_config | default("")) is match("^/")
+          - (linuxcnc_config | default("")) is search("(?i)[.]ini$")
+        fail_msg: >-
+          This playbook requires Debian 13, a regular non-root target_user,
+          and linuxcnc_config set to an absolute .ini path.
+
+    - name: Read the target account
+      ansible.builtin.getent:
+        database: passwd
+        key: "{{ target_user }}"
+
+    - name: Read regular-user UID bounds
+      ansible.builtin.slurp:
+        src: /etc/login.defs
+      register: linuxcnc_autostart_login_defs
+
+    - name: Derive target account details and UID bounds
+      ansible.builtin.set_fact:
+        linuxcnc_autostart_home: "{{ ansible_facts['getent_passwd'][target_user][4] }}"
+        linuxcnc_autostart_uid: "{{ ansible_facts['getent_passwd'][target_user][1] | int }}"
+        linuxcnc_autostart_shell: "{{ ansible_facts['getent_passwd'][target_user][5] }}"
+        linuxcnc_autostart_uid_min_matches: >-
+          {{
+            linuxcnc_autostart_login_defs.content
+            | b64decode
+            | regex_findall('(?m)^\s*UID_MIN\s+(\d+)\s*$')
+          }}
+        linuxcnc_autostart_uid_max_matches: >-
+          {{
+            linuxcnc_autostart_login_defs.content
+            | b64decode
+            | regex_findall('(?m)^\s*UID_MAX\s+(\d+)\s*$')
+          }}
+
+    - name: Read the target account's primary group
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/id
+          - -gn
+          - --
+          - "{{ target_user }}"
+      register: linuxcnc_autostart_group
+      changed_when: false
+      check_mode: false
+
+    - name: Inspect required paths
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        follow: true
+      loop:
+        - "{{ linuxcnc_autostart_home }}"
+        - "{{ linuxcnc_config }}"
+        - /usr/bin/linuxcnc
+        - /usr/bin/inivar
+        - /usr/bin/swaymsg
+        - "{{ linuxcnc_autostart_home }}/.config/sway/config"
+        - "{{ linuxcnc_autostart_home }}/.config/waybar/config"
+      register: linuxcnc_autostart_paths
+
+    - name: Validate the account and required paths
+      ansible.builtin.assert:
+        that:
+          - linuxcnc_autostart_uid_min_matches | length == 1
+          - linuxcnc_autostart_uid_max_matches | length == 1
+          - linuxcnc_autostart_uid >= (linuxcnc_autostart_uid_min_matches[0] | int)
+          - linuxcnc_autostart_uid <= (linuxcnc_autostart_uid_max_matches[0] | int)
+          - linuxcnc_autostart_home is match("^/")
+          - not (linuxcnc_autostart_shell is match("^.*/(nologin|false)$"))
+          - linuxcnc_autostart_paths.results[0].stat.exists
+          - linuxcnc_autostart_paths.results[0].stat.isdir
+          - linuxcnc_autostart_paths.results[1].stat.exists
+          - linuxcnc_autostart_paths.results[1].stat.isreg
+          - linuxcnc_autostart_paths.results[2].stat.exists
+          - linuxcnc_autostart_paths.results[2].stat.isreg
+          - linuxcnc_autostart_paths.results[2].stat.executable
+          - linuxcnc_autostart_paths.results[3].stat.exists
+          - linuxcnc_autostart_paths.results[3].stat.isreg
+          - linuxcnc_autostart_paths.results[3].stat.executable
+          - linuxcnc_autostart_paths.results[4].stat.exists
+          - linuxcnc_autostart_paths.results[4].stat.isreg
+          - linuxcnc_autostart_paths.results[4].stat.executable
+          - linuxcnc_autostart_paths.results[5].stat.exists
+          - linuxcnc_autostart_paths.results[5].stat.isreg
+          - linuxcnc_autostart_paths.results[6].stat.exists
+          - linuxcnc_autostart_paths.results[6].stat.isreg
+        fail_msg: >-
+          target_user must be a regular login account with an existing home;
+          linuxcnc_config must be a regular .ini file; /usr/bin/linuxcnc must
+          be installed with inivar; swaymsg must be executable; and the target
+          user's Sway and Waybar configs must already exist.
+
+    - name: Check that the target user can read the managed configurations
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/test
+          - -r
+          - "{{ item }}"
+      loop:
+        - "{{ linuxcnc_config }}"
+        - "{{ linuxcnc_autostart_home }}/.config/sway/config"
+        - "{{ linuxcnc_autostart_home }}/.config/waybar/config"
+      become: true
+      become_user: "{{ target_user }}"
+      changed_when: false
+      check_mode: false
+
+    - name: Validate the existing Waybar JSON configuration
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/python3
+          - -m
+          - json.tool
+          - "{{ linuxcnc_autostart_home }}/.config/waybar/config"
+      become: true
+      become_user: "{{ target_user }}"
+      environment:
+        HOME: "{{ linuxcnc_autostart_home }}"
+      changed_when: false
+      check_mode: false
+
+    - name: Read the existing Waybar configuration
+      ansible.builtin.slurp:
+        src: "{{ linuxcnc_autostart_home }}/.config/waybar/config"
+      register: linuxcnc_autostart_waybar_source
+
+    - name: Decode the existing Waybar configuration
+      ansible.builtin.set_fact:
+        linuxcnc_autostart_waybar_config: >-
+          {{
+            linuxcnc_autostart_waybar_source.content
+            | b64decode
+            | from_json
+          }}
+
+    - name: Require a Waybar configuration with a left module list
+      ansible.builtin.assert:
+        that:
+          - linuxcnc_autostart_waybar_config is mapping
+          - linuxcnc_autostart_waybar_config["modules-left"] is defined
+          - linuxcnc_autostart_waybar_config["modules-left"] is sequence
+          - linuxcnc_autostart_waybar_config["modules-left"] is not string
+        fail_msg: >-
+          The Waybar config must be a JSON object with modules-left set to an
+          array before the LinuxCNC launcher can be added.
+
+    - name: Read the selected LinuxCNC display configuration
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/inivar
+          - -ini
+          - "{{ linuxcnc_config }}"
+          - -sec
+          - DISPLAY
+          - -var
+          - DISPLAY
+      become: true
+      become_user: "{{ target_user }}"
+      register: linuxcnc_autostart_display
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: Require a LinuxCNC INI with a display program
+      ansible.builtin.assert:
+        that:
+          - linuxcnc_autostart_display.rc == 0
+          - linuxcnc_autostart_display.stdout | trim | length > 0
+          - (linuxcnc_autostart_display.stdout | trim) is match('(?i)^qtvcp(\s|$)')
+        fail_msg: >-
+          The selected .ini must define a QtVCP program in [DISPLAY] DISPLAY.
+          This Sway implementation currently requires QtVCP so it can place
+          the delayed XWayland window on workspace 1 deterministically.
+
+    - name: Validate the existing Sway configuration in an isolated runtime
+      block:
+        - name: Create a private preflight Sway validation runtime
+          ansible.builtin.tempfile:
+            state: directory
+            prefix: linuxcncsetup-linuxcnc-pre-sway-
+          become: true
+          become_user: "{{ target_user }}"
+          register: linuxcnc_autostart_preflight_runtime
+          check_mode: false
+          changed_when: false
+
+        - name: Enforce private preflight runtime permissions
+          ansible.builtin.file:
+            path: "{{ linuxcnc_autostart_preflight_runtime.path }}"
+            state: directory
+            mode: "0700"
+          become: true
+          become_user: "{{ target_user }}"
+          changed_when: false
+
+        - name: Validate the existing Sway configuration before changing it
+          ansible.builtin.command:
+            argv:
+              - /usr/bin/sway
+              - --validate
+              - --config
+              - "{{ linuxcnc_autostart_home }}/.config/sway/config"
+          become: true
+          become_user: "{{ target_user }}"
+          environment:
+            HOME: "{{ linuxcnc_autostart_home }}"
+            XDG_RUNTIME_DIR: "{{ linuxcnc_autostart_preflight_runtime.path }}"
+            WLR_BACKENDS: headless
+            WLR_RENDERER: pixman
+            WLR_LIBINPUT_NO_DEVICES: "1"
+            WAYLAND_DISPLAY: ""
+            DISPLAY: ""
+            SWAYSOCK: ""
+          register: linuxcnc_autostart_preflight_validation
+          changed_when: false
+          check_mode: false
+          failed_when: >-
+            linuxcnc_autostart_preflight_validation.rc != 0 or
+            "Error(s) loading config!" in
+            (
+              (linuxcnc_autostart_preflight_validation.stdout | default("")) +
+              (linuxcnc_autostart_preflight_validation.stderr | default(""))
+            )
+      always:
+        - name: Remove the private preflight Sway validation runtime
+          ansible.builtin.file:
+            path: "{{ linuxcnc_autostart_preflight_runtime.path }}"
+            state: absent
+          become: true
+          when:
+            - linuxcnc_autostart_preflight_runtime is defined
+            - linuxcnc_autostart_preflight_runtime.path is defined
+          check_mode: false
+          changed_when: false
+
+  tasks:
+    - name: Persist LinuxCNC autostart for the next Sway session
+      ansible.builtin.import_tasks: tasks/linuxcnc_autostart.yml
+      become: true
+
+  post_tasks:
+    - name: Report the configured Sway autostart
+      ansible.builtin.debug:
+        msg: >-
+          LinuxCNC will open {{ linuxcnc_config }} fullscreen on workspace 1 at
+          the next Sway login. The Waybar CNC button returns to the existing
+          QtVCP window on workspace 1, or launches the same selected
+          configuration when no QtVCP window is open. LinuxCNC was not launched
+          in the current session.

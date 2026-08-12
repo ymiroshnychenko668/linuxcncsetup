@@ -1,0 +1,109 @@
+#!/bin/sh
+# Managed by linuxcncsetup. Changes will be replaced.
+
+# XFCE uses the same desktop name for its X11 and Wayland sessions. Keep this
+# X11-only launcher inert when the autostart entry is seen by XFCE on Wayland.
+[ "${XDG_SESSION_TYPE:-}" = "x11" ] || exit 0
+[ -n "${DISPLAY:-}" ] || exit 0
+
+runtime_dir=${XDG_RUNTIME_DIR:-"/run/user/$(/usr/bin/id -u)"}
+[ -d "$runtime_dir" ] || exit 1
+
+find_qtvcp_window()
+{
+    /usr/bin/wmctrl -lx 2>/dev/null |
+        /usr/bin/awk 'tolower($3) ~ /(^|[.])qtvcp([.]|$)/ { print $1; exit }'
+}
+
+place_qtvcp_window()
+{
+    qtvcp_window_id=$1
+    /usr/bin/wmctrl -s 0 >/dev/null 2>&1 || true
+    /usr/bin/wmctrl -i -r "$qtvcp_window_id" -t 0 >/dev/null 2>&1 || true
+    /usr/bin/wmctrl -i -r "$qtvcp_window_id" -b add,fullscreen >/dev/null 2>&1 || true
+    /usr/bin/wmctrl -i -a "$qtvcp_window_id" >/dev/null 2>&1 || true
+}
+
+wait_for_window_manager()
+{
+    attempt=0
+    while [ "$attempt" -lt 80 ]; do
+        /usr/bin/wmctrl -m >/dev/null 2>&1 && return 0
+        attempt=$((attempt + 1))
+        /usr/bin/sleep 0.25
+    done
+    return 1
+}
+
+wait_for_qtvcp_window()
+{
+    watched_pid=${1:-}
+    attempt=0
+    while [ "$attempt" -lt 240 ]; do
+        qtvcp_window_id=$(find_qtvcp_window)
+        if [ -n "$qtvcp_window_id" ]; then
+            printf '%s\n' "$qtvcp_window_id"
+            return 0
+        fi
+        if [ -n "$watched_pid" ] && ! kill -0 "$watched_pid" 2>/dev/null; then
+            return 1
+        fi
+        attempt=$((attempt + 1))
+        /usr/bin/sleep 0.25
+    done
+    return 1
+}
+
+qtvcp_window_id=$(find_qtvcp_window)
+if [ -n "$qtvcp_window_id" ]; then
+    place_qtvcp_window "$qtvcp_window_id"
+    exit 0
+fi
+
+umask 077
+lock_file=$runtime_dir/linuxcncsetup-linuxcnc-autostart-x11.lock
+exec 9>"$lock_file" || exit 1
+if ! /usr/bin/flock --nonblock 9; then
+    # Another launcher owns startup. Focus its window when it becomes ready,
+    # but never start a second LinuxCNC process.
+    qtvcp_window_id=$(wait_for_qtvcp_window)
+    if [ -n "$qtvcp_window_id" ]; then
+        place_qtvcp_window "$qtvcp_window_id"
+    fi
+    exit 0
+fi
+
+if ! wait_for_window_manager; then
+    if /usr/bin/pgrep -u "$(/usr/bin/id -u)" -x linuxcnc >/dev/null 2>&1; then
+        exit 0
+    fi
+    exec /usr/bin/linuxcnc {{ linuxcnc_config | ansible.builtin.quote }}
+fi
+
+# Close the race between the first lookup and taking the startup lock.
+qtvcp_window_id=$(find_qtvcp_window)
+if [ -n "$qtvcp_window_id" ]; then
+    place_qtvcp_window "$qtvcp_window_id"
+    exit 0
+fi
+
+# A session-restored LinuxCNC may start alongside XDG autostart. Wait for its
+# QtVCP window rather than starting a second machine process.
+if /usr/bin/pgrep -u "$(/usr/bin/id -u)" -x linuxcnc >/dev/null 2>&1; then
+    qtvcp_window_id=$(wait_for_qtvcp_window)
+    if [ -n "$qtvcp_window_id" ]; then
+        place_qtvcp_window "$qtvcp_window_id"
+    fi
+    exit 0
+fi
+
+/usr/bin/wmctrl -s 0 >/dev/null 2>&1 || true
+/usr/bin/linuxcnc {{ linuxcnc_config | ansible.builtin.quote }} &
+linuxcnc_pid=$!
+
+qtvcp_window_id=$(wait_for_qtvcp_window "$linuxcnc_pid")
+if [ -n "$qtvcp_window_id" ]; then
+    place_qtvcp_window "$qtvcp_window_id"
+fi
+
+wait "$linuxcnc_pid"

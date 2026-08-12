@@ -85,6 +85,8 @@
       - --omit-dir-times
       - --exclude=/.git/
       - --exclude=/ansible/
+      - --exclude=/assets.go
+      - --exclude=/assets_test.go
       - --exclude=/build/
       - --exclude=/scripts/
       - --exclude=/web/node_modules/

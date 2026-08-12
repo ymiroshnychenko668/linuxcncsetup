@@ -1,0 +1,19 @@
+[Unit]
+Description=Apply the LinuxCNC IRQ-affinity policy
+Documentation=file:///etc/linuxcncsetup/irq-affinity.yml
+After=local-fs.target
+Before=irqbalance.service
+ConditionPathExists={{ irq_affinity_config_path }}
+ConditionPathIsReadWrite=/proc/irq
+
+[Service]
+Type=oneshot
+ExecStart={{ irq_affinity_helper_path }} --apply --config {{ irq_affinity_config_path }}
+RemainAfterExit=yes
+PrivateTmp=yes
+ProtectHome=yes
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

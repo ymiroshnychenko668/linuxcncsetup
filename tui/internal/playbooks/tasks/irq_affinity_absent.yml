@@ -1,0 +1,36 @@
+---
+- name: Inspect the owned IRQ-affinity unit and enablement link
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+  loop:
+    - "{{ irq_affinity_service_path }}"
+    - "/etc/systemd/system/multi-user.target.wants/{{ irq_affinity_service_name }}"
+  register: irq_affinity_owned_service_files
+
+- name: Disable the owned IRQ-affinity unit without stopping it
+  ansible.builtin.systemd_service:
+    name: "{{ irq_affinity_service_name }}"
+    enabled: false
+    daemon_reload: true
+  when:
+    - not ansible_check_mode
+    - irq_affinity_owned_service_files.results[0].stat.exists
+
+- name: Remove only linuxcncsetup-owned IRQ-affinity files
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - "{{ irq_affinity_config_path }}"
+    - "{{ irq_affinity_helper_path }}"
+    - "{{ irq_affinity_service_path }}"
+    - "/etc/systemd/system/multi-user.target.wants/{{ irq_affinity_service_name }}"
+    - "{{ irq_affinity_legacy_irqbalance_dropin }}"
+    - "{{ irq_affinity_result_path }}"
+    - "{{ irq_affinity_live_result_path }}"
+
+- name: Reload systemd after removing the owned unit
+  ansible.builtin.systemd_service:
+    daemon_reload: true
+  when: not ansible_check_mode

@@ -1,0 +1,8 @@
+# Managed by linuxcncsetup. Changes will be replaced.
+# Regular exec commands run once when a new Sway session starts, not on reload.
+# QtVCP can create either a native Wayland window or an XWayland window.
+assign [app_id="(?i)^qtvcp$"] workspace number 1
+assign [class="(?i)^qtvcp$"] workspace number 1
+for_window [app_id="(?i)^qtvcp$"] fullscreen enable
+for_window [class="(?i)^qtvcp$"] fullscreen enable
+exec --no-startup-id "$HOME/.local/bin/linuxcnc-autostart"

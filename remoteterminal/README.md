@@ -27,7 +27,7 @@ The generated certificate encrypts traffic but is not automatically trusted by c
 
 ## Installation from the TUI
 
-Use the LinuxCNC Setup TUI application and choose **Install Remote Terminal (Ansible)**. The TUI asks for a machine display name, the local system user, LAN IPv4 address, and HTTPS port, then invokes `ansible/install.yml` directly. The host name is offered as the default machine name.
+Use the LinuxCNC Setup TUI application and choose **Install Remote Terminal**. The TUI asks for a machine display name, the local system user, LAN IPv4 address, and HTTPS port, then runs the bundled Ansible installer. The host name is offered as the default machine name.
 
 The repository-root `setup.sh` shell menu is deprecated. It remains functional for compatibility but should not be used for new installations or updates.
 

@@ -1,0 +1,82 @@
+---
+- name: Configure LinuxCNC real-time kernel command line
+  hosts: localhost
+  connection: local
+  become: true
+  gather_facts: false
+  vars:
+    grub_rt_dropin_path: /etc/default/grub.d/99-linuxcncsetup-rt.cfg
+
+  tasks:
+    - name: Validate the requested CPU roles
+      ansible.builtin.assert:
+        that:
+          - grub_rt_state | default("present") in ["present", "absent"]
+          - grub_rt_state | default("present") == "absent" or grub_rt_protected_cpus | default("") | length > 0
+          - grub_rt_state | default("present") == "absent" or grub_rt_housekeeping_cpus | default("") | length > 0
+          - grub_rt_state | default("present") == "absent" or grub_rt_protected_cpus != grub_rt_housekeeping_cpus
+        fail_msg: Protected and housekeeping CPU lists must both be non-empty and different.
+
+    - name: Ensure the GRUB drop-in directory exists
+      ansible.builtin.file:
+        path: /etc/default/grub.d
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      when: grub_rt_state | default("present") == "present"
+
+    - name: Install the managed LinuxCNC real-time GRUB parameters
+      ansible.builtin.template:
+        src: templates/linuxcncsetup-grub-rt.cfg.j2
+        dest: "{{ grub_rt_dropin_path }}"
+        owner: root
+        group: root
+        mode: "0644"
+        backup: true
+      register: grub_rt_dropin
+      when: grub_rt_state | default("present") == "present"
+
+    - name: Remove the managed LinuxCNC real-time GRUB parameters
+      ansible.builtin.file:
+        path: "{{ grub_rt_dropin_path }}"
+        state: absent
+      register: grub_rt_removed
+      when: grub_rt_state | default("present") == "absent"
+
+    - name: Inspect the Debian GRUB configuration generator
+      ansible.builtin.stat:
+        path: /usr/sbin/update-grub
+      register: grub_rt_update_grub
+
+    - name: Inspect the portable GRUB configuration generator
+      ansible.builtin.stat:
+        path: /usr/sbin/grub-mkconfig
+      register: grub_rt_mkconfig
+
+    - name: Require a supported GRUB configuration generator
+      ansible.builtin.assert:
+        that:
+          - grub_rt_update_grub.stat.executable or grub_rt_mkconfig.stat.executable
+        fail_msg: Neither /usr/sbin/update-grub nor /usr/sbin/grub-mkconfig is executable.
+
+    - name: Regenerate the bootloader configuration
+      ansible.builtin.command:
+        argv: >-
+          {{
+            ['/usr/sbin/update-grub']
+            if grub_rt_update_grub.stat.executable
+            else ['/usr/sbin/grub-mkconfig', '-o', '/boot/grub/grub.cfg']
+          }}
+      when: >-
+        not ansible_check_mode and
+        ((grub_rt_dropin.changed | default(false)) or
+        (grub_rt_removed.changed | default(false)))
+      changed_when: true
+
+    - name: Explain when the requested configuration becomes active
+      ansible.builtin.debug:
+        msg: The managed GRUB parameters are saved. Reboot to activate them.
+      when: >-
+        (grub_rt_dropin.changed | default(false)) or
+        (grub_rt_removed.changed | default(false))

@@ -1,0 +1,89 @@
+---
+- name: Create owned IRQ-affinity directories
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "{{ item.mode }}"
+  loop:
+    - path: /etc/linuxcncsetup
+      mode: "0755"
+    - path: /usr/local/libexec
+      mode: "0755"
+
+- name: Install the boot-time IRQ-affinity helper
+  ansible.builtin.template:
+    src: templates/linuxcncsetup-irq-affinity.py.j2
+    dest: "{{ irq_affinity_helper_path }}"
+    owner: root
+    group: root
+    mode: "0755"
+    backup: true
+    validate: /usr/bin/python3 -m py_compile %s
+  register: irq_affinity_helper_install
+
+- name: Install the declarative IRQ-affinity policy
+  ansible.builtin.template:
+    src: templates/irq-affinity-policy.yml.j2
+    dest: "{{ irq_affinity_config_path }}"
+    owner: root
+    group: root
+    mode: "0644"
+    backup: true
+    validate: /usr/bin/python3 -m json.tool %s
+  register: irq_affinity_policy_install
+
+- name: Install the IRQ-affinity systemd unit
+  ansible.builtin.template:
+    src: templates/linuxcncsetup-irq-affinity.service.j2
+    dest: "{{ irq_affinity_service_path }}"
+    owner: root
+    group: root
+    mode: "0644"
+    backup: true
+  register: irq_affinity_service_install
+
+- name: Remove the stale boot result when installed assets change
+  ansible.builtin.file:
+    path: "{{ irq_affinity_result_path }}"
+    state: absent
+  when: >-
+    irq_affinity_helper_install.changed or
+    irq_affinity_policy_install.changed or
+    irq_affinity_service_install.changed
+
+- name: Validate the installed IRQ-affinity policy with the helper
+  ansible.builtin.command:
+    argv:
+      - "{{ irq_affinity_helper_path }}"
+      - --validate-config
+      - "{{ irq_affinity_config_path }}"
+  changed_when: false
+  check_mode: false
+  when: not ansible_check_mode
+
+- name: Validate the installed systemd unit
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/systemd-analyze
+      - verify
+      - "{{ irq_affinity_service_path }}"
+  changed_when: false
+  check_mode: false
+  when: not ansible_check_mode
+
+- name: Enable IRQ affinity for future boots without starting it
+  ansible.builtin.systemd_service:
+    name: "{{ irq_affinity_service_name }}"
+    enabled: true
+    daemon_reload: true
+  when: not ansible_check_mode
+
+- name: Preview enabling IRQ affinity for future boots
+  ansible.builtin.debug:
+    msg: >-
+      Would enable {{ irq_affinity_service_name }} for future boots without
+      starting it or changing live IRQ affinity.
+  changed_when: true
+  when: ansible_check_mode
