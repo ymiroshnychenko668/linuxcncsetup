@@ -1,0 +1,500 @@
+---
+- name: Select TLS material mode
+  ansible.builtin.set_fact:
+    remoteterminal_tls_mode: "{{ 'supplied' if remoteterminal_supplied_tls | bool else 'generated' }}"
+
+- name: Describe desired generated TLS material
+  ansible.builtin.set_fact:
+    remoteterminal_tls_configuration_descriptor: >-
+      {{ remoteterminal_tls_profile_version ~ '\n' ~
+         remoteterminal_tls_certificate_common_name ~ '\n' ~
+         ansible_facts.hostname ~ '\n' ~
+         (ansible_facts.fqdn | default(ansible_facts.hostname, true)) ~ '\n' ~
+         remoteterminal_listen_address ~ '\n' ~
+         (remoteterminal_generated_tls_days | string) }}
+  when: not (remoteterminal_supplied_tls | bool)
+
+- name: Describe desired supplied TLS material
+  ansible.builtin.set_fact:
+    remoteterminal_tls_configuration_descriptor: >-
+      {{ 'supplied-v1\n' ~
+         remoteterminal_tls_source_stats.results[0].stat.checksum ~ '\n' ~
+         remoteterminal_tls_source_stats.results[1].stat.checksum }}
+  no_log: true
+  when: remoteterminal_supplied_tls | bool
+
+- name: Calculate desired TLS configuration fingerprint
+  ansible.builtin.set_fact:
+    remoteterminal_tls_configuration_fingerprint: >-
+      {{ remoteterminal_tls_configuration_descriptor | hash('sha256') }}
+
+- name: Assemble desired TLS marker
+  ansible.builtin.set_fact:
+    remoteterminal_tls_marker_content: |-
+      marker-version=1
+      mode={{ remoteterminal_tls_mode }}
+      fingerprint={{ remoteterminal_tls_configuration_fingerprint }}
+
+- name: Inspect active TLS link without following it
+  ansible.builtin.stat:
+    path: "{{ remoteterminal_tls_current_dir }}"
+    follow: false
+  register: remoteterminal_tls_current_link
+
+- name: Inspect active TLS files
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: true
+  loop:
+    - "{{ remoteterminal_tls_cert_path }}"
+    - "{{ remoteterminal_tls_key_path }}"
+    - "{{ remoteterminal_tls_marker_path }}"
+  register: remoteterminal_tls_current_files
+
+- name: Determine whether active TLS layout is a controlled complete set
+  ansible.builtin.set_fact:
+    remoteterminal_tls_current_layout_valid: >-
+      {{ remoteterminal_tls_current_link.stat.exists and
+         (remoteterminal_tls_current_link.stat.islnk | default(false)) and
+         (remoteterminal_tls_current_link.stat.lnk_source | default('')).startswith(remoteterminal_tls_sets_dir ~ '/') and
+         remoteterminal_tls_current_files.results[0].stat.exists and
+         (remoteterminal_tls_current_files.results[0].stat.isreg | default(false)) and
+         remoteterminal_tls_current_files.results[1].stat.exists and
+         (remoteterminal_tls_current_files.results[1].stat.isreg | default(false)) and
+         remoteterminal_tls_current_files.results[2].stat.exists and
+         (remoteterminal_tls_current_files.results[2].stat.isreg | default(false)) }}
+
+- name: Read active TLS configuration marker
+  ansible.builtin.slurp:
+    src: "{{ remoteterminal_tls_marker_path }}"
+  register: remoteterminal_tls_current_marker
+  when: remoteterminal_tls_current_layout_valid | bool
+
+- name: Determine whether active TLS marker matches requested configuration
+  ansible.builtin.set_fact:
+    remoteterminal_tls_current_marker_valid: >-
+      {{ remoteterminal_tls_current_layout_valid and
+         (remoteterminal_tls_current_marker.content | default('') | b64decode | trim) ==
+         (remoteterminal_tls_marker_content | trim) }}
+
+- name: Check active TLS certificate validity window
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/openssl
+      - x509
+      - -in
+      - "{{ remoteterminal_tls_cert_path }}"
+      - -noout
+      - -checkend
+      - "{{ remoteterminal_generated_tls_renew_before_seconds | string }}"
+  register: remoteterminal_tls_current_expiry
+  changed_when: false
+  failed_when: false
+  when: remoteterminal_tls_current_marker_valid | bool
+
+- name: Read active TLS certificate public key
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/openssl
+      - x509
+      - -in
+      - "{{ remoteterminal_tls_cert_path }}"
+      - -pubkey
+      - -noout
+  register: remoteterminal_tls_current_certificate_public_key
+  changed_when: false
+  failed_when: false
+  when: remoteterminal_tls_current_marker_valid | bool
+
+- name: Read active TLS private-key public component
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/openssl
+      - pkey
+      - -in
+      - "{{ remoteterminal_tls_key_path }}"
+      - -pubout
+  register: remoteterminal_tls_current_private_public_key
+  changed_when: false
+  failed_when: false
+  no_log: true
+  when: remoteterminal_tls_current_marker_valid | bool
+
+- name: Check active generated certificate host SAN
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/openssl
+      - x509
+      - -in
+      - "{{ remoteterminal_tls_cert_path }}"
+      - -noout
+      - -checkhost
+      - "{{ item }}"
+  loop: "{{ [ansible_facts.hostname, ansible_facts.fqdn | default(ansible_facts.hostname, true)] | unique }}"
+  register: remoteterminal_tls_current_host_sans
+  changed_when: false
+  failed_when: false
+  when:
+    - remoteterminal_tls_current_marker_valid | bool
+    - not (remoteterminal_supplied_tls | bool)
+
+- name: Check active generated certificate IP SAN
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/openssl
+      - x509
+      - -in
+      - "{{ remoteterminal_tls_cert_path }}"
+      - -noout
+      - -checkip
+      - "{{ remoteterminal_listen_address }}"
+  register: remoteterminal_tls_current_ip_san
+  changed_when: false
+  failed_when: false
+  when:
+    - remoteterminal_tls_current_marker_valid | bool
+    - not (remoteterminal_supplied_tls | bool)
+
+- name: Determine whether active TLS material is reusable
+  ansible.builtin.set_fact:
+    remoteterminal_tls_current_valid: >-
+      {{ remoteterminal_tls_current_marker_valid and
+         (remoteterminal_tls_current_expiry.rc | default(1) == 0) and
+         (remoteterminal_tls_current_certificate_public_key.rc | default(1) == 0) and
+         (remoteterminal_tls_current_private_public_key.rc | default(1) == 0) and
+         (remoteterminal_tls_current_certificate_public_key.stdout | default('') ==
+          remoteterminal_tls_current_private_public_key.stdout | default('')) and
+         ((remoteterminal_supplied_tls | bool) or
+          ((remoteterminal_tls_current_host_sans.results | default([]) |
+            selectattr('rc', 'ne', 0) | list | length) == 0 and
+           (remoteterminal_tls_current_ip_san.rc | default(1) == 0))) }}
+  no_log: true
+
+- name: Build and atomically activate a complete TLS set
+  when: not (remoteterminal_tls_current_valid | bool)
+  block:
+    - name: Create private TLS candidate directory
+      ansible.builtin.tempfile:
+        state: directory
+        path: "{{ remoteterminal_tls_sets_dir }}"
+        prefix: "{{ remoteterminal_tls_mode }}-{{ remoteterminal_tls_configuration_fingerprint[0:16] }}-"
+      register: remoteterminal_tls_candidate
+
+    - name: Record TLS candidate paths
+      ansible.builtin.set_fact:
+        remoteterminal_tls_candidate_cert: "{{ remoteterminal_tls_candidate.path }}/server.crt"
+        remoteterminal_tls_candidate_key: "{{ remoteterminal_tls_candidate.path }}/server.key"
+        remoteterminal_tls_candidate_marker: "{{ remoteterminal_tls_candidate.path }}/config.marker"
+
+    - name: Copy supplied TLS certificate into inactive candidate without following final source link
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/dd
+          - if={{ remoteterminal_tls_cert_source }}
+          - of={{ remoteterminal_tls_candidate_cert }}
+          - iflag=nofollow
+          - conv=fsync
+          - status=none
+      changed_when: true
+      when: remoteterminal_supplied_tls | bool
+
+    - name: Copy supplied TLS key into inactive candidate without following final source link
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/dd
+          - if={{ remoteterminal_tls_key_source }}
+          - of={{ remoteterminal_tls_candidate_key }}
+          - iflag=nofollow
+          - conv=fsync
+          - status=none
+      changed_when: true
+      no_log: true
+      when: remoteterminal_supplied_tls | bool
+
+    - name: Generate private key in inactive TLS candidate
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/openssl
+          - genpkey
+          - -algorithm
+          - RSA
+          - -pkeyopt
+          - rsa_keygen_bits:3072
+          - -out
+          - "{{ remoteterminal_tls_candidate_key }}"
+      changed_when: true
+      no_log: true
+      when: not (remoteterminal_supplied_tls | bool)
+
+    - name: Generate self-signed certificate in inactive TLS candidate
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/openssl
+          - req
+          - -new
+          - -x509
+          - -sha256
+          - -days
+          - "{{ remoteterminal_generated_tls_days | string }}"
+          - -key
+          - "{{ remoteterminal_tls_candidate_key }}"
+          - -out
+          - "{{ remoteterminal_tls_candidate_cert }}"
+          - -subj
+          - "/CN={{ remoteterminal_tls_certificate_common_name }}"
+          - -addext
+          - "{{ remoteterminal_tls_subject_alt_name }}"
+      changed_when: true
+      when: not (remoteterminal_supplied_tls | bool)
+
+    - name: Apply inactive TLS candidate permissions
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: "{{ item.state }}"
+        owner: "{{ item.owner }}"
+        group: "{{ item.group }}"
+        mode: "{{ item.mode }}"
+      loop:
+        - { path: "{{ remoteterminal_tls_candidate.path }}", state: directory, owner: root, group: root, mode: "0755" }
+        - { path: "{{ remoteterminal_tls_candidate_cert }}", state: file, owner: root, group: root, mode: "0644" }
+        - { path: "{{ remoteterminal_tls_candidate_key }}", state: file, owner: "{{ remoteterminal_user }}", group: root, mode: "0400" }
+      no_log: true
+
+    - name: Check inactive TLS candidate validity window
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/openssl
+          - x509
+          - -in
+          - "{{ remoteterminal_tls_candidate_cert }}"
+          - -noout
+          - -checkend
+          - "{{ remoteterminal_generated_tls_renew_before_seconds | string }}"
+      register: remoteterminal_tls_candidate_expiry
+      changed_when: false
+      failed_when: false
+
+    - name: Read inactive TLS candidate certificate public key
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/openssl
+          - x509
+          - -in
+          - "{{ remoteterminal_tls_candidate_cert }}"
+          - -pubkey
+          - -noout
+      register: remoteterminal_tls_candidate_certificate_public_key
+      changed_when: false
+      failed_when: false
+
+    - name: Read inactive TLS candidate private-key public component
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/openssl
+          - pkey
+          - -in
+          - "{{ remoteterminal_tls_candidate_key }}"
+          - -pubout
+      register: remoteterminal_tls_candidate_private_public_key
+      changed_when: false
+      failed_when: false
+      no_log: true
+
+    - name: Check inactive TLS candidate private-key integrity
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/openssl
+          - pkey
+          - -in
+          - "{{ remoteterminal_tls_candidate_key }}"
+          - -noout
+          - -check
+      register: remoteterminal_tls_candidate_key_integrity
+      changed_when: false
+      failed_when: false
+      no_log: true
+
+    - name: Check inactive generated certificate host SAN
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/openssl
+          - x509
+          - -in
+          - "{{ remoteterminal_tls_candidate_cert }}"
+          - -noout
+          - -checkhost
+          - "{{ item }}"
+      loop: "{{ [ansible_facts.hostname, ansible_facts.fqdn | default(ansible_facts.hostname, true)] | unique }}"
+      register: remoteterminal_tls_candidate_host_sans
+      changed_when: false
+      failed_when: false
+      when: not (remoteterminal_supplied_tls | bool)
+
+    - name: Check inactive generated certificate IP SAN
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/openssl
+          - x509
+          - -in
+          - "{{ remoteterminal_tls_candidate_cert }}"
+          - -noout
+          - -checkip
+          - "{{ remoteterminal_listen_address }}"
+      register: remoteterminal_tls_candidate_ip_san
+      changed_when: false
+      failed_when: false
+      when: not (remoteterminal_supplied_tls | bool)
+
+    - name: Validate complete inactive TLS candidate before activation
+      ansible.builtin.assert:
+        that:
+          - remoteterminal_tls_candidate_expiry.rc == 0
+          - remoteterminal_tls_candidate_certificate_public_key.rc == 0
+          - remoteterminal_tls_candidate_private_public_key.rc == 0
+          - remoteterminal_tls_candidate_key_integrity.rc == 0
+          - >-
+            remoteterminal_tls_candidate_certificate_public_key.stdout ==
+            remoteterminal_tls_candidate_private_public_key.stdout
+          - >-
+            (remoteterminal_supplied_tls | bool) or
+            (remoteterminal_tls_candidate_host_sans.results |
+             selectattr('rc', 'ne', 0) | list | length == 0)
+          - >-
+            (remoteterminal_supplied_tls | bool) or
+            remoteterminal_tls_candidate_ip_san.rc == 0
+        fail_msg: >-
+          Refusing to activate TLS material because the certificate is invalid
+          or near expiry, the private key does not match, or a generated
+          certificate is missing a configured host/IP SAN.
+      no_log: true
+
+    - name: Complete inactive TLS set with configuration marker
+      ansible.builtin.copy:
+        content: "{{ remoteterminal_tls_marker_content }}\n"
+        dest: "{{ remoteterminal_tls_candidate_marker }}"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Create temporary activation link for complete TLS set
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/ln
+          - -sT
+          - "{{ remoteterminal_tls_candidate.path }}"
+          - "{{ remoteterminal_tls_dir }}/.current-{{ remoteterminal_tls_candidate.path | basename }}"
+      changed_when: true
+
+    - name: Persist service restart requirement before TLS activation
+      ansible.builtin.copy:
+        content: "tls-material-changed\n"
+        dest: "{{ remoteterminal_restart_required_marker }}"
+        owner: root
+        group: root
+        mode: "0600"
+
+    - name: Atomically replace active TLS set link as final candidate operation
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/mv
+          - -Tf
+          - "{{ remoteterminal_tls_dir }}/.current-{{ remoteterminal_tls_candidate.path | basename }}"
+          - "{{ remoteterminal_tls_current_dir }}"
+      changed_when: true
+  rescue:
+    - name: Remove rejected inactive TLS candidate
+      ansible.builtin.file:
+        path: "{{ remoteterminal_tls_candidate.path }}"
+        state: absent
+      when: remoteterminal_tls_candidate.path | default('') | length > 0
+
+    - name: Remove rejected temporary TLS activation link
+      ansible.builtin.file:
+        path: >-
+          {{ remoteterminal_tls_dir }}/.current-{{ remoteterminal_tls_candidate.path | default('') | basename }}
+        state: absent
+      when: remoteterminal_tls_candidate.path | default('') | length > 0
+
+    - name: Abort after TLS candidate validation failure
+      ansible.builtin.fail:
+        msg: >-
+          TLS installation failed before activation. The prior active
+          certificate/key pair, if any, was left unchanged.
+
+- name: Validate active TLS certificate after atomic activation
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/openssl
+      - x509
+      - -in
+      - "{{ remoteterminal_tls_cert_path }}"
+      - -noout
+      - -checkend
+      - "{{ remoteterminal_generated_tls_renew_before_seconds | string }}"
+  changed_when: false
+
+- name: Validate active TLS private key after atomic activation
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/openssl
+      - pkey
+      - -in
+      - "{{ remoteterminal_tls_key_path }}"
+      - -noout
+      - -check
+  changed_when: false
+  no_log: true
+
+- name: Enforce active TLS set directory confidentiality boundary
+  ansible.builtin.file:
+    path: >-
+      {{ remoteterminal_tls_candidate.path
+         if not (remoteterminal_tls_current_valid | bool)
+         else remoteterminal_tls_current_link.stat.lnk_source }}
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+    follow: false
+
+- name: Enforce active TLS certificate ownership and permissions
+  ansible.builtin.file:
+    path: "{{ remoteterminal_tls_cert_path }}"
+    state: file
+    owner: root
+    group: root
+    mode: "0644"
+    follow: true
+
+- name: Enforce active TLS key ownership and permissions
+  ansible.builtin.file:
+    path: "{{ remoteterminal_tls_key_path }}"
+    state: file
+    owner: "{{ remoteterminal_user }}"
+    group: root
+    mode: "0400"
+    follow: true
+  no_log: true
+
+- name: Enforce active TLS marker ownership and permissions
+  ansible.builtin.file:
+    path: "{{ remoteterminal_tls_marker_path }}"
+    state: file
+    owner: root
+    group: root
+    mode: "0644"
+    follow: true
+
+- name: Verify service account can read active TLS material
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/test
+      - -r
+      - "{{ item }}"
+  loop:
+    - "{{ remoteterminal_tls_cert_path }}"
+    - "{{ remoteterminal_tls_key_path }}"
+  become: true
+  become_user: "{{ remoteterminal_user }}"
+  changed_when: false
+  when: not (remoteterminal_tls_skip_service_user_read_test | default(false) | bool)

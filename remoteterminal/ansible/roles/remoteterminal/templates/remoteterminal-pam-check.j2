@@ -1,0 +1,25 @@
+#!/bin/sh
+# Managed by Ansible. This fixed-argument helper deliberately reads the system
+# password only through pamtester's terminal conversation. It never accepts a
+# password in arguments, environment variables, or files.
+set -eu
+
+if [ "$(id -u)" -ne 0 ]; then
+    echo "Run this verifier through sudo from a trusted local terminal." >&2
+    exit 1
+fi
+
+/usr/sbin/runuser --user {{ remoteterminal_user }} -- \
+    /usr/bin/pamtester {{ remoteterminal_pam_service }} \
+    {{ remoteterminal_user }} authenticate acct_mgmt
+
+umask 077
+marker_tmp="$(mktemp '{{ remoteterminal_config_dir }}/.pam-authentication.XXXXXX')"
+trap 'rm -f -- "$marker_tmp"' EXIT HUP INT TERM
+printf '%s\n' '{{ remoteterminal_pam_probe_fingerprint }}' >"$marker_tmp"
+chown root:root "$marker_tmp"
+chmod 0600 "$marker_tmp"
+mv -f -- "$marker_tmp" '{{ remoteterminal_pam_verification_marker }}'
+trap - EXIT HUP INT TERM
+
+echo "Remote Terminal PAM authentication and account checks passed."

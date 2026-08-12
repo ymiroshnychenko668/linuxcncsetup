@@ -1,0 +1,486 @@
+---
+- name: Calculate pinned ttyd build identity
+  ansible.builtin.set_fact:
+    remoteterminal_ttyd_build_fingerprint: >-
+      {{ (remoteterminal_ttyd_version ~ '\n' ~
+          remoteterminal_ttyd_commit ~ '\n' ~
+          remoteterminal_ttyd_archive_checksum ~ '\n' ~
+          remoteterminal_build_tool_package_versions) | hash('sha256') }}
+
+- name: Record content-addressed ttyd paths
+  ansible.builtin.set_fact:
+    remoteterminal_ttyd_tool_dir: >-
+      {{ remoteterminal_install_root }}/tools/ttyd-{{ remoteterminal_ttyd_version }}-{{
+         remoteterminal_ttyd_commit[0:12] }}-{{ remoteterminal_ttyd_build_fingerprint[0:12] }}
+    remoteterminal_ttyd_completion_prefix: >-
+      build={{ remoteterminal_ttyd_build_fingerprint }}
+
+- name: Inspect root-owned ttyd tool hierarchy without following links
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+  loop:
+    - "{{ remoteterminal_install_root }}"
+    - "{{ remoteterminal_install_root }}/tools"
+    - "{{ remoteterminal_ttyd_tool_dir }}"
+  register: remoteterminal_ttyd_tool_path_stats
+
+- name: Reject unsafe ttyd tool hierarchy
+  ansible.builtin.assert:
+    that:
+      - >-
+        not item.stat.exists or
+        (item.stat.isdir and not (item.stat.islnk | default(false)) and
+         item.stat.uid | int == 0 and
+         item.stat.mode is match('^0?[0-7][0145][0145]$'))
+    fail_msg: >-
+      Refusing the ttyd install because {{ item.item }} is not absent or a
+      root-owned, non-symlink, non-writable-by-group/other directory.
+  loop: "{{ remoteterminal_ttyd_tool_path_stats.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Create root-owned ttyd tool parent
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  loop:
+    - "{{ remoteterminal_install_root }}"
+    - "{{ remoteterminal_install_root }}/tools"
+
+- name: Find stale inactive ttyd candidates in validated tool parent
+  ansible.builtin.find:
+    paths: "{{ remoteterminal_install_root }}/tools"
+    patterns: ".ttyd-*"
+    file_type: any
+    recurse: false
+    hidden: true
+  register: remoteterminal_ttyd_stale_candidates
+
+- name: Reject unsafe stale ttyd candidate entries
+  ansible.builtin.assert:
+    that:
+      - (item.path | dirname) == (remoteterminal_install_root ~ '/tools')
+      - (item.path | basename) is match('^\\.ttyd-[0-9a-f]{12}-[A-Za-z0-9_.-]+$')
+      - item.isdir
+      - not (item.islnk | default(false))
+      - item.uid | int == 0
+      - item.mode is match('^0?[0-7][0145][0145]$')
+    fail_msg: >-
+      Refusing to prune an unexpected inactive ttyd candidate entry:
+      {{ item.path }}
+  loop: "{{ remoteterminal_ttyd_stale_candidates.files }}"
+  loop_control:
+    label: "{{ item.path }}"
+
+- name: Remove stale inactive ttyd candidates after validation
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: absent
+  loop: "{{ remoteterminal_ttyd_stale_candidates.files }}"
+  loop_control:
+    label: "{{ item.path }}"
+
+- name: Inspect installed ttyd completion artifacts without following links
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+    checksum_algorithm: sha256
+  loop:
+    - "{{ remoteterminal_ttyd_tool_dir }}"
+    - "{{ remoteterminal_ttyd_tool_dir }}/bin"
+    - "{{ remoteterminal_ttyd_tool_dir }}/bin/ttyd"
+    - "{{ remoteterminal_ttyd_tool_dir }}/.complete"
+  register: remoteterminal_ttyd_installed_artifacts
+
+- name: Read installed ttyd completion marker
+  ansible.builtin.slurp:
+    src: "{{ remoteterminal_ttyd_tool_dir }}/.complete"
+  register: remoteterminal_ttyd_installed_marker
+  when:
+    - remoteterminal_ttyd_installed_artifacts.results[3].stat.exists
+    - remoteterminal_ttyd_installed_artifacts.results[3].stat.isreg | default(false)
+    - not (remoteterminal_ttyd_installed_artifacts.results[3].stat.islnk | default(false))
+    - remoteterminal_ttyd_installed_artifacts.results[3].stat.uid | int == 0
+
+- name: Probe installed ttyd version as selected account
+  ansible.builtin.command:
+    argv:
+      - "{{ remoteterminal_ttyd_tool_dir }}/bin/ttyd"
+      - --version
+  register: remoteterminal_ttyd_installed_version_probe
+  changed_when: false
+  failed_when: false
+  become: true
+  become_user: "{{ remoteterminal_user }}"
+  when:
+    - remoteterminal_ttyd_installed_artifacts.results[2].stat.exists
+    - remoteterminal_ttyd_installed_artifacts.results[2].stat.isreg | default(false)
+    - not (remoteterminal_ttyd_installed_artifacts.results[2].stat.islnk | default(false))
+    - remoteterminal_ttyd_installed_artifacts.results[2].stat.uid | int == 0
+
+- name: Probe installed ttyd library resolution as selected account
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/ldd
+      - "{{ remoteterminal_ttyd_tool_dir }}/bin/ttyd"
+  register: remoteterminal_ttyd_installed_ldd_probe
+  changed_when: false
+  failed_when: false
+  become: true
+  become_user: "{{ remoteterminal_user }}"
+  when:
+    - remoteterminal_ttyd_installed_artifacts.results[2].stat.exists
+    - remoteterminal_ttyd_installed_artifacts.results[2].stat.isreg | default(false)
+    - not (remoteterminal_ttyd_installed_artifacts.results[2].stat.islnk | default(false))
+    - remoteterminal_ttyd_installed_artifacts.results[2].stat.uid | int == 0
+
+- name: Determine whether installed ttyd is complete and reusable
+  ansible.builtin.set_fact:
+    remoteterminal_ttyd_installed_valid: >-
+      {{ remoteterminal_ttyd_installed_artifacts.results[0].stat.exists and
+         (remoteterminal_ttyd_installed_artifacts.results[0].stat.isdir | default(false)) and
+         not (remoteterminal_ttyd_installed_artifacts.results[0].stat.islnk | default(false)) and
+         remoteterminal_ttyd_installed_artifacts.results[0].stat.uid | int == 0 and
+         remoteterminal_ttyd_installed_artifacts.results[0].stat.gid | int == 0 and
+         remoteterminal_ttyd_installed_artifacts.results[0].stat.mode == '0755' and
+         remoteterminal_ttyd_installed_artifacts.results[1].stat.exists and
+         (remoteterminal_ttyd_installed_artifacts.results[1].stat.isdir | default(false)) and
+         not (remoteterminal_ttyd_installed_artifacts.results[1].stat.islnk | default(false)) and
+         remoteterminal_ttyd_installed_artifacts.results[1].stat.uid | int == 0 and
+         remoteterminal_ttyd_installed_artifacts.results[1].stat.gid | int == 0 and
+         remoteterminal_ttyd_installed_artifacts.results[1].stat.mode == '0755' and
+         remoteterminal_ttyd_installed_artifacts.results[2].stat.exists and
+         (remoteterminal_ttyd_installed_artifacts.results[2].stat.isreg | default(false)) and
+         not (remoteterminal_ttyd_installed_artifacts.results[2].stat.islnk | default(false)) and
+         remoteterminal_ttyd_installed_artifacts.results[2].stat.uid | int == 0 and
+         remoteterminal_ttyd_installed_artifacts.results[2].stat.gid | int == 0 and
+         remoteterminal_ttyd_installed_artifacts.results[2].stat.mode == '0755' and
+         (remoteterminal_ttyd_installed_artifacts.results[2].stat.executable | default(false)) and
+         (remoteterminal_ttyd_installed_artifacts.results[2].stat.checksum | default('') | length) == 64 and
+         remoteterminal_ttyd_installed_artifacts.results[3].stat.exists and
+         (remoteterminal_ttyd_installed_artifacts.results[3].stat.isreg | default(false)) and
+         not (remoteterminal_ttyd_installed_artifacts.results[3].stat.islnk | default(false)) and
+         remoteterminal_ttyd_installed_artifacts.results[3].stat.uid | int == 0 and
+         remoteterminal_ttyd_installed_artifacts.results[3].stat.gid | int == 0 and
+         remoteterminal_ttyd_installed_artifacts.results[3].stat.mode == '0644' and
+         (remoteterminal_ttyd_installed_marker.content | default('') | b64decode | trim) ==
+         (remoteterminal_ttyd_completion_prefix ~ '\nsha256=' ~
+          (remoteterminal_ttyd_installed_artifacts.results[2].stat.checksum | default(''))) and
+         (remoteterminal_ttyd_installed_version_probe.rc | default(1)) == 0 and
+         remoteterminal_ttyd_version in
+         ((remoteterminal_ttyd_installed_version_probe.stdout | default('')) ~
+          (remoteterminal_ttyd_installed_version_probe.stderr | default(''))) and
+         (remoteterminal_ttyd_installed_ldd_probe.rc | default(1)) == 0 and
+         'not found' not in (remoteterminal_ttyd_installed_ldd_probe.stdout | default('')) }}
+
+- name: Rebuild and atomically install pinned ttyd
+  when: not (remoteterminal_ttyd_installed_valid | bool)
+  block:
+    - name: Inspect delegated ttyd build directories without following links
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        follow: false
+      loop:
+        - "{{ remoteterminal_build_root }}/downloads"
+        - "{{ remoteterminal_build_root }}/ttyd-{{ remoteterminal_ttyd_commit }}"
+        - "{{ remoteterminal_build_root }}/ttyd-{{ remoteterminal_ttyd_commit }}-build"
+      register: remoteterminal_ttyd_build_path_stats
+
+    - name: Reject unsafe delegated ttyd build directories
+      ansible.builtin.assert:
+        that:
+          - >-
+            not item.stat.exists or
+            (item.stat.isdir and not (item.stat.islnk | default(false)) and
+             item.stat.uid | int == remoteterminal_selected_uid | int)
+        fail_msg: >-
+          Refusing the ttyd build because delegated path {{ item.item }} is not
+          absent or a real directory owned by the selected build account.
+      loop: "{{ remoteterminal_ttyd_build_path_stats.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: Remove stale delegated ttyd source and build trees
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "{{ remoteterminal_build_root }}/ttyd-{{ remoteterminal_ttyd_commit }}"
+        - "{{ remoteterminal_build_root }}/ttyd-{{ remoteterminal_ttyd_commit }}-build"
+
+    - name: Create clean user-owned ttyd build directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ remoteterminal_user }}"
+        group: "{{ remoteterminal_selected_group }}"
+        mode: "0750"
+      loop:
+        - "{{ remoteterminal_build_root }}/downloads"
+        - "{{ remoteterminal_build_root }}/ttyd-{{ remoteterminal_ttyd_commit }}"
+        - "{{ remoteterminal_build_root }}/ttyd-{{ remoteterminal_ttyd_commit }}-build"
+
+    - name: Download checksum-pinned ttyd source archive
+      ansible.builtin.get_url:
+        url: "{{ remoteterminal_ttyd_archive_url }}"
+        dest: "{{ remoteterminal_build_root }}/downloads/ttyd-{{ remoteterminal_ttyd_commit }}.tar.gz"
+        checksum: "{{ remoteterminal_ttyd_archive_checksum }}"
+        owner: "{{ remoteterminal_user }}"
+        group: "{{ remoteterminal_selected_group }}"
+        mode: "0640"
+        timeout: 60
+      become: true
+      become_user: "{{ remoteterminal_user }}"
+
+    - name: Extract verified ttyd source archive
+      ansible.builtin.unarchive:
+        src: "{{ remoteterminal_build_root }}/downloads/ttyd-{{ remoteterminal_ttyd_commit }}.tar.gz"
+        dest: "{{ remoteterminal_build_root }}/ttyd-{{ remoteterminal_ttyd_commit }}"
+        remote_src: true
+        extra_opts:
+          - --strip-components=1
+      become: true
+      become_user: "{{ remoteterminal_user }}"
+
+    - name: Read verified ttyd build manifest
+      ansible.builtin.slurp:
+        src: "{{ remoteterminal_build_root }}/ttyd-{{ remoteterminal_ttyd_commit }}/CMakeLists.txt"
+      register: remoteterminal_ttyd_cmake_manifest
+      become: true
+      become_user: "{{ remoteterminal_user }}"
+
+    - name: Verify extracted ttyd version declaration
+      ansible.builtin.assert:
+        that:
+          - >-
+            ('project(ttyd VERSION ' ~ remoteterminal_ttyd_version) in
+            (remoteterminal_ttyd_cmake_manifest.content | b64decode)
+        fail_msg: >-
+          The checksum-verified archive does not declare the expected ttyd
+          version {{ remoteterminal_ttyd_version }}.
+
+    - name: Configure pinned ttyd build
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/cmake
+          - -S
+          - "{{ remoteterminal_build_root }}/ttyd-{{ remoteterminal_ttyd_commit }}"
+          - -B
+          - "{{ remoteterminal_build_root }}/ttyd-{{ remoteterminal_ttyd_commit }}-build"
+          - -DCMAKE_BUILD_TYPE=Release
+      become: true
+      become_user: "{{ remoteterminal_user }}"
+      environment:
+        HOME: "{{ remoteterminal_selected_home }}"
+      changed_when: true
+
+    - name: Compile pinned ttyd source from a clean target
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/cmake
+          - --build
+          - "{{ remoteterminal_build_root }}/ttyd-{{ remoteterminal_ttyd_commit }}-build"
+          - --clean-first
+          - --parallel
+          - "{{ remoteterminal_build_jobs | string }}"
+      become: true
+      become_user: "{{ remoteterminal_user }}"
+      environment:
+        HOME: "{{ remoteterminal_selected_home }}"
+      changed_when: true
+
+    - name: Inspect compiled ttyd binary without following links
+      ansible.builtin.stat:
+        path: "{{ remoteterminal_build_root }}/ttyd-{{ remoteterminal_ttyd_commit }}-build/ttyd"
+        follow: false
+      register: remoteterminal_ttyd_build_result
+      become: true
+      become_user: "{{ remoteterminal_user }}"
+
+    - name: Verify compiled ttyd binary is a safe regular file
+      ansible.builtin.assert:
+        that:
+          - remoteterminal_ttyd_build_result.stat.exists
+          - remoteterminal_ttyd_build_result.stat.isreg
+          - not (remoteterminal_ttyd_build_result.stat.islnk | default(false))
+          - remoteterminal_ttyd_build_result.stat.uid | int == remoteterminal_selected_uid | int
+          - remoteterminal_ttyd_build_result.stat.size | int > 0
+        fail_msg: "The ttyd source build did not produce a safe regular binary."
+
+    - name: Create inactive ttyd tool candidate
+      ansible.builtin.tempfile:
+        state: directory
+        path: "{{ remoteterminal_install_root }}/tools"
+        prefix: ".ttyd-{{ remoteterminal_ttyd_build_fingerprint[0:12] }}-"
+      register: remoteterminal_ttyd_candidate
+
+    - name: Create inactive ttyd candidate binary directory
+      ansible.builtin.file:
+        path: "{{ remoteterminal_ttyd_candidate.path }}/bin"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Copy compiled ttyd into inactive candidate without following final source link
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/dd
+          - if={{ remoteterminal_build_root }}/ttyd-{{ remoteterminal_ttyd_commit }}-build/ttyd
+          - of={{ remoteterminal_ttyd_candidate.path }}/bin/ttyd
+          - iflag=nofollow
+          - conv=fsync
+          - status=none
+      changed_when: true
+
+    - name: Apply inactive ttyd candidate permissions
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: "{{ item.state }}"
+        owner: root
+        group: root
+        mode: "{{ item.mode }}"
+      loop:
+        - { path: "{{ remoteterminal_ttyd_candidate.path }}", state: directory, mode: "0755" }
+        - { path: "{{ remoteterminal_ttyd_candidate.path }}/bin", state: directory, mode: "0755" }
+        - { path: "{{ remoteterminal_ttyd_candidate.path }}/bin/ttyd", state: file, mode: "0755" }
+
+    - name: Hash inactive ttyd candidate without following links
+      ansible.builtin.stat:
+        path: "{{ remoteterminal_ttyd_candidate.path }}/bin/ttyd"
+        follow: false
+        checksum_algorithm: sha256
+      register: remoteterminal_ttyd_candidate_binary
+
+    - name: Read inactive ttyd candidate version as selected account
+      ansible.builtin.command:
+        argv:
+          - "{{ remoteterminal_ttyd_candidate.path }}/bin/ttyd"
+          - --version
+      register: remoteterminal_ttyd_candidate_version
+      changed_when: false
+      become: true
+      become_user: "{{ remoteterminal_user }}"
+
+    - name: Inspect inactive ttyd candidate library resolution as selected account
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/ldd
+          - "{{ remoteterminal_ttyd_candidate.path }}/bin/ttyd"
+      register: remoteterminal_ttyd_candidate_ldd
+      changed_when: false
+      become: true
+      become_user: "{{ remoteterminal_user }}"
+
+    - name: Validate inactive ttyd candidate before promotion
+      ansible.builtin.assert:
+        that:
+          - remoteterminal_ttyd_candidate_binary.stat.isreg
+          - not (remoteterminal_ttyd_candidate_binary.stat.islnk | default(false))
+          - remoteterminal_ttyd_candidate_binary.stat.uid | int == 0
+          - remoteterminal_ttyd_candidate_binary.stat.gid | int == 0
+          - remoteterminal_ttyd_candidate_binary.stat.mode == '0755'
+          - (remoteterminal_ttyd_candidate_binary.stat.checksum | default('') | length) == 64
+          - >-
+            remoteterminal_ttyd_version in
+            (remoteterminal_ttyd_candidate_version.stdout ~
+             remoteterminal_ttyd_candidate_version.stderr)
+          - "'not found' not in remoteterminal_ttyd_candidate_ldd.stdout"
+        fail_msg: >-
+          Refusing to install ttyd because the inactive candidate reports the
+          wrong version or has unresolved shared-library dependencies.
+
+    - name: Complete inactive ttyd candidate with build fingerprint
+      ansible.builtin.copy:
+        content: |
+          {{ remoteterminal_ttyd_completion_prefix }}
+          sha256={{ remoteterminal_ttyd_candidate_binary.stat.checksum }}
+        dest: "{{ remoteterminal_ttyd_candidate.path }}/.complete"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Atomically exchange complete candidate with existing ttyd tool
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/python3
+          - -c
+          - |
+            import ctypes
+            import os
+            import sys
+
+            libc = ctypes.CDLL(None, use_errno=True)
+            if libc.renameat2(-100, os.fsencode(sys.argv[1]), -100, os.fsencode(sys.argv[2]), 2) != 0:
+                error_number = ctypes.get_errno()
+                raise OSError(error_number, os.strerror(error_number))
+          - "{{ remoteterminal_ttyd_candidate.path }}"
+          - "{{ remoteterminal_ttyd_tool_dir }}"
+      changed_when: true
+      when: remoteterminal_ttyd_installed_artifacts.results[0].stat.exists
+
+    - name: Atomically promote complete ttyd candidate into an empty slot
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/mv
+          - -T
+          - "{{ remoteterminal_ttyd_candidate.path }}"
+          - "{{ remoteterminal_ttyd_tool_dir }}"
+      changed_when: true
+      when: not remoteterminal_ttyd_installed_artifacts.results[0].stat.exists
+  rescue:
+    - name: Remove rejected inactive ttyd candidate
+      ansible.builtin.file:
+        path: "{{ remoteterminal_ttyd_candidate.path }}"
+        state: absent
+      when: remoteterminal_ttyd_candidate.path | default('') | length > 0
+
+    - name: Abort after ttyd build or candidate validation failure
+      ansible.builtin.fail:
+        msg: >-
+          The pinned ttyd build or its inactive candidate validation failed.
+          No incomplete ttyd tool was activated.
+
+- name: Remove displaced invalid ttyd tool after successful exchange
+  ansible.builtin.file:
+    path: "{{ remoteterminal_ttyd_candidate.path }}"
+    state: absent
+  when:
+    - not (remoteterminal_ttyd_installed_valid | bool)
+    - remoteterminal_ttyd_installed_artifacts.results[0].stat.exists
+    - remoteterminal_ttyd_candidate.path | default('') | length > 0
+
+- name: Verify final ttyd version as selected account
+  ansible.builtin.command:
+    argv:
+      - "{{ remoteterminal_ttyd_tool_dir }}/bin/ttyd"
+      - --version
+  register: remoteterminal_ttyd_version_result
+  changed_when: false
+  become: true
+  become_user: "{{ remoteterminal_user }}"
+
+- name: Verify final ttyd runtime libraries as selected account
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/ldd
+      - "{{ remoteterminal_ttyd_tool_dir }}/bin/ttyd"
+  register: remoteterminal_ttyd_ldd_result
+  changed_when: false
+  become: true
+  become_user: "{{ remoteterminal_user }}"
+
+- name: Assert final ttyd version and library resolution
+  ansible.builtin.assert:
+    that:
+      - >-
+        remoteterminal_ttyd_version in
+        (remoteterminal_ttyd_version_result.stdout ~ remoteterminal_ttyd_version_result.stderr)
+      - "'not found' not in remoteterminal_ttyd_ldd_result.stdout"
+    fail_msg: >-
+      The atomically installed ttyd tool is the wrong version or has
+      unresolved shared-library dependencies.

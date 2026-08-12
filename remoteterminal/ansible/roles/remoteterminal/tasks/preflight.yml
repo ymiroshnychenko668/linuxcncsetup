@@ -1,0 +1,271 @@
+---
+- name: Verify supported operating system and privilege context
+  ansible.builtin.assert:
+    that:
+      - ansible_facts.distribution == 'Debian'
+      - ansible_facts.architecture in ['x86_64', 'amd64']
+      - ansible_facts.service_mgr == 'systemd'
+      - ansible_facts.user_id == 'root'
+    fail_msg: >-
+      Remote Terminal installation requires an AMD64 Debian system,
+      systemd, and root privilege through Ansible become.
+
+- name: Validate required installer variables
+  ansible.builtin.assert:
+    that:
+      - remoteterminal_user | length > 0
+      - remoteterminal_user is match('^[a-z_][a-z0-9_-]*[$]?$')
+      - remoteterminal_machine_name | length > 0
+      - remoteterminal_machine_name | length <= 64
+      - remoteterminal_machine_name is match('^[A-Za-z0-9][A-Za-z0-9 ._-]*$')
+      - remoteterminal_listen_address | length > 0
+      - remoteterminal_listen_address is match('^[0-9]{1,3}(\.[0-9]{1,3}){3}$')
+      - remoteterminal_listen_address not in ['0.0.0.0', '127.0.0.1']
+      - remoteterminal_port | int >= 1024
+      - remoteterminal_port | int <= 65535
+      - remoteterminal_max_sessions | int >= 1
+      - remoteterminal_max_sessions | int <= 64
+      - remoteterminal_source_dir is match('^/')
+      - remoteterminal_build_root == '/var/lib/remoteterminal-build'
+      - remoteterminal_install_root == '/opt/remoteterminal'
+      - remoteterminal_config_dir == '/etc/remoteterminal'
+      - remoteterminal_pam_policy_path == '/etc/pam.d/remoteterminal'
+      - remoteterminal_pam_check_path == '/usr/local/sbin/remoteterminal-pam-check'
+      - remoteterminal_systemd_unit_path == '/etc/systemd/system/remoteterminal.service'
+      - remoteterminal_deployment_applied_marker == '/etc/remoteterminal/deployment.applied'
+      - remoteterminal_service_name == 'remoteterminal'
+      - remoteterminal_runtime_directory_name == 'remoteterminal'
+      - remoteterminal_state_directory_name == 'remoteterminal'
+      - remoteterminal_build_jobs | int >= 1
+      - remoteterminal_generated_tls_days | int >= 1
+      - remoteterminal_generated_tls_renew_before_seconds | int >= 86400
+      - >-
+        remoteterminal_generated_tls_days | int * 86400 >
+        remoteterminal_generated_tls_renew_before_seconds | int + 86400
+      - remoteterminal_tls_certificate_common_name is match('^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$')
+      - (remoteterminal_tls_cert_source | length > 0) == (remoteterminal_tls_key_source | length > 0)
+      - remoteterminal_pam_service is match('^[A-Za-z0-9_.-]+$')
+      - remoteterminal_pam_auth_include is match('^[A-Za-z0-9_.-]+$')
+      - remoteterminal_pam_account_include is match('^[A-Za-z0-9_.-]+$')
+      - remoteterminal_pam_policy_version is match('^[A-Za-z0-9_.-]+$')
+      - remoteterminal_idle_timeout | length == 0 or remoteterminal_idle_timeout is match('^([0-9]+(ns|us|µs|ms|s|m|h))+$')
+      - remoteterminal_absolute_timeout | length == 0 or remoteterminal_absolute_timeout is match('^([0-9]+(ns|us|µs|ms|s|m|h))+$')
+    fail_msg: >-
+      Supply a non-root target user, a valid machine display name, and a
+      specific non-loopback LAN IPv4 address. Port, session-limit, source-path,
+      TLS-pair, or build settings are invalid. Certificate and key source paths
+      must be supplied together.
+
+- name: Split configured listen address into octets
+  ansible.builtin.set_fact:
+    remoteterminal_listen_address_octets: "{{ remoteterminal_listen_address.split('.') | map('int') | list }}"
+
+- name: Validate configured IPv4 octets
+  ansible.builtin.assert:
+    that:
+      - remoteterminal_listen_address_octets | length == 4
+      - remoteterminal_listen_address_octets | min >= 0
+      - remoteterminal_listen_address_octets | max <= 255
+      - remoteterminal_listen_address_octets[0] != 127
+      - remoteterminal_listen_address_octets[0] >= 1
+      - remoteterminal_listen_address_octets[0] <= 223
+      - remoteterminal_listen_address_octets[-1] not in [0, 255]
+    fail_msg: "remoteterminal_listen_address must be a valid non-loopback IPv4 address."
+
+- name: Inspect source-build parent and root without following links
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+  loop:
+    - "{{ remoteterminal_build_root | dirname }}"
+    - "{{ remoteterminal_build_root }}"
+  register: remoteterminal_build_path_stats
+
+- name: Reject unsafe source-build hierarchy
+  ansible.builtin.assert:
+    that:
+      - remoteterminal_build_path_stats.results[0].stat.exists
+      - remoteterminal_build_path_stats.results[0].stat.isdir
+      - not (remoteterminal_build_path_stats.results[0].stat.islnk | default(false))
+      - remoteterminal_build_path_stats.results[0].stat.uid | int == 0
+      - remoteterminal_build_path_stats.results[0].stat.mode is match('^0?[0-7][0145][0145]$')
+      - >-
+        not remoteterminal_build_path_stats.results[1].stat.exists or
+        (remoteterminal_build_path_stats.results[1].stat.isdir and
+         not (remoteterminal_build_path_stats.results[1].stat.islnk | default(false)) and
+         remoteterminal_build_path_stats.results[1].stat.uid | int == 0 and
+         remoteterminal_build_path_stats.results[1].stat.mode is match('^0?[0-7][0145][0145]$'))
+    fail_msg: >-
+      Refusing the source-build path because its parent must be a root-owned,
+      non-symlink directory without group/other write access, and an existing
+      build root must meet the same constraints.
+
+- name: Inspect early root-owned deployment roots without following links
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+  loop:
+    - "{{ remoteterminal_install_root }}"
+    - "{{ remoteterminal_config_dir }}"
+  register: remoteterminal_early_deployment_roots
+
+- name: Reject unsafe early deployment roots
+  ansible.builtin.assert:
+    that:
+      - >-
+        not item.stat.exists or
+        (item.stat.isdir and not (item.stat.islnk | default(false)) and
+         item.stat.uid | int == 0 and
+         item.stat.mode is match('^0?[0-7][0145][0145]$'))
+    fail_msg: >-
+      Refusing installation because {{ item.item }} is not absent or a
+      root-owned, non-symlink, non-writable-by-group/other directory.
+  loop: "{{ remoteterminal_early_deployment_roots.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Verify listen address belongs to this host
+  ansible.builtin.assert:
+    that:
+      - remoteterminal_listen_address in (ansible_facts.all_ipv4_addresses | default([]))
+    fail_msg: >-
+      {{ remoteterminal_listen_address }} is not one of the IPv4 addresses
+      reported for this host ({{ ansible_facts.all_ipv4_addresses | default([]) | join(', ') }}).
+      Set remoteterminal_validate_listen_address_is_local=false only when the
+      address is configured outside normal interface discovery.
+  when: remoteterminal_validate_listen_address_is_local | bool
+
+- name: Look up selected system account
+  ansible.builtin.getent:
+    database: passwd
+    key: "{{ remoteterminal_user }}"
+    fail_key: false
+
+- name: Verify selected system account exists
+  ansible.builtin.assert:
+    that:
+      - remoteterminal_user in (ansible_facts.getent_passwd | default({}))
+    fail_msg: "The selected system account '{{ remoteterminal_user }}' does not exist."
+
+- name: Record selected account fields
+  ansible.builtin.set_fact:
+    remoteterminal_selected_uid: "{{ ansible_facts.getent_passwd[remoteterminal_user][1] | int }}"
+    remoteterminal_selected_gid: "{{ ansible_facts.getent_passwd[remoteterminal_user][2] | int }}"
+    remoteterminal_selected_home: "{{ ansible_facts.getent_passwd[remoteterminal_user][4] }}"
+    remoteterminal_selected_shell: "{{ ansible_facts.getent_passwd[remoteterminal_user][5] }}"
+
+- name: Resolve selected account primary group
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/id
+      - -gn
+      - "{{ remoteterminal_user }}"
+  register: remoteterminal_primary_group_result
+  changed_when: false
+  check_mode: false
+
+- name: Record selected account and deployment paths
+  ansible.builtin.set_fact:
+    remoteterminal_selected_group: "{{ remoteterminal_primary_group_result.stdout | trim }}"
+    remoteterminal_runtime_dir: "/run/{{ remoteterminal_runtime_directory_name }}"
+    remoteterminal_state_dir: "/var/lib/{{ remoteterminal_state_directory_name }}"
+    remoteterminal_tls_dir: "{{ remoteterminal_config_dir }}/tls"
+    remoteterminal_tls_sets_dir: "{{ remoteterminal_config_dir }}/tls/sets"
+    remoteterminal_tls_current_dir: "{{ remoteterminal_config_dir }}/tls/current"
+    remoteterminal_tls_cert_path: "{{ remoteterminal_config_dir }}/tls/current/server.crt"
+    remoteterminal_tls_key_path: "{{ remoteterminal_config_dir }}/tls/current/server.key"
+    remoteterminal_tls_marker_path: "{{ remoteterminal_config_dir }}/tls/current/config.marker"
+    remoteterminal_tls_subject_alt_name: >-
+      {{ 'subjectAltName=DNS:' ~ ansible_facts.hostname ~
+         ',DNS:' ~ (ansible_facts.fqdn | default(ansible_facts.hostname, true)) ~
+         ',IP:' ~ remoteterminal_listen_address }}
+    remoteterminal_ttyd_tool_dir: >-
+      {{ remoteterminal_install_root }}/tools/ttyd-{{ remoteterminal_ttyd_version }}-{{ remoteterminal_ttyd_commit[0:12] }}
+    remoteterminal_supplied_tls: "{{ remoteterminal_tls_cert_source | length > 0 }}"
+
+- name: Verify target account is non-root and interactive
+  ansible.builtin.assert:
+    that:
+      - remoteterminal_selected_uid | int != 0
+      - remoteterminal_selected_home is match('^/[A-Za-z0-9_.+/@-]+$')
+      - remoteterminal_selected_shell not in ['/usr/sbin/nologin', '/sbin/nologin', '/bin/false', '/usr/bin/false']
+      - remoteterminal_selected_group | length > 0
+      - remoteterminal_selected_group is match('^[a-z_][a-z0-9_-]*[$]?$')
+    fail_msg: >-
+      The service must run as a non-root account with a safe absolute home path,
+      an interactive shell, and a resolvable primary group.
+
+- name: Inspect selected account home and shell
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop:
+    - "{{ remoteterminal_selected_home }}"
+    - "{{ remoteterminal_selected_shell }}"
+  register: remoteterminal_account_path_stats
+
+- name: Verify selected account home and shell are usable
+  ansible.builtin.assert:
+    that:
+      - remoteterminal_account_path_stats.results[0].stat.exists
+      - remoteterminal_account_path_stats.results[0].stat.isdir
+      - remoteterminal_account_path_stats.results[1].stat.exists
+      - remoteterminal_account_path_stats.results[1].stat.executable
+    fail_msg: "The selected account home directory or login shell is not usable."
+
+- name: Inspect required application source paths
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop:
+    - "{{ remoteterminal_source_dir }}/go.mod"
+    - "{{ remoteterminal_source_dir }}/go.sum"
+    - "{{ remoteterminal_source_dir }}/cmd/remoteterminal"
+    - "{{ remoteterminal_source_dir }}/internal"
+    - "{{ remoteterminal_source_dir }}/web/package.json"
+    - "{{ remoteterminal_source_dir }}/web/package-lock.json"
+  register: remoteterminal_source_path_stats
+
+- name: Verify complete application source tree is present
+  ansible.builtin.assert:
+    that:
+      - item.stat.exists
+      - item.stat.readable
+    fail_msg: "Required source path is missing or unreadable: {{ item.item }}"
+  loop: "{{ remoteterminal_source_path_stats.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Verify selected account can read application source
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/test
+      - -r
+      - "{{ remoteterminal_source_dir }}/go.mod"
+  become: true
+  become_user: "{{ remoteterminal_user }}"
+  changed_when: false
+  check_mode: false
+
+- name: Inspect supplied TLS sources
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+    get_checksum: true
+    checksum_algorithm: sha256
+  loop:
+    - "{{ remoteterminal_tls_cert_source }}"
+    - "{{ remoteterminal_tls_key_source }}"
+  register: remoteterminal_tls_source_stats
+  no_log: true
+  when: remoteterminal_supplied_tls | bool
+
+- name: Verify supplied TLS sources are regular readable files
+  ansible.builtin.assert:
+    that:
+      - item.stat.exists
+      - item.stat.isreg
+      - item.stat.readable
+    fail_msg: "Supplied TLS source is missing or unreadable: {{ item.item }}"
+  loop: "{{ remoteterminal_tls_source_stats.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item | default('unknown') }}"
+  when: remoteterminal_supplied_tls | bool

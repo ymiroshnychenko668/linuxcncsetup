@@ -1,0 +1,26 @@
+---
+- name: Create root-owned source-build root
+  ansible.builtin.file:
+    path: "{{ remoteterminal_build_root }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Reinspect source-build root without following links
+  ansible.builtin.stat:
+    path: "{{ remoteterminal_build_root }}"
+    follow: false
+  register: remoteterminal_prepared_build_root
+
+- name: Verify prepared source-build root remains secure
+  ansible.builtin.assert:
+    that:
+      - remoteterminal_prepared_build_root.stat.exists
+      - remoteterminal_prepared_build_root.stat.isdir
+      - not (remoteterminal_prepared_build_root.stat.islnk | default(false))
+      - remoteterminal_prepared_build_root.stat.uid | int == 0
+      - remoteterminal_prepared_build_root.stat.mode is match('^0?[0-7][0145][0145]$')
+    fail_msg: >-
+      Refusing to build because the prepared build root is not a root-owned,
+      non-symlink directory without group/other write permission.

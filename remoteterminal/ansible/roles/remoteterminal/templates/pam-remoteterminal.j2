@@ -1,0 +1,5 @@
+#%PAM-1.0
+# Managed by Ansible. The Go service invokes both authentication and account
+# management for the one username configured in its environment file.
+@include {{ remoteterminal_pam_auth_include }}
+@include {{ remoteterminal_pam_account_include }}

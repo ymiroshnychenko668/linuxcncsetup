@@ -1,0 +1,650 @@
+---
+- name: Inspect root-owned install hierarchy without following links
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+  loop:
+    - "{{ remoteterminal_install_root }}"
+    - "{{ remoteterminal_install_root }}/releases"
+    - "{{ remoteterminal_release_dir }}"
+  register: remoteterminal_install_path_stats
+
+- name: Reject unsafe root-owned install hierarchy
+  ansible.builtin.assert:
+    that:
+      - >-
+        not item.stat.exists or
+        (item.stat.isdir and not (item.stat.islnk | default(false)) and
+         item.stat.uid | int == 0 and
+         item.stat.mode is match('^0?[0-7][0145][0145]$'))
+    fail_msg: >-
+      Refusing deployment because install path {{ item.item }} is not an absent
+      path or a root-owned, non-symlink, non-writable-by-group/other directory.
+  loop: "{{ remoteterminal_install_path_stats.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Remove incomplete content-addressed release before restaging
+  ansible.builtin.file:
+    path: "{{ remoteterminal_release_dir }}"
+    state: absent
+  when:
+    - not (remoteterminal_release_complete | bool)
+    - remoteterminal_install_path_stats.results[2].stat.exists
+
+- name: Inspect root-owned configuration hierarchy without following links
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+  loop:
+    - "{{ remoteterminal_config_dir }}"
+    - "{{ remoteterminal_tls_dir }}"
+    - "{{ remoteterminal_tls_sets_dir }}"
+  register: remoteterminal_config_path_stats
+
+- name: Reject unsafe root-owned configuration hierarchy
+  ansible.builtin.assert:
+    that:
+      - >-
+        not item.stat.exists or
+        (item.stat.isdir and not (item.stat.islnk | default(false)) and
+         item.stat.uid | int == 0 and
+         item.stat.mode is match('^0?[0-7][0145][0145]$'))
+    fail_msg: >-
+      Refusing deployment because config path {{ item.item }} is not an absent
+      path or a root-owned, non-symlink, non-writable-by-group/other directory.
+  loop: "{{ remoteterminal_config_path_stats.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Create Remote Terminal installation hierarchy
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: root
+    group: "{{ item.group | default('root') }}"
+    mode: "{{ item.mode }}"
+  loop:
+    - { path: "{{ remoteterminal_install_root }}", mode: "0755" }
+    - { path: "{{ remoteterminal_install_root }}/releases", mode: "0755" }
+    - { path: "{{ remoteterminal_release_dir }}", mode: "0755" }
+    - { path: "{{ remoteterminal_release_dir }}/bin", mode: "0755" }
+    - { path: "{{ remoteterminal_config_dir }}", mode: "0750", group: "{{ remoteterminal_selected_group }}" }
+    - { path: "{{ remoteterminal_tls_dir }}", mode: "0755" }
+    - { path: "{{ remoteterminal_tls_sets_dir }}", mode: "0755" }
+
+- name: Reinspect created install hierarchy without following links
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+  loop:
+    - "{{ remoteterminal_install_root }}"
+    - "{{ remoteterminal_install_root }}/releases"
+    - "{{ remoteterminal_release_dir }}"
+    - "{{ remoteterminal_release_dir }}/bin"
+  register: remoteterminal_created_install_path_stats
+
+- name: Enforce created install hierarchy postconditions
+  ansible.builtin.assert:
+    that:
+      - item.stat.exists
+      - item.stat.isdir
+      - not (item.stat.islnk | default(false))
+      - item.stat.uid | int == 0
+      - item.stat.mode is match('^0?[0-7][0145][0145]$')
+    fail_msg: "Unsafe created install path detected: {{ item.item }}"
+  loop: "{{ remoteterminal_created_install_path_stats.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Create service-user-owned incoming frontend directory
+  ansible.builtin.file:
+    path: "{{ remoteterminal_release_dir }}/web"
+    state: directory
+    owner: "{{ remoteterminal_user }}"
+    group: "{{ remoteterminal_selected_group }}"
+    mode: "0700"
+  when: not (remoteterminal_release_complete | bool)
+
+- name: Ensure completed release frontend directory exists
+  ansible.builtin.file:
+    path: "{{ remoteterminal_release_dir }}/web"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  when: remoteterminal_release_complete | bool
+
+- name: Install versioned Remote Terminal service binary
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/dd
+      - if={{ remoteterminal_app_binary_stage_path }}
+      - of={{ remoteterminal_release_dir }}/bin/remoteterminal
+      - iflag=nofollow
+      - conv=fsync
+      - status=none
+  changed_when: true
+  when: not (remoteterminal_release_complete | bool)
+
+- name: Enforce versioned service binary permissions
+  ansible.builtin.file:
+    path: "{{ remoteterminal_release_dir }}/bin/remoteterminal"
+    state: file
+    owner: root
+    group: root
+    mode: "0755"
+  when: not (remoteterminal_release_complete | bool)
+
+- name: Detect symlinks in built frontend source tree
+  ansible.builtin.find:
+    paths: "{{ remoteterminal_app_stage_dir }}/web/dist"
+    file_type: link
+    recurse: true
+    hidden: true
+  register: remoteterminal_frontend_source_links
+  when: not (remoteterminal_release_complete | bool)
+
+- name: Inventory all built frontend source entries
+  ansible.builtin.find:
+    paths: "{{ remoteterminal_app_stage_dir }}/web/dist"
+    file_type: any
+    recurse: true
+    hidden: true
+  register: remoteterminal_frontend_source_entries
+  when: not (remoteterminal_release_complete | bool)
+
+- name: Reject symlinks in built frontend source tree
+  ansible.builtin.assert:
+    that:
+      - remoteterminal_frontend_source_links.matched | int == 0
+    fail_msg: >-
+      Refusing to install frontend assets because the build output contains
+      symbolic links.
+  when: not (remoteterminal_release_complete | bool)
+
+- name: Reject special files in built frontend source tree
+  ansible.builtin.assert:
+    that:
+      - item.isreg | default(false) or item.isdir | default(false)
+    fail_msg: "Unsupported built frontend entry type: {{ item.path }}"
+  loop: "{{ remoteterminal_frontend_source_entries.files | default([]) }}"
+  loop_control:
+    label: "{{ item.path }}"
+  when: not (remoteterminal_release_complete | bool)
+
+- name: Install versioned frontend assets
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/rsync
+      - --archive
+      - --delete
+      - "{{ remoteterminal_app_stage_dir }}/web/dist/"
+      - "{{ remoteterminal_release_dir }}/web/"
+  become: true
+  become_user: "{{ remoteterminal_user }}"
+  changed_when: true
+  when: not (remoteterminal_release_complete | bool)
+
+- name: Freeze incoming frontend hierarchy without dereferencing links
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/chown
+      - --recursive
+      - --no-dereference
+      - root:root
+      - "{{ remoteterminal_release_dir }}/web"
+  changed_when: true
+  when: not (remoteterminal_release_complete | bool)
+
+- name: Detect symlinks in deployed frontend tree
+  ansible.builtin.find:
+    paths: "{{ remoteterminal_release_dir }}/web"
+    file_type: link
+    recurse: true
+    hidden: true
+  register: remoteterminal_deployed_frontend_links
+
+- name: Inventory all deployed frontend entries
+  ansible.builtin.find:
+    paths: "{{ remoteterminal_release_dir }}/web"
+    file_type: any
+    recurse: true
+    hidden: true
+  register: remoteterminal_deployed_frontend_entries
+
+- name: Reject symlinks in deployed frontend tree
+  ansible.builtin.assert:
+    that:
+      - remoteterminal_deployed_frontend_links.matched | int == 0
+    fail_msg: >-
+      Refusing to serve frontend assets because the deployed release contains
+      symbolic links.
+
+- name: Reject special files in deployed frontend tree
+  ansible.builtin.assert:
+    that:
+      - item.isreg | default(false) or item.isdir | default(false)
+    fail_msg: "Unsupported deployed frontend entry type: {{ item.path }}"
+  loop: "{{ remoteterminal_deployed_frontend_entries.files }}"
+  loop_control:
+    label: "{{ item.path }}"
+
+- name: Inventory deployed frontend directories
+  ansible.builtin.find:
+    paths: "{{ remoteterminal_release_dir }}/web"
+    file_type: directory
+    recurse: true
+  register: remoteterminal_deployed_frontend_directories
+
+- name: Enforce deployed frontend directory ownership and mode
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  loop: "{{ remoteterminal_deployed_frontend_directories.files | default([]) }}"
+  loop_control:
+    label: "{{ item.path }}"
+
+- name: Inventory deployed frontend files
+  ansible.builtin.find:
+    paths: "{{ remoteterminal_release_dir }}/web"
+    file_type: file
+    recurse: true
+  register: remoteterminal_deployed_frontend_files
+
+- name: Enforce deployed frontend file ownership and mode
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: file
+    owner: root
+    group: root
+    mode: "0644"
+  loop: "{{ remoteterminal_deployed_frontend_files.files | default([]) }}"
+  loop_control:
+    label: "{{ item.path }}"
+
+- name: Verify service account can read deployed frontend entrypoint
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/test
+      - -r
+      - "{{ remoteterminal_release_dir }}/web/index.html"
+  become: true
+  become_user: "{{ remoteterminal_user }}"
+  changed_when: false
+
+- name: Write completed release marker last
+  ansible.builtin.copy:
+    content: "{{ remoteterminal_release_digest }}\n"
+    dest: "{{ remoteterminal_release_dir }}/.complete"
+    owner: root
+    group: root
+    mode: "0644"
+  when: not (remoteterminal_release_complete | bool)
+
+- name: Install and validate atomic TLS material
+  ansible.builtin.include_tasks: tls.yml
+
+- name: Render PAM policy
+  ansible.builtin.template:
+    src: pam-remoteterminal.j2
+    dest: "{{ remoteterminal_pam_policy_path }}"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Inspect effective PAM policy inputs
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: true
+    get_checksum: true
+    checksum_algorithm: sha256
+  loop:
+    - "{{ remoteterminal_pam_policy_path }}"
+    - "/etc/pam.d/{{ remoteterminal_pam_auth_include }}"
+    - "/etc/pam.d/{{ remoteterminal_pam_account_include }}"
+  register: remoteterminal_pam_policy_inputs
+
+- name: Verify effective PAM policy inputs exist
+  ansible.builtin.assert:
+    that:
+      - item.stat.exists
+      - item.stat.isreg
+      - item.stat.checksum | length > 0
+    fail_msg: "Required PAM policy input is missing or invalid: {{ item.item }}"
+  loop: "{{ remoteterminal_pam_policy_inputs.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Calculate exact PAM verification fingerprint
+  ansible.builtin.set_fact:
+    remoteterminal_pam_probe_fingerprint: >-
+      {{ (remoteterminal_pam_policy_version ~ '\n' ~
+          remoteterminal_user ~ '\n' ~ remoteterminal_pam_service ~ '\n' ~
+          (remoteterminal_pam_policy_inputs.results |
+           map(attribute='stat.checksum') | join('\n'))) | hash('sha256') }}
+
+- name: Install interactive PAM authentication verifier
+  ansible.builtin.template:
+    src: remoteterminal-pam-check.j2
+    dest: "{{ remoteterminal_pam_check_path }}"
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Exercise PAM account stack as exact systemd service account
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/pamtester
+      - "{{ remoteterminal_pam_service }}"
+      - "{{ remoteterminal_user }}"
+      - acct_mgmt
+  become: true
+  become_user: "{{ remoteterminal_user }}"
+  environment:
+    HOME: "{{ remoteterminal_selected_home }}"
+  register: remoteterminal_pam_account_probe
+  changed_when: false
+
+- name: Inspect full PAM authentication verification marker
+  ansible.builtin.stat:
+    path: "{{ remoteterminal_pam_verification_marker }}"
+    follow: false
+  register: remoteterminal_pam_verification_marker_stat
+
+- name: Read full PAM authentication verification marker
+  ansible.builtin.slurp:
+    src: "{{ remoteterminal_pam_verification_marker }}"
+  register: remoteterminal_pam_verification_marker_content
+  when:
+    - remoteterminal_pam_verification_marker_stat.stat.exists
+    - remoteterminal_pam_verification_marker_stat.stat.isreg | default(false)
+    - not (remoteterminal_pam_verification_marker_stat.stat.islnk | default(false))
+
+- name: Record full PAM authentication verification state
+  ansible.builtin.set_fact:
+    remoteterminal_pam_authentication_verified: >-
+      {{ remoteterminal_pam_verification_marker_stat.stat.exists and
+         (remoteterminal_pam_verification_marker_stat.stat.isreg | default(false)) and
+         not (remoteterminal_pam_verification_marker_stat.stat.islnk | default(false)) and
+         (remoteterminal_pam_verification_marker_content.content | default('') |
+          b64decode | trim) == remoteterminal_pam_probe_fingerprint }}
+
+- name: Enforce requested full interactive PAM verification gate
+  ansible.builtin.assert:
+    that:
+      - remoteterminal_pam_authentication_verified | bool
+    fail_msg: >-
+      The non-secret PAM account probe passed, but full password authentication
+      has not been verified for this PAM policy and service user. Run
+      'sudo {{ remoteterminal_pam_check_path }}' from a trusted local terminal,
+      then rerun the installer. The helper reads the password only through PAM's
+      terminal conversation and writes no credential data.
+  when: remoteterminal_require_verified_pam_authentication | bool
+
+- name: Render desired service inputs in memory
+  ansible.builtin.set_fact:
+    remoteterminal_desired_environment_content: >-
+      {{ lookup('ansible.builtin.template', 'remoteterminal.env.j2') }}
+    remoteterminal_desired_unit_content: >-
+      {{ lookup('ansible.builtin.template', 'remoteterminal.service.j2') }}
+
+- name: Calculate desired deployment input fingerprint
+  ansible.builtin.set_fact:
+    remoteterminal_desired_environment_checksum: >-
+      {{ remoteterminal_desired_environment_content | hash('sha256') }}
+    remoteterminal_desired_unit_checksum: >-
+      {{ remoteterminal_desired_unit_content | hash('sha256') }}
+    remoteterminal_desired_deployment_fingerprint: >-
+      {{ (remoteterminal_desired_environment_content ~ '\n--unit--\n' ~
+          remoteterminal_desired_unit_content ~ '\n--tls--\n' ~
+          remoteterminal_tls_configuration_fingerprint) | hash('sha256') }}
+
+- name: Inspect current live service inputs before mutation
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+    get_checksum: true
+    checksum_algorithm: sha256
+  loop:
+    - "{{ remoteterminal_config_dir }}/remoteterminal.env"
+    - "{{ remoteterminal_systemd_unit_path }}"
+  register: remoteterminal_current_service_inputs
+
+- name: Reject unsafe existing live service input paths
+  ansible.builtin.assert:
+    that:
+      - >-
+        not item.stat.exists or
+        ((item.stat.isreg | default(false)) and
+         not (item.stat.islnk | default(false)) and
+         item.stat.uid | int == 0)
+    fail_msg: >-
+      Refusing deployment because live service input {{ item.item }} is not
+      absent or a root-owned, non-symlink regular file.
+  loop: "{{ remoteterminal_current_service_inputs.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Determine whether current live service inputs match desired content
+  ansible.builtin.set_fact:
+    remoteterminal_current_service_inputs_match: >-
+      {{ remoteterminal_current_service_inputs.results[0].stat.exists and
+         (remoteterminal_current_service_inputs.results[0].stat.checksum | default('')) ==
+         remoteterminal_desired_environment_checksum and
+         remoteterminal_current_service_inputs.results[1].stat.exists and
+         (remoteterminal_current_service_inputs.results[1].stat.checksum | default('')) ==
+         remoteterminal_desired_unit_checksum }}
+
+- name: Inspect last successfully applied deployment fingerprint
+  ansible.builtin.stat:
+    path: "{{ remoteterminal_deployment_applied_marker }}"
+    follow: false
+  register: remoteterminal_deployment_applied_marker_stat
+
+- name: Reject unsafe applied deployment fingerprint marker
+  ansible.builtin.assert:
+    that:
+      - >-
+        not remoteterminal_deployment_applied_marker_stat.stat.exists or
+        ((remoteterminal_deployment_applied_marker_stat.stat.isreg | default(false)) and
+         not (remoteterminal_deployment_applied_marker_stat.stat.islnk | default(false)) and
+         remoteterminal_deployment_applied_marker_stat.stat.uid | int == 0 and
+         remoteterminal_deployment_applied_marker_stat.stat.gid | int == 0 and
+         remoteterminal_deployment_applied_marker_stat.stat.mode == '0600')
+    fail_msg: >-
+      Refusing deployment because the last-applied fingerprint marker has an
+      unsafe type, owner, group, or mode.
+
+- name: Read last successfully applied deployment fingerprint
+  ansible.builtin.slurp:
+    src: "{{ remoteterminal_deployment_applied_marker }}"
+  register: remoteterminal_deployment_applied_marker_content
+  when: remoteterminal_deployment_applied_marker_stat.stat.exists
+
+- name: Determine whether desired service inputs were successfully applied
+  ansible.builtin.set_fact:
+    remoteterminal_deployment_inputs_applied: >-
+      {{ remoteterminal_deployment_applied_marker_stat.stat.exists and
+         (remoteterminal_deployment_applied_marker_content.content | default('') |
+          b64decode | trim) == remoteterminal_desired_deployment_fingerprint }}
+
+- name: Persist restart requirement before mutating live service inputs
+  ansible.builtin.copy:
+    content: "deployment={{ remoteterminal_desired_deployment_fingerprint }}\n"
+    dest: "{{ remoteterminal_restart_required_marker }}"
+    owner: root
+    group: root
+    mode: "0600"
+  when: >-
+    not (remoteterminal_deployment_inputs_applied | bool) or
+    not (remoteterminal_current_service_inputs_match | bool)
+
+- name: Render Remote Terminal environment file
+  ansible.builtin.template:
+    src: remoteterminal.env.j2
+    dest: "{{ remoteterminal_config_dir }}/remoteterminal.env"
+    owner: root
+    group: "{{ remoteterminal_selected_group }}"
+    mode: "0640"
+
+- name: Render Remote Terminal systemd unit
+  ansible.builtin.template:
+    src: remoteterminal.service.j2
+    dest: "{{ remoteterminal_systemd_unit_path }}"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Reload Remote Terminal systemd unit
+
+- name: Reload changed systemd unit before continuing
+  ansible.builtin.meta: flush_handlers
+
+- name: Inspect active application release link
+  ansible.builtin.stat:
+    path: "{{ remoteterminal_install_root }}/current"
+    follow: false
+  register: remoteterminal_current_release
+
+- name: Validate active application release link
+  ansible.builtin.assert:
+    that:
+      - >-
+        not remoteterminal_current_release.stat.exists or
+        ((remoteterminal_current_release.stat.islnk | default(false)) and
+         (remoteterminal_current_release.stat.lnk_source | default('')).startswith(
+           remoteterminal_install_root ~ '/releases/'))
+    fail_msg: >-
+      Refusing deployment because the active release path is neither absent nor
+      an application-owned symlink beneath the releases directory.
+
+- name: Remove stale temporary release activation link from root-owned parent
+  ansible.builtin.file:
+    path: "{{ remoteterminal_install_root }}/.current-{{ remoteterminal_release_id }}"
+    state: absent
+
+- name: Create temporary content-addressed release activation link
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/ln
+      - -sfnT
+      - "{{ remoteterminal_release_dir }}"
+      - "{{ remoteterminal_install_root }}/.current-{{ remoteterminal_release_id }}"
+  changed_when: true
+  when: >-
+    remoteterminal_current_release.stat.lnk_source | default('') !=
+    remoteterminal_release_dir
+
+- name: Atomically activate content-addressed application release
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/mv
+      - -Tf
+      - "{{ remoteterminal_install_root }}/.current-{{ remoteterminal_release_id }}"
+      - "{{ remoteterminal_install_root }}/current"
+  register: remoteterminal_activate_release
+  changed_when: true
+  when: >-
+    remoteterminal_current_release.stat.lnk_source | default('') !=
+    remoteterminal_release_dir
+
+- name: Validate installed systemd unit
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/systemd-analyze
+      - verify
+      - "{{ remoteterminal_systemd_unit_path }}"
+  changed_when: false
+
+- name: Enable and start Remote Terminal service
+  ansible.builtin.stat:
+    path: "{{ remoteterminal_restart_required_marker }}"
+    follow: false
+  register: remoteterminal_restart_required
+
+- name: Enable and start or restart Remote Terminal service
+  ansible.builtin.systemd_service:
+    name: "{{ remoteterminal_service_name }}.service"
+    enabled: true
+    state: "{{ 'restarted' if remoteterminal_restart_required.stat.exists else 'started' }}"
+    daemon_reload: true
+
+- name: Flush release activation handler before health check
+  ansible.builtin.meta: flush_handlers
+
+- name: Wait for Remote Terminal HTTPS port
+  ansible.builtin.wait_for:
+    host: "{{ remoteterminal_listen_address }}"
+    port: "{{ remoteterminal_port | int }}"
+    state: started
+    timeout: "{{ (remoteterminal_health_retries | int * remoteterminal_health_delay | int) + 5 }}"
+
+- name: Verify Remote Terminal HTTPS health endpoint
+  ansible.builtin.uri:
+    url: "https://{{ remoteterminal_listen_address }}:{{ remoteterminal_port }}/healthz"
+    method: GET
+    validate_certs: false
+    return_content: true
+    status_code: 200
+  register: remoteterminal_health_result
+  retries: "{{ remoteterminal_health_retries }}"
+  delay: "{{ remoteterminal_health_delay }}"
+  until:
+    - remoteterminal_health_result.status | default(0) == 200
+    - remoteterminal_health_result.json.ok | default(false) | bool
+
+- name: Verify deployed frontend is served over HTTPS
+  ansible.builtin.uri:
+    url: "https://{{ remoteterminal_listen_address }}:{{ remoteterminal_port }}/"
+    method: GET
+    validate_certs: false
+    return_content: true
+    status_code: 200
+  register: remoteterminal_frontend_http_result
+  retries: "{{ remoteterminal_health_retries }}"
+  delay: "{{ remoteterminal_health_delay }}"
+  until:
+    - remoteterminal_frontend_http_result.status | default(0) == 200
+    - "'<div id=\"root\"></div>' in (remoteterminal_frontend_http_result.content | default(''))"
+
+- name: Record successfully applied deployment fingerprint after health verification
+  ansible.builtin.copy:
+    content: "{{ remoteterminal_desired_deployment_fingerprint }}\n"
+    dest: "{{ remoteterminal_deployment_applied_marker }}"
+    owner: root
+    group: root
+    mode: "0600"
+
+- name: Clear durable restart requirement after successful service verification
+  ansible.builtin.file:
+    path: "{{ remoteterminal_restart_required_marker }}"
+    state: absent
+
+- name: Read installed certificate fingerprint
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/openssl
+      - x509
+      - -in
+      - "{{ remoteterminal_tls_cert_path }}"
+      - -noout
+      - -fingerprint
+      - -sha256
+  register: remoteterminal_tls_fingerprint
+  changed_when: false
+
+- name: Report installed Remote Terminal endpoint
+  ansible.builtin.debug:
+    msg:
+      - "Remote Terminal is healthy at https://{{ remoteterminal_listen_address }}:{{ remoteterminal_port }}/"
+      - "TLS {{ remoteterminal_tls_fingerprint.stdout }}"
+      - "Service account: {{ remoteterminal_user }}"
+      - "Release: {{ remoteterminal_release_id }}"
+      - >-
+        PAM account gate passed; full interactive password authentication
+        verified={{ remoteterminal_pam_authentication_verified | bool }}.
+        To verify without exposing the password to Ansible, run:
+        sudo {{ remoteterminal_pam_check_path }}

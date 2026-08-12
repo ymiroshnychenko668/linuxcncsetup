@@ -1,0 +1,102 @@
+---
+# Lifecycle. The top-level install and uninstall playbooks set this explicitly.
+remoteterminal_state: present
+
+# Install inputs. The TUI supplies all three values; direct Ansible runs use
+# the host name as the display name unless one is supplied explicitly.
+remoteterminal_user: ""
+remoteterminal_listen_address: ""
+remoteterminal_machine_name: "{{ ansible_facts.hostname | default('LinuxCNC machine', true) }}"
+
+# Application settings.
+remoteterminal_port: 8443
+remoteterminal_max_sessions: 8
+remoteterminal_idle_timeout: ""
+remoteterminal_absolute_timeout: ""
+remoteterminal_pam_service: remoteterminal
+remoteterminal_pam_auth_include: common-auth
+remoteterminal_pam_account_include: common-account
+remoteterminal_pam_policy_version: common-includes-v1
+
+# Source and build locations. playbook_dir is remoteterminal/ansible for the
+# supported entrypoint, so this defaults to the remoteterminal source tree.
+remoteterminal_source_dir: "{{ playbook_dir | dirname }}"
+remoteterminal_build_root: /var/lib/remoteterminal-build
+remoteterminal_build_jobs: "{{ [ansible_processor_vcpus | default(2) | int, 4] | min }}"
+
+# System deployment locations.
+remoteterminal_service_name: remoteterminal
+remoteterminal_install_root: /opt/remoteterminal
+remoteterminal_config_dir: /etc/remoteterminal
+remoteterminal_pam_policy_path: /etc/pam.d/remoteterminal
+remoteterminal_pam_check_path: /usr/local/sbin/remoteterminal-pam-check
+remoteterminal_systemd_unit_path: /etc/systemd/system/remoteterminal.service
+remoteterminal_runtime_directory_name: remoteterminal
+remoteterminal_state_directory_name: remoteterminal
+remoteterminal_tmux_binary: /usr/bin/tmux
+
+# A supplied certificate and key must be set together. They are copied into the
+# application-owned config directory. When omitted, a self-signed certificate
+# is generated for the selected address and host name.
+remoteterminal_tls_cert_source: ""
+remoteterminal_tls_key_source: ""
+remoteterminal_generated_tls_days: 825
+remoteterminal_generated_tls_renew_before_seconds: 2592000
+remoteterminal_tls_certificate_common_name: "{{ ansible_facts.fqdn | default(ansible_facts.hostname, true) }}"
+remoteterminal_tls_profile_version: generated-rsa3072-v1
+
+# The playbook always performs a non-secret PAM account-management probe as the
+# service user. Full password authentication must remain interactive so the
+# real password never enters Ansible variables, facts, output, or process
+# arguments. The installed helper records successful interactive verification.
+remoteterminal_require_verified_pam_authentication: false
+remoteterminal_pam_verification_marker: "{{ remoteterminal_config_dir }}/pam-authentication.verified"
+remoteterminal_restart_required_marker: "{{ remoteterminal_config_dir }}/restart-required"
+remoteterminal_deployment_applied_marker: "{{ remoteterminal_config_dir }}/deployment.applied"
+
+# Refuse wildcard, loopback, or unassigned addresses by default. This may be
+# disabled only for unusual static-network configurations whose address is not
+# reported by Ansible facts at install time.
+remoteterminal_validate_listen_address_is_local: true
+
+# ttyd 1.7.7 is pinned by both immutable commit URL and archive digest.
+remoteterminal_ttyd_version: "1.7.7"
+remoteterminal_ttyd_commit: 40e79c706be14029b391f369bee6613c31667abb
+remoteterminal_ttyd_archive_url: "https://github.com/tsl0922/ttyd/archive/40e79c706be14029b391f369bee6613c31667abb.tar.gz"
+remoteterminal_ttyd_archive_checksum: "sha256:1f6f53a5021a2cee4af9b975f3dc7a3185bd261c23a84f7b680285f6c1a50341"
+
+# Health verification controls.
+remoteterminal_health_retries: 20
+remoteterminal_health_delay: 2
+
+# Packages deliberately remain installed on uninstall because apt cannot know
+# whether another application or the operator uses them. Application-owned
+# files are removed by default; each preservation choice is explicit.
+remoteterminal_uninstall_preserve_installation: false
+remoteterminal_uninstall_preserve_config: false
+remoteterminal_uninstall_preserve_state: false
+remoteterminal_uninstall_preserve_build_cache: false
+remoteterminal_uninstall_user: "{{ remoteterminal_user | default('') }}"
+
+# Debian build and runtime dependencies. ttyd is built against the packaged
+# libraries, and the resulting dynamically linked binary uses their runtimes.
+remoteterminal_apt_packages:
+  - build-essential
+  - ca-certificates
+  - cmake
+  - git
+  - golang-go
+  - libjson-c-dev
+  - libpam0g
+  - libpam0g-dev
+  - libssl-dev
+  - libuv1-dev
+  - libwebsockets-dev
+  - nodejs
+  - npm
+  - openssl
+  - pkg-config
+  - pamtester
+  - rsync
+  - tmux
+  - zlib1g-dev

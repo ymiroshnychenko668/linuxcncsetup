@@ -1,0 +1,5 @@
+/build/
+/web/dist/
+/web/node_modules/
+*.tsbuildinfo
+*.log

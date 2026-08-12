@@ -1,0 +1,360 @@
+---
+- name: Inspect delegated application build directories without following links
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+  loop:
+    - "{{ remoteterminal_build_root }}/application-source"
+    - "{{ remoteterminal_build_root }}/cache"
+    - "{{ remoteterminal_build_root }}/cache/go-build"
+    - "{{ remoteterminal_build_root }}/cache/go-mod"
+    - "{{ remoteterminal_build_root }}/cache/npm"
+  register: remoteterminal_application_build_path_stats
+
+- name: Reject unsafe delegated application build directories
+  ansible.builtin.assert:
+    that:
+      - >-
+        not item.stat.exists or
+        (item.stat.isdir and not (item.stat.islnk | default(false)))
+    fail_msg: >-
+      Refusing the application build because delegated path {{ item.item }} is
+      not a real directory. Remove the unexpected path and rerun installation.
+  loop: "{{ remoteterminal_application_build_path_stats.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Create user-owned application staging and cache directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ remoteterminal_user }}"
+    group: "{{ remoteterminal_selected_group }}"
+    mode: "0750"
+  loop:
+    - "{{ remoteterminal_build_root }}/application-source"
+    - "{{ remoteterminal_build_root }}/cache"
+
+- name: Create nested application cache directories as selected user
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: "0750"
+    follow: false
+  loop:
+    - "{{ remoteterminal_build_root }}/cache/go-build"
+    - "{{ remoteterminal_build_root }}/cache/go-mod"
+    - "{{ remoteterminal_build_root }}/cache/npm"
+  become: true
+  become_user: "{{ remoteterminal_user }}"
+
+- name: Verify nested application cache directories without following links
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+  loop:
+    - "{{ remoteterminal_build_root }}/cache/go-build"
+    - "{{ remoteterminal_build_root }}/cache/go-mod"
+    - "{{ remoteterminal_build_root }}/cache/npm"
+  register: remoteterminal_application_cache_path_stats
+
+- name: Enforce nested application cache postconditions
+  ansible.builtin.assert:
+    that:
+      - item.stat.exists
+      - item.stat.isdir
+      - not (item.stat.islnk | default(false))
+      - item.stat.uid | int == remoteterminal_selected_uid | int
+      - item.stat.mode == '0750'
+    fail_msg: "Unsafe nested build cache path detected: {{ item.item }}"
+  loop: "{{ remoteterminal_application_cache_path_stats.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Stage application source without build outputs
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/rsync
+      - --archive
+      - --no-owner
+      - --no-group
+      - --delete
+      - --delete-excluded
+      - --checksum
+      - --itemize-changes
+      - --omit-dir-times
+      - --exclude=/.git/
+      - --exclude=/ansible/
+      - --exclude=/build/
+      - --exclude=/scripts/
+      - --exclude=/web/node_modules/
+      - --exclude=/web/dist/
+      - --exclude=/web/coverage/
+      - --exclude=*.tsbuildinfo
+      - --exclude=*.log
+      - --exclude=.env
+      - --exclude=.env.*
+      - --exclude=/IMPLEMENTATION_PLAN.md
+      - --exclude=/README.md
+      - --exclude=/Makefile
+      - "{{ remoteterminal_source_dir }}/"
+      - "{{ remoteterminal_build_root }}/application-source/"
+  become: true
+  become_user: "{{ remoteterminal_user }}"
+  register: remoteterminal_source_stage_result
+  changed_when: remoteterminal_source_stage_result.stdout | trim | length > 0
+
+- name: Inventory all staged source entries
+  ansible.builtin.find:
+    paths:
+      - "{{ remoteterminal_build_root }}/application-source"
+    file_type: any
+    hidden: true
+    recurse: true
+  register: remoteterminal_staged_source_entries
+  become: true
+  become_user: "{{ remoteterminal_user }}"
+
+- name: Reject links and special entries from staged source
+  ansible.builtin.assert:
+    that:
+      - item.isreg | default(false) or item.isdir | default(false)
+    fail_msg: >-
+      Staged source contains a symbolic link or special entry that cannot be
+      represented safely in the deterministic release digest: {{ item.path }}
+  loop: "{{ remoteterminal_staged_source_entries.files }}"
+  loop_control:
+    label: "{{ item.path }}"
+
+- name: Inventory staged build inputs with checksums
+  ansible.builtin.find:
+    paths:
+      - "{{ remoteterminal_build_root }}/application-source"
+    file_type: file
+    hidden: true
+    recurse: true
+    get_checksum: true
+  register: remoteterminal_staged_source_files
+  become: true
+  become_user: "{{ remoteterminal_user }}"
+
+- name: Verify staged build inputs are not empty
+  ansible.builtin.assert:
+    that:
+      - remoteterminal_staged_source_files.matched | int > 0
+    fail_msg: "No application build inputs were staged from {{ remoteterminal_source_dir }}."
+
+- name: Initialize source manifest
+  ansible.builtin.set_fact:
+    remoteterminal_source_manifest: []
+
+- name: Assemble deterministic source manifest
+  ansible.builtin.set_fact:
+    remoteterminal_source_manifest: >-
+      {{ remoteterminal_source_manifest + [item.path ~ ':' ~ item.checksum] }}
+  loop: "{{ remoteterminal_staged_source_files.files | sort(attribute='path') }}"
+  loop_control:
+    label: "{{ item.path }}"
+
+- name: Calculate application release digest
+  ansible.builtin.set_fact:
+    remoteterminal_release_digest: >-
+      {{ (remoteterminal_source_manifest | join('\n') ~ '\n' ~
+          remoteterminal_ttyd_commit ~ '\n' ~
+          remoteterminal_go_version.stdout ~ '\n' ~
+          remoteterminal_node_version.stdout ~ '\n' ~
+          remoteterminal_npm_version.stdout ~ '\n' ~
+          remoteterminal_build_tool_package_versions) | hash('sha256') }}
+
+- name: Record content-addressed release paths
+  ansible.builtin.set_fact:
+    remoteterminal_release_id: "{{ remoteterminal_release_digest[0:16] }}"
+    remoteterminal_release_dir: "{{ remoteterminal_install_root }}/releases/{{ remoteterminal_release_digest[0:16] }}"
+    remoteterminal_app_source_stage_dir: "{{ remoteterminal_build_root }}/application-source"
+    remoteterminal_app_stage_dir: "{{ remoteterminal_build_root }}/application-build-{{ remoteterminal_release_digest[0:16] }}"
+    remoteterminal_app_binary_stage_path: "{{ remoteterminal_build_root }}/application-build-{{ remoteterminal_release_digest[0:16] }}/remoteterminal"
+
+- name: Inspect completed application release artifacts
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+  loop:
+    - "{{ remoteterminal_release_dir }}/.complete"
+    - "{{ remoteterminal_release_dir }}/bin/remoteterminal"
+    - "{{ remoteterminal_release_dir }}/web/index.html"
+  register: remoteterminal_release_artifact_stats
+
+- name: Read completed release marker
+  ansible.builtin.slurp:
+    src: "{{ remoteterminal_release_dir }}/.complete"
+  register: remoteterminal_release_marker_content
+  when:
+    - remoteterminal_release_artifact_stats.results[0].stat.exists
+    - remoteterminal_release_artifact_stats.results[0].stat.isreg | default(false)
+    - not (remoteterminal_release_artifact_stats.results[0].stat.islnk | default(false))
+    - remoteterminal_release_artifact_stats.results[0].stat.uid | int == 0
+
+- name: Determine whether content-addressed release is complete and trusted
+  ansible.builtin.set_fact:
+    remoteterminal_release_complete: >-
+      {{ remoteterminal_release_artifact_stats.results[0].stat.exists and
+         (remoteterminal_release_artifact_stats.results[0].stat.isreg | default(false)) and
+         not (remoteterminal_release_artifact_stats.results[0].stat.islnk | default(false)) and
+         remoteterminal_release_artifact_stats.results[0].stat.uid | int == 0 and
+         (remoteterminal_release_marker_content.content | default('') | b64decode | trim) ==
+         remoteterminal_release_digest and
+         remoteterminal_release_artifact_stats.results[1].stat.exists and
+         (remoteterminal_release_artifact_stats.results[1].stat.isreg | default(false)) and
+         not (remoteterminal_release_artifact_stats.results[1].stat.islnk | default(false)) and
+         remoteterminal_release_artifact_stats.results[1].stat.uid | int == 0 and
+         (remoteterminal_release_artifact_stats.results[1].stat.executable | default(false)) and
+         remoteterminal_release_artifact_stats.results[2].stat.exists and
+         (remoteterminal_release_artifact_stats.results[2].stat.isreg | default(false)) and
+         not (remoteterminal_release_artifact_stats.results[2].stat.islnk | default(false)) and
+         remoteterminal_release_artifact_stats.results[2].stat.uid | int == 0 and
+         remoteterminal_release_artifact_stats.results[2].stat.readable }}
+
+- name: Inspect content-addressed application build path without following links
+  ansible.builtin.stat:
+    path: "{{ remoteterminal_app_stage_dir }}"
+    follow: false
+  register: remoteterminal_application_release_build_path
+
+- name: Reject unsafe content-addressed application build path
+  ansible.builtin.assert:
+    that:
+      - >-
+        not remoteterminal_application_release_build_path.stat.exists or
+        (remoteterminal_application_release_build_path.stat.isdir and
+         not (remoteterminal_application_release_build_path.stat.islnk | default(false)))
+    fail_msg: >-
+      Refusing the application build because the content-addressed build path
+      is not a real directory.
+
+- name: Remove interrupted content-addressed application build directory
+  ansible.builtin.file:
+    path: "{{ remoteterminal_app_stage_dir }}"
+    state: absent
+  when:
+    - not (remoteterminal_release_complete | bool)
+    - remoteterminal_application_release_build_path.stat.exists
+
+- name: Create clean delegated content-addressed application build directory
+  ansible.builtin.file:
+    path: "{{ remoteterminal_app_stage_dir }}"
+    state: directory
+    owner: "{{ remoteterminal_user }}"
+    group: "{{ remoteterminal_selected_group }}"
+    mode: "0750"
+  when: not (remoteterminal_release_complete | bool)
+
+- name: Build application release as selected non-root account
+  when: not (remoteterminal_release_complete | bool)
+  block:
+    - name: Create clean application release build tree
+      ansible.builtin.copy:
+        src: "{{ remoteterminal_app_source_stage_dir }}/"
+        dest: "{{ remoteterminal_app_stage_dir }}/"
+        remote_src: true
+        owner: "{{ remoteterminal_user }}"
+        group: "{{ remoteterminal_selected_group }}"
+        directory_mode: "0750"
+        mode: preserve
+      become: true
+      become_user: "{{ remoteterminal_user }}"
+
+    - name: Install checksum-locked frontend dependencies
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/npm
+          - ci
+          - --no-audit
+          - --no-fund
+        chdir: "{{ remoteterminal_app_stage_dir }}/web"
+      become: true
+      become_user: "{{ remoteterminal_user }}"
+      environment:
+        HOME: "{{ remoteterminal_selected_home }}"
+        npm_config_cache: "{{ remoteterminal_build_root }}/cache/npm"
+      changed_when: true
+
+    - name: Compile production React frontend
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/npm
+          - run
+          - build
+        chdir: "{{ remoteterminal_app_stage_dir }}/web"
+      become: true
+      become_user: "{{ remoteterminal_user }}"
+      environment:
+        HOME: "{{ remoteterminal_selected_home }}"
+        npm_config_cache: "{{ remoteterminal_build_root }}/cache/npm"
+        NODE_ENV: production
+      changed_when: true
+
+    - name: Run Go test suite with PAM cgo support
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/go
+          - test
+          - -tags
+          - pam
+          - ./...
+        chdir: "{{ remoteterminal_app_stage_dir }}"
+      become: true
+      become_user: "{{ remoteterminal_user }}"
+      environment:
+        CGO_ENABLED: "1"
+        GOCACHE: "{{ remoteterminal_build_root }}/cache/go-build"
+        GOMODCACHE: "{{ remoteterminal_build_root }}/cache/go-mod"
+        GOTOOLCHAIN: local
+        HOME: "{{ remoteterminal_selected_home }}"
+      changed_when: false
+
+    - name: Compile Go service with PAM cgo support
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/go
+          - build
+          - -tags
+          - pam
+          - -trimpath
+          - -ldflags=-s -w
+          - -o
+          - "{{ remoteterminal_app_binary_stage_path }}"
+          - ./cmd/remoteterminal
+        chdir: "{{ remoteterminal_app_stage_dir }}"
+      become: true
+      become_user: "{{ remoteterminal_user }}"
+      environment:
+        CGO_ENABLED: "1"
+        GOCACHE: "{{ remoteterminal_build_root }}/cache/go-build"
+        GOMODCACHE: "{{ remoteterminal_build_root }}/cache/go-mod"
+        GOTOOLCHAIN: local
+        HOME: "{{ remoteterminal_selected_home }}"
+      changed_when: true
+
+    - name: Inspect application build outputs
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        follow: false
+      loop:
+        - "{{ remoteterminal_app_binary_stage_path }}"
+        - "{{ remoteterminal_app_stage_dir }}/web/dist/index.html"
+      register: remoteterminal_app_build_outputs
+      become: true
+      become_user: "{{ remoteterminal_user }}"
+
+    - name: Verify application build outputs
+      ansible.builtin.assert:
+        that:
+          - item.stat.exists
+          - item.stat.isreg
+          - not (item.stat.islnk | default(false))
+          - item.stat.uid | int == remoteterminal_selected_uid | int
+          - item.stat.size | int > 0
+        fail_msg: "Application build output is missing or empty: {{ item.item }}"
+      loop: "{{ remoteterminal_app_build_outputs.results }}"
+      loop_control:
+        label: "{{ item.item }}"

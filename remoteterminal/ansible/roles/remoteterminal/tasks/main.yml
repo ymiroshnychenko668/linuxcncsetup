@@ -1,0 +1,44 @@
+---
+- name: Validate requested Remote Terminal lifecycle state
+  ansible.builtin.assert:
+    that:
+      - remoteterminal_state in ['present', 'absent']
+    fail_msg: "remoteterminal_state must be either 'present' or 'absent'."
+
+- name: Run Remote Terminal installation
+  when: remoteterminal_state == 'present'
+  block:
+    - name: Run installation preflight checks
+      ansible.builtin.include_tasks: preflight.yml
+
+    - name: Install build and runtime dependencies
+      ansible.builtin.include_tasks: dependencies.yml
+
+    - name: Prepare secure source-build hierarchy
+      ansible.builtin.include_tasks: prepare_build.yml
+      when: not ansible_check_mode
+
+    - name: Build pinned ttyd dependency
+      ansible.builtin.include_tasks: build_ttyd.yml
+      when: not ansible_check_mode
+
+    - name: Stage and build Remote Terminal
+      ansible.builtin.include_tasks: build_application.yml
+      when: not ansible_check_mode
+
+    - name: Deploy and verify Remote Terminal
+      ansible.builtin.include_tasks: deploy.yml
+      when: not ansible_check_mode
+
+    - name: Explain check-mode coverage
+      ansible.builtin.debug:
+        msg: >-
+          Check mode validated preflight inputs and predicted Debian package
+          changes. Source compilation, deployment, service changes, and the
+          HTTPS health probe are intentionally skipped because their outputs do
+          not exist until the build commands run.
+      when: ansible_check_mode
+
+- name: Run Remote Terminal uninstall
+  ansible.builtin.include_tasks: uninstall.yml
+  when: remoteterminal_state == 'absent'

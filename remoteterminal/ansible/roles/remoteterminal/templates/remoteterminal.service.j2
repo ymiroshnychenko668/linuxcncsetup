@@ -1,0 +1,37 @@
+[Unit]
+Description=Remote Terminal web service
+After=network-online.target local-fs.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=30
+ConditionFileIsExecutable={{ remoteterminal_release_dir }}/bin/remoteterminal
+ConditionFileIsExecutable={{ remoteterminal_ttyd_tool_dir }}/bin/ttyd
+ConditionFileIsExecutable={{ remoteterminal_tmux_binary }}
+
+[Service]
+Type=simple
+User={{ remoteterminal_user }}
+Group={{ remoteterminal_selected_group }}
+WorkingDirectory={{ remoteterminal_selected_home }}
+EnvironmentFile={{ remoteterminal_config_dir }}/remoteterminal.env
+Environment=HOME={{ remoteterminal_selected_home }}
+Environment=USER={{ remoteterminal_user }}
+Environment=LOGNAME={{ remoteterminal_user }}
+Environment=SHELL={{ remoteterminal_selected_shell }}
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+Environment=REMOTE_TERMINAL_WEB_DIR={{ remoteterminal_release_dir }}/web
+ExecStart={{ remoteterminal_release_dir }}/bin/remoteterminal
+Restart=on-failure
+RestartSec=10s
+TimeoutStopSec=30s
+KillSignal=SIGTERM
+KillMode=control-group
+RuntimeDirectory={{ remoteterminal_runtime_directory_name }}
+RuntimeDirectoryMode=0700
+StateDirectory={{ remoteterminal_state_directory_name }}
+StateDirectoryMode=0700
+UMask=0077
+SyslogIdentifier=remoteterminal
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,232 @@
+---
+- name: Validate destructive uninstall paths
+  ansible.builtin.assert:
+    that:
+      - remoteterminal_install_root == '/opt/remoteterminal'
+      - remoteterminal_config_dir == '/etc/remoteterminal'
+      - remoteterminal_build_root == '/var/lib/remoteterminal-build'
+      - remoteterminal_runtime_directory_name == 'remoteterminal'
+      - remoteterminal_state_directory_name == 'remoteterminal'
+      - remoteterminal_pam_policy_path == '/etc/pam.d/remoteterminal'
+      - remoteterminal_pam_check_path == '/usr/local/sbin/remoteterminal-pam-check'
+      - remoteterminal_systemd_unit_path == '/etc/systemd/system/remoteterminal.service'
+      - remoteterminal_service_name == 'remoteterminal'
+      - remoteterminal_uninstall_user | length > 0
+      - remoteterminal_uninstall_user is match('^[a-z_][a-z0-9_-]*[$]?$')
+    fail_msg: >-
+      Refusing uninstall because one or more application-owned paths fall
+      outside their narrow expected system directories or contain an unsafe
+      dot/path segment.
+
+- name: Stop exact Remote Terminal service even after interrupted unit removal
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/systemctl
+      - stop
+      - "{{ remoteterminal_service_name }}.service"
+  register: remoteterminal_uninstall_service_stop
+  changed_when: remoteterminal_uninstall_service_stop.rc == 0
+  failed_when:
+    - remoteterminal_uninstall_service_stop.rc != 0
+    - >-
+      'not loaded' not in
+      ((remoteterminal_uninstall_service_stop.stdout ~ remoteterminal_uninstall_service_stop.stderr) | lower)
+    - >-
+      'not found' not in
+      ((remoteterminal_uninstall_service_stop.stdout ~ remoteterminal_uninstall_service_stop.stderr) | lower)
+    - >-
+      'does not exist' not in
+      ((remoteterminal_uninstall_service_stop.stdout ~ remoteterminal_uninstall_service_stop.stderr) | lower)
+
+- name: Disable exact Remote Terminal service even after interrupted unit removal
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/systemctl
+      - disable
+      - "{{ remoteterminal_service_name }}.service"
+  register: remoteterminal_uninstall_service_disable
+  changed_when: >-
+    remoteterminal_uninstall_service_disable.rc == 0 and
+    (remoteterminal_uninstall_service_disable.stdout ~
+     remoteterminal_uninstall_service_disable.stderr) | trim | length > 0
+  failed_when:
+    - remoteterminal_uninstall_service_disable.rc != 0
+    - >-
+      'no such file or directory' not in
+      ((remoteterminal_uninstall_service_disable.stdout ~ remoteterminal_uninstall_service_disable.stderr) | lower)
+    - >-
+      'not loaded' not in
+      ((remoteterminal_uninstall_service_disable.stdout ~ remoteterminal_uninstall_service_disable.stderr) | lower)
+    - >-
+      'not found' not in
+      ((remoteterminal_uninstall_service_disable.stdout ~ remoteterminal_uninstall_service_disable.stderr) | lower)
+    - >-
+      'does not exist' not in
+      ((remoteterminal_uninstall_service_disable.stdout ~ remoteterminal_uninstall_service_disable.stderr) | lower)
+
+- name: Inspect private Remote Terminal runtime directory
+  ansible.builtin.stat:
+    path: "/run/{{ remoteterminal_runtime_directory_name }}"
+    follow: false
+  register: remoteterminal_uninstall_runtime_directory
+
+- name: Inspect private Remote Terminal tmux socket without following links
+  ansible.builtin.stat:
+    path: "/run/{{ remoteterminal_runtime_directory_name }}/tmux.sock"
+    follow: false
+  register: remoteterminal_uninstall_tmux_socket
+
+- name: Look up requested uninstall account
+  ansible.builtin.getent:
+    database: passwd
+    key: "{{ remoteterminal_uninstall_user }}"
+    fail_key: false
+  when: remoteterminal_uninstall_user | length > 0
+
+- name: Determine safe tmux cleanup account
+  ansible.builtin.set_fact:
+    remoteterminal_uninstall_user_valid: >-
+      {{ remoteterminal_uninstall_user | length > 0 and
+         remoteterminal_uninstall_user in (ansible_facts.getent_passwd | default({})) and
+         (ansible_facts.getent_passwd[remoteterminal_uninstall_user][1] | int) != 0 }}
+
+- name: Require verified non-root tmux cleanup account
+  ansible.builtin.assert:
+    that:
+      - remoteterminal_uninstall_user_valid | bool
+    fail_msg: >-
+      Supply remoteterminal_user (or remoteterminal_uninstall_user) as the exact
+      non-root account used by the service. Uninstall refuses to remove runtime
+      state when it cannot safely stop the application-owned tmux server as its
+      owner.
+
+- name: Record safe tmux cleanup account home
+  ansible.builtin.set_fact:
+    remoteterminal_uninstall_user_home: >-
+      {{ ansible_facts.getent_passwd[remoteterminal_uninstall_user][4] }}
+  when: remoteterminal_uninstall_user_valid | bool
+
+- name: Stop only the application-owned tmux server
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/tmux
+      - -S
+      - "/run/{{ remoteterminal_runtime_directory_name }}/tmux.sock"
+      - kill-server
+  register: remoteterminal_uninstall_tmux_stop
+  become: true
+  become_user: "{{ remoteterminal_uninstall_user }}"
+  environment:
+    HOME: "{{ remoteterminal_uninstall_user_home }}"
+  changed_when: remoteterminal_uninstall_tmux_stop.rc == 0
+  failed_when:
+    - remoteterminal_uninstall_tmux_stop.rc != 0
+    - "'no server running' not in (remoteterminal_uninstall_tmux_stop.stderr | lower)"
+    - "'no such file' not in (remoteterminal_uninstall_tmux_stop.stderr | lower)"
+  when:
+    - remoteterminal_uninstall_user_valid | bool
+    - remoteterminal_uninstall_runtime_directory.stat.exists
+    - remoteterminal_uninstall_runtime_directory.stat.isdir
+    - not (remoteterminal_uninstall_runtime_directory.stat.islnk | default(false))
+    - remoteterminal_uninstall_tmux_socket.stat.exists
+    - remoteterminal_uninstall_tmux_socket.stat.issock | default(false)
+    - not (remoteterminal_uninstall_tmux_socket.stat.islnk | default(false))
+
+- name: Report skipped unsafe or unverifiable tmux cleanup
+  ansible.builtin.debug:
+    msg: >-
+      Skipped tmux kill-server because the requested non-root cleanup account,
+      runtime directory, or Unix socket could not be verified safely. The
+      application runtime directory will still be removed without contacting
+      any possibly unrelated tmux server.
+  when: >-
+    not (remoteterminal_uninstall_user_valid | bool) or
+    not remoteterminal_uninstall_runtime_directory.stat.exists or
+    not remoteterminal_uninstall_runtime_directory.stat.isdir or
+    (remoteterminal_uninstall_runtime_directory.stat.islnk | default(false)) or
+    not remoteterminal_uninstall_tmux_socket.stat.exists or
+    not (remoteterminal_uninstall_tmux_socket.stat.issock | default(false)) or
+    (remoteterminal_uninstall_tmux_socket.stat.islnk | default(false))
+
+- name: Remove Remote Terminal systemd unit
+  ansible.builtin.file:
+    path: "{{ remoteterminal_systemd_unit_path }}"
+    state: absent
+
+- name: Reload systemd after unit removal
+  ansible.builtin.systemd_service:
+    daemon_reload: true
+  changed_when: false
+
+- name: Reset failed Remote Terminal systemd state
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/systemctl
+      - reset-failed
+      - "{{ remoteterminal_service_name }}.service"
+  register: remoteterminal_reset_failed
+  changed_when: false
+  failed_when:
+    - remoteterminal_reset_failed.rc != 0
+    - >-
+      'not found' not in
+      ((remoteterminal_reset_failed.stdout ~ remoteterminal_reset_failed.stderr) | lower)
+    - >-
+      'not loaded' not in
+      ((remoteterminal_reset_failed.stdout ~ remoteterminal_reset_failed.stderr) | lower)
+
+- name: Remove Remote Terminal PAM policy
+  ansible.builtin.file:
+    path: "{{ remoteterminal_pam_policy_path }}"
+    state: absent
+
+- name: Remove Remote Terminal interactive PAM verifier
+  ansible.builtin.file:
+    path: "{{ remoteterminal_pam_check_path }}"
+    state: absent
+
+- name: Remove application runtime directory
+  ansible.builtin.file:
+    path: "/run/{{ remoteterminal_runtime_directory_name }}"
+    state: absent
+
+- name: Remove application installation
+  ansible.builtin.file:
+    path: "{{ remoteterminal_install_root }}"
+    state: absent
+  when: not (remoteterminal_uninstall_preserve_installation | bool)
+
+- name: Remove application configuration and TLS material
+  ansible.builtin.file:
+    path: "{{ remoteterminal_config_dir }}"
+    state: absent
+  when: not (remoteterminal_uninstall_preserve_config | bool)
+
+- name: Remove application state directory
+  ansible.builtin.file:
+    path: "/var/lib/{{ remoteterminal_state_directory_name }}"
+    state: absent
+  when: not (remoteterminal_uninstall_preserve_state | bool)
+
+- name: Remove source-build cache
+  ansible.builtin.file:
+    path: "{{ remoteterminal_build_root }}"
+    state: absent
+  when: not (remoteterminal_uninstall_preserve_build_cache | bool)
+
+- name: Report explicit uninstall preservation semantics
+  ansible.builtin.debug:
+    msg:
+      - >-
+        Remote Terminal is uninstalled. Its private runtime directory and
+        application-owned tmux/ttyd processes are stopped; Remote Terminal tmux
+        sessions are not preserved.
+      - >-
+        Unrelated tmux servers, the selected user's home directory and files,
+        LinuxCNC configuration, and installed Debian dependency packages were
+        not modified or removed.
+      - >-
+        Preserved by requested overrides: installation={{ remoteterminal_uninstall_preserve_installation | bool }},
+        config_and_tls={{ remoteterminal_uninstall_preserve_config | bool }},
+        state={{ remoteterminal_uninstall_preserve_state | bool }},
+        build_cache={{ remoteterminal_uninstall_preserve_build_cache | bool }}.

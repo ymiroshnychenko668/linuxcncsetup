@@ -1,0 +1,13 @@
+---
+- name: Build and install Remote Terminal
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  become: true
+  any_errors_fatal: true
+
+  vars:
+    remoteterminal_state: present
+
+  roles:
+    - role: remoteterminal
