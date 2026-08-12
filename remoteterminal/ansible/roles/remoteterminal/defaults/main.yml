@@ -59,11 +59,12 @@ remoteterminal_deployment_applied_marker: "{{ remoteterminal_config_dir }}/deplo
 # reported by Ansible facts at install time.
 remoteterminal_validate_listen_address_is_local: true
 
-# ttyd 1.7.7 is pinned by both immutable commit URL and archive digest.
+# ttyd 1.7.7 plus upstream xterm clipboard support is pinned by both an
+# immutable commit URL and archive digest.
 remoteterminal_ttyd_version: "1.7.7"
-remoteterminal_ttyd_commit: 40e79c706be14029b391f369bee6613c31667abb
-remoteterminal_ttyd_archive_url: "https://github.com/tsl0922/ttyd/archive/40e79c706be14029b391f369bee6613c31667abb.tar.gz"
-remoteterminal_ttyd_archive_checksum: "sha256:1f6f53a5021a2cee4af9b975f3dc7a3185bd261c23a84f7b680285f6c1a50341"
+remoteterminal_ttyd_commit: b1eaaee2ca70774c6cb045645914ebc27a70dedd
+remoteterminal_ttyd_archive_url: "https://github.com/tsl0922/ttyd/archive/b1eaaee2ca70774c6cb045645914ebc27a70dedd.tar.gz"
+remoteterminal_ttyd_archive_checksum: "sha256:0d7081e59aba7245782647f10e7a81cd7b0f63041c41a62dd81caf07e7d6db86"
 
 # Health verification controls.
 remoteterminal_health_retries: 20

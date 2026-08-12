@@ -346,7 +346,7 @@ export function Workspace({ machineName, username, onLogout }: WorkspaceProps) {
           </div>
           <div className="topbar__actions">
             <button className="button button--ghost" type="button" onClick={() => setShowHelp(true)}>
-              <KeyboardIcon /> <span>Clipboard help</span>
+              <KeyboardIcon /> <span>Copy &amp; paste</span>
             </button>
             {activeSession ? (
               <button
@@ -415,7 +415,7 @@ export function Workspace({ machineName, username, onLogout }: WorkspaceProps) {
               <button className="button button--primary button--large" type="button" onClick={() => setShowCreate(true)}>
                 <PlusIcon /> Create a session
               </button>
-              <div className="shortcut-note"><KeyboardIcon /> Copy with <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>C</kbd>, paste with <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>V</kbd></div>
+              <div className="shortcut-note"><KeyboardIcon /> Copy: drag over text and release. If needed, hold <kbd>Shift</kbd> while dragging. Paste: <kbd>Ctrl</kbd>+<kbd>V</kbd>.</div>
             </section>
           ) : null}
         </div>
@@ -426,11 +426,12 @@ export function Workspace({ machineName, username, onLogout }: WorkspaceProps) {
       {showHelp ? (
         <Modal title="Terminal copy and paste" onClose={() => setShowHelp(false)}>
           <div className="shortcut-grid">
-            <div><span>Copy selected text</span><kbd>Ctrl</kbd><span>+</span><kbd>Shift</kbd><span>+</span><kbd>C</kbd></div>
-            <div><span>Paste clipboard text</span><kbd>Ctrl</kbd><span>+</span><kbd>Shift</kbd><span>+</span><kbd>V</kbd></div>
+            <div><span>Copy with tmux</span><span>drag</span></div>
+            <div><span>Browser selection fallback</span><kbd>Shift</kbd><span>+</span><span>drag</span></div>
+            <div><span>Paste from this device</span><kbd>Ctrl</kbd><span>+</span><kbd>V</kbd></div>
             <div><span>Alternative paste</span><kbd>Shift</kbd><span>+</span><kbd>Insert</kbd></div>
           </div>
-          <p className="modal-note">Hold <kbd>Shift</kbd> while dragging to make a browser text selection when tmux mouse scrolling is active. Your browser may ask for clipboard permission. Text stays between your clipboard and the terminal.</p>
+          <p className="modal-note">Yellow highlighting is tmux copy mode. Release to copy it to this device. If your browser blocks clipboard access, allow it for this HTTPS site or hold <kbd>Shift</kbd> while dragging. Press <kbd>Esc</kbd> to clear a selection.</p>
         </Modal>
       ) : null}
     </div>

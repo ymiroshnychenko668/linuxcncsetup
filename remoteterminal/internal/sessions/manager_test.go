@@ -29,6 +29,8 @@ type fakeRunner struct {
 	mu                         sync.Mutex
 	sessions                   map[string]*fakeTmuxSession
 	calls                      [][]string
+	clipboardMode              string
+	clipboardTerminalOverride  string
 	newSessionErrorAfterCreate error
 }
 
@@ -90,6 +92,23 @@ func (f *fakeRunner) Run(_ context.Context, binary string, args ...string) ([]by
 		}
 		return nil, nil
 	case "set-option":
+		if len(commandArgs) == 6 && commandArgs[3] == "-s" {
+			switch commandArgs[4] {
+			case tmuxClipboardModeOption:
+				if commandArgs[5] != tmuxClipboardMode {
+					return nil, fmt.Errorf("unsafe clipboard mode: %v", call)
+				}
+				f.clipboardMode = commandArgs[5]
+			case tmuxClipboardOption:
+				if commandArgs[5] != tmuxClipboardTerminalOverride {
+					return nil, fmt.Errorf("unsafe clipboard terminal override: %v", call)
+				}
+				f.clipboardTerminalOverride = commandArgs[5]
+			default:
+				return nil, fmt.Errorf("unsafe server set-option args: %v", call)
+			}
+			return nil, nil
+		}
 		if len(commandArgs) != 7 || commandArgs[3] != "-t" {
 			return nil, fmt.Errorf("unsafe set-option args: %v", call)
 		}
@@ -253,12 +272,22 @@ func TestCreateListConnectDeleteLifecycle(t *testing.T) {
 	}
 	runner.mu.Lock()
 	mouseEnabled := runner.sessions[tmuxTarget(created.ID)].mouse
+	clipboardMode := runner.clipboardMode
+	clipboardTerminalOverride := runner.clipboardTerminalOverride
 	runner.mu.Unlock()
 	if !mouseEnabled {
 		t.Fatal("Connect() did not enable tmux mouse scrolling")
 	}
+	if clipboardTerminalOverride != tmuxClipboardTerminalOverride {
+		t.Fatalf("Connect() clipboard override = %q, want %q", clipboardTerminalOverride, tmuxClipboardTerminalOverride)
+	}
+	if clipboardMode != tmuxClipboardMode {
+		t.Fatalf("Connect() clipboard mode = %q, want %q", clipboardMode, tmuxClipboardMode)
+	}
 	runner.mu.Lock()
 	runner.sessions[tmuxTarget(created.ID)].mouse = false
+	runner.clipboardMode = ""
+	runner.clipboardTerminalOverride = ""
 	runner.mu.Unlock()
 	if _, _, err := manager.Connect(context.Background(), created.ID); err != nil {
 		t.Fatal(err)
@@ -268,9 +297,17 @@ func TestCreateListConnectDeleteLifecycle(t *testing.T) {
 	}
 	runner.mu.Lock()
 	mouseEnabled = runner.sessions[tmuxTarget(created.ID)].mouse
+	clipboardMode = runner.clipboardMode
+	clipboardTerminalOverride = runner.clipboardTerminalOverride
 	runner.mu.Unlock()
 	if !mouseEnabled {
 		t.Fatal("repeated Connect() did not restore tmux mouse scrolling before reusing ttyd")
+	}
+	if clipboardTerminalOverride != tmuxClipboardTerminalOverride {
+		t.Fatalf("repeated Connect() clipboard override = %q, want %q", clipboardTerminalOverride, tmuxClipboardTerminalOverride)
+	}
+	if clipboardMode != tmuxClipboardMode {
+		t.Fatalf("repeated Connect() clipboard mode = %q, want %q", clipboardMode, tmuxClipboardMode)
 	}
 	if err := manager.Delete(context.Background(), created.ID); err != nil {
 		t.Fatal(err)

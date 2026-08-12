@@ -116,7 +116,7 @@ Persistence in version 1 is limited to browser disconnects, tab closure, and log
 
 ### Copy and paste
 
-Select terminal text and use `Ctrl+Shift+C` to copy. Because tmux handles mouse scrolling, hold `Shift` while dragging when the browser needs to select text directly. Use `Ctrl+Shift+V` or `Shift+Insert` to paste. Clipboard access requires the HTTPS origin and may prompt for browser permission.
+Because tmux handles mouse scrolling, a normal drag creates a yellow tmux copy-mode selection. Release to copy it to the browser device through ttyd's OSC 52 clipboard support, and press `Esc` if a selection needs to be cleared. If the browser blocks clipboard access, allow it for the HTTPS site or hold `Shift` while dragging to use ttyd's browser-selection fallback. Use `Ctrl+V` to paste, with `Shift+Insert` as an alternative.
 
 ## Local development
 

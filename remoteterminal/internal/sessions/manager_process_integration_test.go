@@ -173,6 +173,14 @@ func TestManagerRealProcessLifecycle(t *testing.T) {
 		"show-options", "-v", "-t", tmuxTarget(created.ID), "mouse").CombinedOutput(); err != nil || strings.TrimSpace(string(output)) != "on" {
 		t.Fatalf("Connect did not enable tmux mouse scrolling: %v (%s)", err, strings.TrimSpace(string(output)))
 	}
+	if output, err := exec.CommandContext(ctx, tmuxBinary, "-S", manager.tmuxSocket(),
+		"show-options", "-sv", tmuxClipboardOption).CombinedOutput(); err != nil || strings.TrimSpace(string(output)) != tmuxClipboardTerminalOverride {
+		t.Fatalf("Connect did not configure browser clipboard integration: %v (%s)", err, strings.TrimSpace(string(output)))
+	}
+	if output, err := exec.CommandContext(ctx, tmuxBinary, "-S", manager.tmuxSocket(),
+		"show-options", "-sv", tmuxClipboardModeOption).CombinedOutput(); err != nil || strings.TrimSpace(string(output)) != tmuxClipboardMode {
+		t.Fatalf("Connect did not restrict browser clipboard integration: %v (%s)", err, strings.TrimSpace(string(output)))
+	}
 	firstManaged, ttydPID := integrationManagedProcess(t, manager, created.ID)
 	ttydSocket := manager.ttydSocket(created.ID)
 	if info, err := os.Stat(ttydSocket); err != nil || info.Mode()&os.ModeSocket == 0 {
@@ -202,6 +210,9 @@ func TestManagerRealProcessLifecycle(t *testing.T) {
 	if response.StatusCode != http.StatusOK || len(body) == 0 || !bytes.Contains(bytes.ToLower(body), []byte("ttyd")) {
 		t.Fatalf("proxied ttyd index: status=%d bytes=%d contains-ttyd=%t",
 			response.StatusCode, len(body), bytes.Contains(bytes.ToLower(body), []byte("ttyd")))
+	}
+	if !bytes.Contains(body, []byte("navigator.clipboard.writeText")) {
+		t.Fatal("proxied ttyd frontend does not contain the OSC 52 browser clipboard provider")
 	}
 	t.Logf("Connect/Proxy: ttyd_pid=%d socket=%s HTTP=%d body_bytes=%d",
 		ttydPID, ttydSocket, response.StatusCode, len(body))
@@ -233,6 +244,17 @@ func TestManagerRealProcessLifecycle(t *testing.T) {
 	firstOutput, err := firstWS.readTTydOutputUntil(executedMarker, 8*time.Second)
 	if err != nil {
 		t.Fatalf("distinctive command output: %v; output=%q", err, firstOutput)
+	}
+	clipboardText := []byte("__REMOTE_TERMINAL_CLIPBOARD_" + value + "__")
+	clipboardSequence := []byte("\x1b]52;c;" + base64.StdEncoding.EncodeToString(clipboardText) + "\a")
+	clipboardCommand := exec.CommandContext(ctx, tmuxBinary, "-S", manager.tmuxSocket(), "load-buffer", "-w", "-")
+	clipboardCommand.Stdin = bytes.NewReader(clipboardText)
+	if output, err := clipboardCommand.CombinedOutput(); err != nil {
+		t.Fatalf("request tmux clipboard write: %v (%s)", err, strings.TrimSpace(string(output)))
+	}
+	clipboardOutput, err := firstWS.readTTydOutputUntil(clipboardSequence, 8*time.Second)
+	if err != nil {
+		t.Fatalf("OSC 52 browser clipboard output: %v; output=%q", err, clipboardOutput)
 	}
 	t.Logf("WebSocket: HTTP=101 subprotocol=%s command_marker=%s", firstWS.subprotocol, executedMarker)
 	if err := firstWS.Close(); err != nil {

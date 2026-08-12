@@ -35,7 +35,13 @@ var (
 	ErrShuttingDown       = errors.New("service is shutting down")
 )
 
-const tmuxListFormat = "#{session_name}\t#{@remoteterminal-id}\t#{@remoteterminal-name}\t#{session_attached}\t#{session_windows}\t#{session_created}"
+const (
+	tmuxListFormat                = "#{session_name}\t#{@remoteterminal-id}\t#{@remoteterminal-name}\t#{session_attached}\t#{session_windows}\t#{session_created}"
+	tmuxClipboardModeOption       = "set-clipboard"
+	tmuxClipboardMode             = "external"
+	tmuxClipboardOption           = "terminal-overrides"
+	tmuxClipboardTerminalOverride = `xterm-256color:Ms=\E]52;c;%p2%s\007`
+)
 
 // Session is the public description returned by the API. ID is an opaque,
 // random identifier; Name is user-selected display text and is never used in a
@@ -358,6 +364,22 @@ func (m *Manager) Connect(ctx context.Context, id string) (Session, string, erro
 	session, err := m.findLocked(ctx, id)
 	if err != nil {
 		return Session{}, "", err
+	}
+	// tmux normally emits OSC 52 with an empty clipboard selector, while ttyd's
+	// xterm clipboard addon accepts the explicit "c" system-clipboard selector.
+	// The private server always exposes ttyd as xterm-256color, so replace its
+	// otherwise-empty terminal-overrides array before a client attaches. Setting
+	// the complete option (rather than appending) keeps repeated connects
+	// idempotent and cannot affect the user's ordinary tmux server. External
+	// mode lets tmux copy out but prevents pane applications from setting the
+	// browser clipboard through tmux.
+	if output, err := m.runner.Run(ctx, m.config.TmuxBinary,
+		"-S", m.tmuxSocket(), "set-option", "-s", tmuxClipboardModeOption, tmuxClipboardMode); err != nil {
+		return Session{}, "", commandError("restrict tmux clipboard integration", output, err)
+	}
+	if output, err := m.runner.Run(ctx, m.config.TmuxBinary,
+		"-S", m.tmuxSocket(), "set-option", "-s", tmuxClipboardOption, tmuxClipboardTerminalOverride); err != nil {
+		return Session{}, "", commandError("enable browser clipboard integration", output, err)
 	}
 	// tmux owns the scrollback while attached through ttyd. Without mouse
 	// handling, xterm.js sees tmux's alternate screen and converts wheel input

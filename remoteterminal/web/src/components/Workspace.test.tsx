@@ -139,4 +139,22 @@ describe('Workspace', () => {
 
     expect(await screen.findByRole('heading', { name: 'Workshop Mill / Workspace' })).toBeInTheDocument()
   })
+
+  it('explains how tmux mouse mode affects browser copy and paste', async () => {
+    render(<Workspace machineName="Workshop Mill" username="operator" onLogout={vi.fn()} />)
+    const user = userEvent.setup()
+
+    await user.click(screen.getByRole('button', { name: 'Copy & paste' }))
+
+    const dialog = screen.getByRole('dialog', { name: 'Terminal copy and paste' })
+    expect(within(dialog).getByText('Copy with tmux')).toBeInTheDocument()
+    expect(within(dialog).getByText('Browser selection fallback')).toBeInTheDocument()
+    expect(within(dialog).getByText('Paste from this device')).toBeInTheDocument()
+    expect(dialog).toHaveTextContent('Shift+drag')
+    expect(dialog).toHaveTextContent('Ctrl+V')
+    expect(dialog).toHaveTextContent('Yellow highlighting is tmux copy mode')
+    expect(dialog).toHaveTextContent('Release to copy it to this device')
+    expect(dialog).toHaveTextContent('Press Esc to clear a selection')
+    expect(dialog).not.toHaveTextContent('Ctrl+Shift+C')
+  })
 })

@@ -256,12 +256,17 @@ Closing a frontend tab only detaches that browser view. Deleting a session is a 
 
 Version 1 uses the pinned ttyd/xterm browser client inside a same-origin terminal frame.
 
-- Copy selected text with `Ctrl+Shift+C`.
-- Paste with `Ctrl+Shift+V` or `Shift+Insert`.
+- Copy a yellow tmux selection to the browser clipboard through OSC 52 when the
+  mouse button is released.
+- Use `Shift` while dragging as the browser-selection copy fallback.
+- Paste with `Ctrl+V` or `Shift+Insert`.
 - Permit clipboard access on the terminal frame.
 - Test plain text, multiline text, Unicode, and Ukrainian keyboard input in supported browsers.
 
-This plan interprets "copy/paste" as standard terminal shortcuts. Visible React Copy and Paste buttons would require either a maintained ttyd client bridge or a direct React/xterm implementation of ttyd's WebSocket protocol and therefore need a separate explicit requirement.
+The pinned ttyd client supplies the maintained xterm clipboard bridge. Visible
+React Copy and Paste buttons would require a direct parent-frame bridge or a
+direct React/xterm implementation of ttyd's WebSocket protocol and therefore
+need a separate explicit requirement.
 
 ## Systemd deployment
 
@@ -423,7 +428,7 @@ These remain the release criteria. Source implementation and local automation do
 ## Current version 1 decisions and defaults
 
 1. **TLS:** A generated self-signed certificate is accepted as the default. Operators must verify its reported fingerprint; a supplied certificate/key pair is the supported override. Requiring a trusted certificate or adding certificate prompts to the TUI remains a future policy/UI choice.
-2. **Clipboard:** Standard terminal shortcuts are the version 1 interface: `Ctrl+Shift+C` to copy and `Ctrl+Shift+V` or `Shift+Insert` to paste. Visible React Copy/Paste buttons remain a future feature if explicitly required.
+2. **Clipboard:** Releasing a yellow tmux selection copies through OSC 52; `Shift`-drag is the browser-selection fallback. Paste uses `Ctrl+V` or `Shift+Insert`. Visible React Copy/Paste buttons remain a future feature if explicitly required.
 3. **Port:** `8443` is the default HTTPS port. `remoteterminal_port` overrides it within the validated unprivileged port range.
 4. **Session limit:** Eight managed sessions is the default. `remoteterminal_max_sessions` overrides it from 1 through 64.
 5. **Persistence:** Version 1 preserves tmux sessions across browser disconnect, tab closure, and logout while the service continues running. Service restart, upgrade restart, reboot, and uninstall are outside that guarantee. Durable restart/reboot persistence is a future design choice.
