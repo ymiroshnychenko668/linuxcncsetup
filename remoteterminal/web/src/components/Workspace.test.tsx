@@ -19,6 +19,26 @@ const beta: TerminalSession = {
   terminalConnected: false,
 }
 
+function installTerminalFocus(frame: HTMLIFrameElement) {
+  const terminalDocument = document.implementation.createHTMLDocument('terminal')
+  const textarea = terminalDocument.createElement('textarea')
+  terminalDocument.body.append(textarea)
+  let textareaFocused = false
+  Object.defineProperty(terminalDocument, 'activeElement', {
+    configurable: true,
+    get: () => textareaFocused ? textarea : terminalDocument.body,
+  })
+  const focus = vi.fn(() => {
+    frame.focus()
+    textareaFocused = true
+  })
+  Object.defineProperty(frame.contentWindow, 'term', {
+    configurable: true,
+    value: { focus, textarea },
+  })
+  return focus
+}
+
 const mocks = vi.hoisted(() => ({
   getSessions: vi.fn(),
   connectSession: vi.fn(),
@@ -75,6 +95,39 @@ describe('Workspace', () => {
     tabs[1].focus()
     await user.keyboard('{ArrowUp}')
     expect(screen.getByRole('tab', { name: /alpha/i })).toHaveAttribute('aria-selected', 'true')
+  })
+
+  it('focuses ttyd after a clicked tab switch but keeps arrow navigation on the tablist', async () => {
+    render(<Workspace machineName="Workshop Mill" username="operator" onLogout={vi.fn()} />)
+    const user = userEvent.setup()
+
+    await user.click(await screen.findByRole('button', { name: /alpha.*open/i }))
+    const alphaFrame = await screen.findByTitle('alpha terminal') as HTMLIFrameElement
+    const focusAlpha = installTerminalFocus(alphaFrame)
+    await waitFor(() => expect(focusAlpha).toHaveBeenCalled())
+
+    await user.click(screen.getByRole('button', { name: /beta.*open/i }))
+    const betaFrame = await screen.findByTitle('beta terminal') as HTMLIFrameElement
+    const focusBeta = installTerminalFocus(betaFrame)
+    await waitFor(() => expect(focusBeta).toHaveBeenCalled())
+
+    focusAlpha.mockClear()
+    focusBeta.mockClear()
+    const alphaTab = screen.getByRole('tab', { name: /alpha/i })
+    await user.click(alphaTab)
+    await waitFor(() => expect(focusAlpha).toHaveBeenCalledTimes(1))
+    expect(document.activeElement).toBe(alphaFrame)
+    expect(focusBeta).not.toHaveBeenCalled()
+
+    focusAlpha.mockClear()
+    alphaTab.focus()
+    await user.keyboard('{ArrowDown}')
+    const betaTab = screen.getByRole('tab', { name: /beta/i })
+    expect(betaTab).toHaveAttribute('aria-selected', 'true')
+    expect(document.activeElement).toBe(betaTab)
+    await new Promise((resolve) => window.setTimeout(resolve, 30))
+    expect(focusAlpha).not.toHaveBeenCalled()
+    expect(focusBeta).not.toHaveBeenCalled()
   })
 
   it('closing a tab leaves tmux running while deletion is confirmed separately', async () => {

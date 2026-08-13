@@ -22,8 +22,11 @@ vi.mock('../api', async () => {
 
 interface MockTerminal {
   fit: ReturnType<typeof vi.fn>
+  focus: ReturnType<typeof vi.fn>
+  focusTextarea: () => void
   refresh: ReturnType<typeof vi.fn>
   rows: number
+  textarea: HTMLTextAreaElement
 }
 
 class MockResizeObserver {
@@ -54,10 +57,27 @@ function flushAnimationFrames() {
 }
 
 function installTerminal(frame: HTMLIFrameElement): MockTerminal {
+  const terminalDocument = document.implementation.createHTMLDocument('terminal')
+  const textarea = terminalDocument.createElement('textarea')
+  terminalDocument.body.append(textarea)
+  let textareaFocused = false
+  const focusTextarea = () => {
+    textareaFocused = true
+  }
+  Object.defineProperty(terminalDocument, 'activeElement', {
+    configurable: true,
+    get: () => textareaFocused ? textarea : terminalDocument.body,
+  })
   const terminal = {
     fit: vi.fn(),
+    focus: vi.fn(() => {
+      frame.focus()
+      focusTextarea()
+    }),
+    focusTextarea,
     refresh: vi.fn(),
     rows: 24,
+    textarea,
   }
   Object.defineProperty(frame.contentWindow, 'term', {
     configurable: true,
@@ -99,6 +119,7 @@ describe('TerminalPanel', () => {
       <TerminalPanel
         session={session}
         active={false}
+        focusRequestKey={0}
         reconnectKey={0}
         onStateChange={onStateChange}
         onSessionChange={onSessionChange}
@@ -112,6 +133,7 @@ describe('TerminalPanel', () => {
       <TerminalPanel
         session={session}
         active
+        focusRequestKey={0}
         reconnectKey={0}
         onStateChange={onStateChange}
         onSessionChange={onSessionChange}
@@ -139,6 +161,7 @@ describe('TerminalPanel', () => {
       <TerminalPanel
         session={session}
         active={false}
+        focusRequestKey={0}
         reconnectKey={0}
         onStateChange={onStateChange}
         onSessionChange={onSessionChange}
@@ -151,6 +174,7 @@ describe('TerminalPanel', () => {
       <TerminalPanel
         session={session}
         active
+        focusRequestKey={0}
         reconnectKey={0}
         onStateChange={onStateChange}
         onSessionChange={onSessionChange}
@@ -173,6 +197,7 @@ describe('TerminalPanel', () => {
       <TerminalPanel
         session={session}
         active={false}
+        focusRequestKey={0}
         reconnectKey={0}
         onStateChange={onStateChange}
         onSessionChange={onSessionChange}
@@ -187,5 +212,122 @@ describe('TerminalPanel', () => {
     unmount()
     expect(animationFrames.size).toBe(0)
     await waitFor(() => expect(mocks.connectSession).toHaveBeenCalledTimes(1))
+  })
+
+  it('retries an explicit focus request until xterm is ready', async () => {
+    const onStateChange = vi.fn()
+    const onSessionChange = vi.fn()
+    const { rerender } = render(
+      <TerminalPanel
+        session={session}
+        active={false}
+        focusRequestKey={0}
+        reconnectKey={0}
+        onStateChange={onStateChange}
+        onSessionChange={onSessionChange}
+      />,
+    )
+    const frame = await screen.findByTitle('alpha terminal') as HTMLIFrameElement
+
+    vi.useFakeTimers()
+    try {
+      frame.focus()
+      rerender(
+        <TerminalPanel
+          session={session}
+          active
+          focusRequestKey={1}
+          reconnectKey={0}
+          onStateChange={onStateChange}
+          onSessionChange={onSessionChange}
+        />,
+      )
+      flushAnimationFrames()
+
+      const terminal = installTerminal(frame)
+      let focusCalls = 0
+      terminal.focus.mockImplementation(() => {
+        frame.focus()
+        focusCalls += 1
+        if (focusCalls > 1) terminal.focusTextarea()
+      })
+      act(() => vi.advanceTimersByTime(50))
+      flushAnimationFrames()
+      expect(terminal.focus).toHaveBeenCalledTimes(1)
+      expect(terminal.textarea.ownerDocument.activeElement).not.toBe(terminal.textarea)
+
+      act(() => vi.advanceTimersByTime(100))
+      flushAnimationFrames()
+      expect(terminal.focus).toHaveBeenCalledTimes(2)
+      expect(terminal.textarea.ownerDocument.activeElement).toBe(terminal.textarea)
+      expect(document.activeElement).toBe(frame)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('abandons pending focus when the user moves to another control or tab', async () => {
+    const onStateChange = vi.fn()
+    const onSessionChange = vi.fn()
+    const { rerender } = render(
+      <TerminalPanel
+        session={session}
+        active={false}
+        focusRequestKey={0}
+        reconnectKey={0}
+        onStateChange={onStateChange}
+        onSessionChange={onSessionChange}
+      />,
+    )
+    const frame = await screen.findByTitle('alpha terminal') as HTMLIFrameElement
+    const panel = frame.closest('[role="tabpanel"]') as HTMLElement
+
+    vi.useFakeTimers()
+    try {
+      frame.focus()
+      rerender(
+        <TerminalPanel
+          session={session}
+          active
+          focusRequestKey={1}
+          reconnectKey={0}
+          onStateChange={onStateChange}
+          onSessionChange={onSessionChange}
+        />,
+      )
+      flushAnimationFrames()
+      panel.focus()
+
+      const terminal = installTerminal(frame)
+      act(() => vi.advanceTimersByTime(50))
+      flushAnimationFrames()
+      expect(terminal.focus).not.toHaveBeenCalled()
+      expect(document.activeElement).toBe(panel)
+
+      rerender(
+        <TerminalPanel
+          session={session}
+          active={false}
+          focusRequestKey={2}
+          reconnectKey={0}
+          onStateChange={onStateChange}
+          onSessionChange={onSessionChange}
+        />,
+      )
+      rerender(
+        <TerminalPanel
+          session={session}
+          active
+          focusRequestKey={2}
+          reconnectKey={0}
+          onStateChange={onStateChange}
+          onSessionChange={onSessionChange}
+        />,
+      )
+      flushAnimationFrames()
+      expect(terminal.focus).not.toHaveBeenCalled()
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })

@@ -6,8 +6,10 @@ export type TerminalState = 'connecting' | 'connected' | 'error'
 
 interface TtydTerminal {
   fit?: () => void
+  focus?: () => void
   refresh?: (start: number, end: number) => void
   rows?: number
+  textarea?: HTMLTextAreaElement
 }
 
 type TtydWindow = Window & { term?: TtydTerminal }
@@ -17,12 +19,13 @@ const REFIT_RETRY_DELAYS_MS = [50, 100, 200, 400, 800, 1600] as const
 interface TerminalPanelProps {
   session: TerminalSession
   active: boolean
+  focusRequestKey: number
   reconnectKey: number
   onStateChange: (id: string, state: TerminalState) => void
   onSessionChange: (session: TerminalSession) => void
 }
 
-export function TerminalPanel({ session, active, reconnectKey, onStateChange, onSessionChange }: TerminalPanelProps) {
+export function TerminalPanel({ session, active, focusRequestKey, reconnectKey, onStateChange, onSessionChange }: TerminalPanelProps) {
   const [state, setState] = useState<TerminalState>('connecting')
   const [terminalUrl, setTerminalUrl] = useState<string | null>(null)
   const [frameKey, setFrameKey] = useState(0)
@@ -33,6 +36,11 @@ export function TerminalPanel({ session, active, reconnectKey, onStateChange, on
   const activeRef = useRef(active)
   const animationFrameRef = useRef<number | null>(null)
   const retryTimeoutRef = useRef<number | null>(null)
+  const focusRequestRef = useRef(0)
+  const focusedRequestRef = useRef(0)
+  const focusOwnerRef = useRef<Element | null>(null)
+  const focusAnimationFrameRef = useRef<number | null>(null)
+  const focusRetryTimeoutRef = useRef<number | null>(null)
 
   const updateState = useCallback((next: TerminalState) => {
     setState(next)
@@ -104,6 +112,70 @@ export function TerminalPanel({ session, active, reconnectKey, onStateChange, on
     })
   }, [cancelScheduledRefit, refitTerminal])
 
+  const cancelScheduledFocus = useCallback(() => {
+    if (focusAnimationFrameRef.current !== null) {
+      window.cancelAnimationFrame(focusAnimationFrameRef.current)
+      focusAnimationFrameRef.current = null
+    }
+    if (focusRetryTimeoutRef.current !== null) {
+      window.clearTimeout(focusRetryTimeoutRef.current)
+      focusRetryTimeoutRef.current = null
+    }
+  }, [])
+
+  const focusTerminal = useCallback(() => {
+    const frame = frameRef.current
+    if (!frame) return false
+
+    try {
+      const terminal = (frame.contentWindow as TtydWindow | null)?.term
+      if (typeof terminal?.focus === 'function') {
+        terminal.focus()
+        const textarea = terminal.textarea
+        if (textarea?.isConnected && textarea.ownerDocument.activeElement === textarea && document.activeElement === frame) {
+          return true
+        }
+      }
+    } catch {
+      // The iframe may still be navigating. Focusing the frame remains a safe
+      // fallback while bounded retries wait for the same-origin xterm object.
+    }
+    frame.focus()
+    return false
+  }, [])
+
+  const scheduleTerminalFocus = useCallback(function scheduleTerminalFocus(attempt = 0) {
+    const request = focusRequestRef.current
+    if (!activeRef.current || request <= focusedRequestRef.current) return
+
+    cancelScheduledFocus()
+    focusAnimationFrameRef.current = window.requestAnimationFrame(() => {
+      focusAnimationFrameRef.current = null
+      if (!activeRef.current || request !== focusRequestRef.current) return
+
+      const frame = frameRef.current
+      const activeElement = document.activeElement
+      const ownsFocus = activeElement === focusOwnerRef.current || activeElement === frame
+      if (!ownsFocus) {
+        // The request started from an explicit tab/open action. If the user
+        // has moved on while ttyd was loading, consume it instead of stealing
+        // focus back from their new control.
+        focusedRequestRef.current = request
+        return
+      }
+      if (focusTerminal()) {
+        focusedRequestRef.current = request
+        return
+      }
+      const retryDelay = REFIT_RETRY_DELAYS_MS[attempt]
+      if (retryDelay === undefined) return
+      focusRetryTimeoutRef.current = window.setTimeout(() => {
+        focusRetryTimeoutRef.current = null
+        scheduleTerminalFocus(attempt + 1)
+      }, retryDelay)
+    })
+  }, [cancelScheduledFocus, focusTerminal])
+
   useEffect(() => {
     void connect()
     return () => {
@@ -121,6 +193,24 @@ export function TerminalPanel({ session, active, reconnectKey, onStateChange, on
     scheduleTerminalRefit()
     return cancelScheduledRefit
   }, [active, cancelScheduledRefit, scheduleTerminalRefit])
+
+  useLayoutEffect(() => {
+    const changed = focusRequestRef.current !== focusRequestKey
+    focusRequestRef.current = focusRequestKey
+    if (changed) {
+      focusOwnerRef.current = document.activeElement
+    }
+    if (!active) {
+      cancelScheduledFocus()
+      // A focus intent belongs to the activation that created it. Do not
+      // replay it after a later keyboard-only tab activation.
+      focusedRequestRef.current = Math.max(focusedRequestRef.current, focusRequestKey)
+      return
+    }
+
+    scheduleTerminalFocus()
+    return cancelScheduledFocus
+  }, [active, cancelScheduledFocus, focusRequestKey, scheduleTerminalFocus])
 
   useEffect(() => {
     if (!active || typeof ResizeObserver === 'undefined' || !panelRef.current) return
@@ -168,6 +258,7 @@ export function TerminalPanel({ session, active, reconnectKey, onStateChange, on
           onLoad={() => {
             updateState('connected')
             scheduleTerminalRefit()
+            scheduleTerminalFocus()
           }}
           onError={() => {
             setError('The terminal connection was interrupted. Your tmux session is still running.')

@@ -75,6 +75,7 @@ export function Workspace({ machineName, username, onLogout }: WorkspaceProps) {
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [activatedIds, setActivatedIds] = useState<string[]>([])
   const [connectionStates, setConnectionStates] = useState<Record<string, TerminalState>>({})
+  const [focusRequestKeys, setFocusRequestKeys] = useState<Record<string, number>>({})
   const [reconnectKeys, setReconnectKeys] = useState<Record<string, number>>({})
   const [loadError, setLoadError] = useState<string | null>(null)
   const [actionError, setActionError] = useState<string | null>(null)
@@ -226,14 +227,20 @@ export function Workspace({ machineName, username, onLogout }: WorkspaceProps) {
     return () => window.clearTimeout(timeout)
   }, [copyState])
 
-  const activateSession = useCallback((id: string) => {
+  const activateSession = useCallback((id: string, focusTerminal = false) => {
     setActivatedIds((current) => current.includes(id) ? current : [...current, id])
     setSelectedId(id)
+    if (focusTerminal) {
+      setFocusRequestKeys((current) => ({
+        ...current,
+        [id]: (current[id] ?? 0) + 1,
+      }))
+    }
   }, [])
 
   const openSession = useCallback((id: string) => {
     setOpenIds((current) => current.includes(id) ? current : [...current, id])
-    activateSession(id)
+    activateSession(id, true)
     setSidebarOpen(false)
   }, [activateSession])
 
@@ -356,7 +363,7 @@ export function Workspace({ machineName, username, onLogout }: WorkspaceProps) {
                         aria-controls={`panel-${session.id}`}
                         tabIndex={selected || selectedId === null ? 0 : -1}
                         onClick={() => {
-                          activateSession(session.id)
+                          activateSession(session.id, true)
                           setSidebarOpen(false)
                         }}
                         onKeyDown={(event) => handleTabKeyDown(event, session.id)}
@@ -519,6 +526,7 @@ export function Workspace({ machineName, username, onLogout }: WorkspaceProps) {
                 key={session.id}
                 session={session}
                 active={session.id === selectedId}
+                focusRequestKey={focusRequestKeys[session.id] ?? 0}
                 reconnectKey={reconnectKeys[session.id] ?? 0}
                 onStateChange={onTerminalStateChange}
                 onSessionChange={onSessionChange}
