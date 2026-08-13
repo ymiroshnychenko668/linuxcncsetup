@@ -28,11 +28,10 @@
 - name: Parse installed tmux version
   ansible.builtin.set_fact:
     remoteterminal_tmux_version_major: >-
-      {{ remoteterminal_tmux_version.stdout |
-         regex_search('^tmux ([0-9]+)\.([0-9]+)', '\\1') | first | int }}
+      {{ remoteterminal_tmux_version.stdout.split()[1].split('.')[0] | int }}
     remoteterminal_tmux_version_minor: >-
-      {{ remoteterminal_tmux_version.stdout |
-         regex_search('^tmux ([0-9]+)\.([0-9]+)', '\\2') | first | int }}
+      {{ remoteterminal_tmux_version.stdout.split()[1].split('.')[1] |
+         regex_replace('[^0-9].*$', '') | int }}
   when: not ansible_check_mode
 
 - name: Verify tmux supports terminal default-colour queries
@@ -46,15 +45,6 @@
       Remote Terminal requires tmux 3.2 or newer because Codex uses OSC 10/11
       default-colour queries to render terminal block fills. The configured
       executable reported {{ remoteterminal_tmux_version.stdout }}.
-  when: not ansible_check_mode
-
-- name: Read installed Go version
-  ansible.builtin.command:
-    argv:
-      - /usr/bin/go
-      - version
-  register: remoteterminal_go_version
-  changed_when: false
   when: not ansible_check_mode
 
 - name: Read installed Node.js version
@@ -90,7 +80,7 @@
     remoteterminal_build_tool_package_versions: >-
       {{ remoteterminal_installed_package_versions.stdout_lines |
          select('match',
-                ('^(binutils|build-essential|cmake|gcc|golang|libc6-dev|' ~
+                ('^(binutils|build-essential|cmake|gcc|libc6-dev|' ~
                  'libjson-c-dev|libpam0g-dev|libssl-dev|libuv1-dev|' ~
                  'libwebsockets-dev|make|nodejs|npm|pkg-config|pkgconf|' ~
                  'zlib1g-dev)[^=]*=')) |
@@ -109,25 +99,10 @@
       and npm {{ remoteterminal_npm_version.stdout }}.
   when: not ansible_check_mode
 
-- name: Verify Go build toolchain is supported
-  ansible.builtin.assert:
-    that:
-      - >-
-        (remoteterminal_go_version.stdout |
-         regex_search('go([0-9]+)\.([0-9]+)', '\\1') | first | int) > 1 or
-        ((remoteterminal_go_version.stdout |
-          regex_search('go([0-9]+)\.([0-9]+)', '\\1') | first | int) == 1 and
-         (remoteterminal_go_version.stdout |
-          regex_search('go([0-9]+)\.([0-9]+)', '\\2') | first | int) >= 19)
-    fail_msg: >-
-      The backend requires Go 1.19 or newer. The configured Debian repositories
-      installed {{ remoteterminal_go_version.stdout }}.
-  when: not ansible_check_mode
-
-- name: Report installed compiler toolchains
+- name: Report installed Debian frontend toolchain
   ansible.builtin.debug:
     msg: >-
-      Using {{ remoteterminal_go_version.stdout }}, Node
-      {{ remoteterminal_node_version.stdout }}, and npm
-      {{ remoteterminal_npm_version.stdout }}.
+      Using Node {{ remoteterminal_node_version.stdout }} and npm
+      {{ remoteterminal_npm_version.stdout }}. The checksum-pinned Go toolchain
+      is installed separately below {{ remoteterminal_install_root }}/tools.
   when: not ansible_check_mode

@@ -11,10 +11,11 @@ import (
 	"time"
 )
 
-// connectionTracker owns downstream terminal connections after net/http has
-// hijacked them for a WebSocket upgrade. Connections are grouped by a hash of
-// the opaque authentication token, so logout can revoke every terminal opened
-// by that browser session without retaining the token itself.
+// connectionTracker owns downstream terminal and code-server connections
+// after net/http has hijacked them for a WebSocket upgrade. Connections are
+// grouped by a hash of the opaque authentication token, so logout can revoke
+// every proxied connection opened by that browser session without retaining
+// the token itself.
 type connectionTracker struct {
 	mu      sync.Mutex
 	byToken map[[sha256.Size]byte]map[*trackedConn]struct{}

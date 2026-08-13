@@ -287,6 +287,12 @@
 
 - name: Install and validate atomic TLS material
   ansible.builtin.include_tasks: tls.yml
+  when: remoteterminal_tls_enabled | bool
+
+- name: Record disabled TLS deployment identity for HTTP transport
+  ansible.builtin.set_fact:
+    remoteterminal_tls_configuration_fingerprint: disabled-http-v1
+  when: not (remoteterminal_tls_enabled | bool)
 
 - name: Render PAM policy
   ansible.builtin.template:
@@ -481,7 +487,8 @@
     mode: "0600"
   when: >-
     not (remoteterminal_deployment_inputs_applied | bool) or
-    not (remoteterminal_current_service_inputs_match | bool)
+    not (remoteterminal_current_service_inputs_match | bool) or
+    (remoteterminal_code_server_tool_replaced | bool)
 
 - name: Render Remote Terminal environment file
   ansible.builtin.template:
@@ -575,16 +582,16 @@
 - name: Flush release activation handler before health check
   ansible.builtin.meta: flush_handlers
 
-- name: Wait for Remote Terminal HTTPS port
+- name: Wait for Remote Terminal listener
   ansible.builtin.wait_for:
     host: "{{ remoteterminal_listen_address }}"
     port: "{{ remoteterminal_port | int }}"
     state: started
     timeout: "{{ (remoteterminal_health_retries | int * remoteterminal_health_delay | int) + 5 }}"
 
-- name: Verify Remote Terminal HTTPS health endpoint
+- name: Verify Remote Terminal health endpoint over selected transport
   ansible.builtin.uri:
-    url: "https://{{ remoteterminal_listen_address }}:{{ remoteterminal_port }}/healthz"
+    url: "{{ remoteterminal_public_endpoint }}healthz"
     method: GET
     validate_certs: false
     return_content: true
@@ -596,9 +603,9 @@
     - remoteterminal_health_result.status | default(0) == 200
     - remoteterminal_health_result.json.ok | default(false) | bool
 
-- name: Verify deployed frontend is served over HTTPS
+- name: Verify deployed frontend is served over selected transport
   ansible.builtin.uri:
-    url: "https://{{ remoteterminal_listen_address }}:{{ remoteterminal_port }}/"
+    url: "{{ remoteterminal_public_endpoint }}"
     method: GET
     validate_certs: false
     return_content: true
@@ -609,6 +616,44 @@
   until:
     - remoteterminal_frontend_http_result.status | default(0) == 200
     - "'<div id=\"root\"></div>' in (remoteterminal_frontend_http_result.content | default(''))"
+
+- name: Reinspect inactive and displaced code-server tools after health verification
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+  loop: "{{ remoteterminal_code_server_deferred_cleanup_paths }}"
+  register: remoteterminal_code_server_deferred_cleanup_stats
+  loop_control:
+    label: "{{ item }}"
+  when: remoteterminal_code_server_deferred_cleanup_paths | length > 0
+
+- name: Revalidate inactive and displaced code-server tools before removal
+  ansible.builtin.assert:
+    that:
+      - (item.item | dirname) == (remoteterminal_install_root ~ '/tools')
+      - (item.item | basename) is match('^\.code-server-[0-9a-f]{12}-[A-Za-z0-9_.-]+$')
+      - >-
+        not item.stat.exists or
+        ((item.stat.isdir | default(false)) and
+         not (item.stat.islnk | default(false)) and
+         item.stat.uid | int == 0 and
+         item.stat.mode is match('^0?[0-7][0145][0145]$'))
+    fail_msg: >-
+      Refusing deferred code-server cleanup because {{ item.item }} no longer
+      has the validated inactive-tool path, type, owner, or mode.
+  loop: "{{ remoteterminal_code_server_deferred_cleanup_stats.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when: remoteterminal_code_server_deferred_cleanup_paths | length > 0
+
+- name: Remove validated inactive and displaced code-server tools after health verification
+  ansible.builtin.file:
+    path: "{{ item.item }}"
+    state: absent
+  loop: "{{ remoteterminal_code_server_deferred_cleanup_stats.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when: remoteterminal_code_server_deferred_cleanup_paths | length > 0
 
 - name: Record successfully applied deployment fingerprint after health verification
   ansible.builtin.copy:
@@ -635,14 +680,26 @@
       - -sha256
   register: remoteterminal_tls_fingerprint
   changed_when: false
+  when: remoteterminal_tls_enabled | bool
+
+- name: Describe active transport security
+  ansible.builtin.set_fact:
+    remoteterminal_transport_detail: >-
+      {{ ('TLS ' ~ remoteterminal_tls_fingerprint.stdout)
+         if remoteterminal_tls_enabled | bool
+         else
+         'WARNING: plaintext HTTP is enabled; PAM credentials and session data are not encrypted, and remote code-server webviews require a browser insecure-origin policy.' }}
 
 - name: Report installed Remote Terminal endpoint
   ansible.builtin.debug:
     msg:
-      - "Remote Terminal is healthy at https://{{ remoteterminal_listen_address }}:{{ remoteterminal_port }}/"
-      - "TLS {{ remoteterminal_tls_fingerprint.stdout }}"
+      - "Remote Terminal is healthy at {{ remoteterminal_public_endpoint }}"
+      - "{{ remoteterminal_transport_detail }}"
       - "Service account: {{ remoteterminal_user }}"
       - "Release: {{ remoteterminal_release_id }}"
+      - >-
+        code-server {{ remoteterminal_code_server_version }} is installed at
+        {{ remoteterminal_code_server_tool_dir }}; active instance limit={{ remoteterminal_max_code_servers }}.
       - >-
         PAM account gate passed; full interactive password authentication
         verified={{ remoteterminal_pam_authentication_verified | bool }}.

@@ -167,9 +167,10 @@
          remoteterminal_ttyd_installed_artifacts.results[3].stat.uid | int == 0 and
          remoteterminal_ttyd_installed_artifacts.results[3].stat.gid | int == 0 and
          remoteterminal_ttyd_installed_artifacts.results[3].stat.mode == '0644' and
-         (remoteterminal_ttyd_installed_marker.content | default('') | b64decode | trim) ==
-         (remoteterminal_ttyd_completion_prefix ~ '\nsha256=' ~
-          (remoteterminal_ttyd_installed_artifacts.results[2].stat.checksum | default(''))) and
+         (remoteterminal_ttyd_installed_marker.content | default('') | b64decode).splitlines() ==
+         [remoteterminal_ttyd_completion_prefix,
+          'sha256=' ~
+          (remoteterminal_ttyd_installed_artifacts.results[2].stat.checksum | default(''))] and
          (remoteterminal_ttyd_installed_version_probe.rc | default(1)) == 0 and
          remoteterminal_ttyd_version in
          ((remoteterminal_ttyd_installed_version_probe.stdout | default('')) ~

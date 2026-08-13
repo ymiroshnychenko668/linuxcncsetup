@@ -10,7 +10,15 @@ remoteterminal_machine_name: "{{ ansible_facts.hostname | default('LinuxCNC mach
 
 # Application settings.
 remoteterminal_port: 8443
+# The production appliance profile uses HTTP on an isolated, trusted machine
+# LAN so every workstation does not need a certificate deployment. PAM
+# credentials and session traffic are not transport-encrypted in this mode,
+# and code-server webviews require the exact HTTP origin in the client
+# browser's managed secure-origin allowlist. Set this to "https" when trusted
+# TLS material is available.
+remoteterminal_transport: http
 remoteterminal_max_sessions: 8
+remoteterminal_max_code_servers: 2
 remoteterminal_idle_timeout: ""
 remoteterminal_absolute_timeout: ""
 remoteterminal_pam_service: remoteterminal
@@ -35,9 +43,10 @@ remoteterminal_runtime_directory_name: remoteterminal
 remoteterminal_state_directory_name: remoteterminal
 remoteterminal_tmux_binary: /usr/bin/tmux
 
-# A supplied certificate and key must be set together. They are copied into the
-# application-owned config directory. When omitted, a self-signed certificate
-# is generated for the selected address and host name.
+# In HTTPS mode a supplied certificate and key must be set together. They are
+# copied into the application-owned config directory. When omitted, a
+# self-signed certificate is generated for the selected address and host name.
+# TLS inputs must remain empty when transport is HTTP.
 remoteterminal_tls_cert_source: ""
 remoteterminal_tls_key_source: ""
 remoteterminal_generated_tls_days: 825
@@ -66,6 +75,22 @@ remoteterminal_ttyd_commit: b1eaaee2ca70774c6cb045645914ebc27a70dedd
 remoteterminal_ttyd_archive_url: "https://github.com/tsl0922/ttyd/archive/b1eaaee2ca70774c6cb045645914ebc27a70dedd.tar.gz"
 remoteterminal_ttyd_archive_checksum: "sha256:0d7081e59aba7245782647f10e7a81cd7b0f63041c41a62dd81caf07e7d6db86"
 
+# The backend is built with the official Go AMD64 distribution instead of the
+# distribution-packaged compiler, whose version is too old on supported releases.
+# The immutable archive URL and exact digest make the compiler an
+# application-owned, content-addressed build input.
+remoteterminal_go_version: "1.26.5"
+remoteterminal_go_archive_url: "https://go.dev/dl/go1.26.5.linux-amd64.tar.gz"
+remoteterminal_go_archive_checksum: "sha256:5c2c3b16caefa1d968a94c1daca04a7ca301a496d9b086e17ad77bb81393f053"
+
+# code-server is installed from the official standalone AMD64 release. The
+# immutable release URL is accepted only with this exact SHA-256 digest; it is
+# not registered as a separate systemd service because Remote Terminal owns
+# every instance through its private tmux server.
+remoteterminal_code_server_version: "4.132.0"
+remoteterminal_code_server_archive_url: "https://github.com/coder/code-server/releases/download/v4.132.0/code-server-4.132.0-linux-amd64.tar.gz"
+remoteterminal_code_server_archive_checksum: "sha256:a38d26f4cb81f768feddff79e2937fd3f39c83d3da8be3da7225e1087e62e4ed"
+
 # Health verification controls.
 remoteterminal_health_retries: 20
 remoteterminal_health_delay: 2
@@ -86,7 +111,6 @@ remoteterminal_apt_packages:
   - ca-certificates
   - cmake
   - git
-  - golang-go
   - libjson-c-dev
   - libpam0g
   - libpam0g-dev

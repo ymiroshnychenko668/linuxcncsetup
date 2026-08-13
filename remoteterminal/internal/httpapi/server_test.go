@@ -11,6 +11,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/http/cookiejar"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -20,6 +21,7 @@ import (
 	"time"
 
 	"github.com/ymiroshnychenko668/linuxcncsetup/remoteterminal/internal/auth"
+	"github.com/ymiroshnychenko668/linuxcncsetup/remoteterminal/internal/codeservers"
 	"github.com/ymiroshnychenko668/linuxcncsetup/remoteterminal/internal/sessions"
 )
 
@@ -115,10 +117,84 @@ func (f *fakeSessionManager) Proxy(_ context.Context, _ string) (http.Handler, e
 }
 func (f *fakeSessionManager) ActiveTerminals() int { return f.active }
 
+type fakeCodeServerManager struct {
+	mu             sync.Mutex
+	items          []codeservers.Instance
+	listing        codeservers.DirectoryListing
+	browseErr      error
+	listErr        error
+	createErr      error
+	deleteErr      error
+	proxyErr       error
+	reused         bool
+	browsedPath    string
+	createdPath    string
+	deletedID      string
+	proxyCalled    int
+	proxiedID      string
+	proxiedRequest *http.Request
+	proxyHandler   http.Handler
+}
+
+func (f *fakeCodeServerManager) Browse(_ context.Context, requestedPath string) (codeservers.DirectoryListing, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.browsedPath = requestedPath
+	return f.listing, f.browseErr
+}
+
+func (f *fakeCodeServerManager) List(context.Context) ([]codeservers.Instance, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]codeservers.Instance(nil), f.items...), f.listErr
+}
+
+func (f *fakeCodeServerManager) Create(_ context.Context, folderPath string) (codeservers.Instance, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.createdPath = folderPath
+	if f.createErr != nil {
+		return codeservers.Instance{}, false, f.createErr
+	}
+	created := codeservers.Instance{ID: testID, Name: "project", FolderPath: folderPath, URL: "/code/" + testID + "/"}
+	f.items = append(f.items, created)
+	return created, f.reused, nil
+}
+
+func (f *fakeCodeServerManager) Delete(_ context.Context, id string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.deletedID = id
+	return f.deleteErr
+}
+
+func (f *fakeCodeServerManager) Proxy(_ context.Context, id string) (http.Handler, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.proxyCalled++
+	f.proxiedID = id
+	if f.proxyErr != nil {
+		return nil, f.proxyErr
+	}
+	if f.proxyHandler != nil {
+		return f.proxyHandler, nil
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		f.proxiedRequest = r
+		w.Header().Add("Content-Security-Policy", "frame-ancestors 'self'")
+		w.Header().Add("Content-Security-Policy", "default-src 'self'; worker-src 'self' blob:")
+		w.Header().Set("X-Frame-Options", "SAMEORIGIN")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("Referrer-Policy", "no-referrer")
+		w.WriteHeader(http.StatusNoContent)
+	}), nil
+}
+
 type harness struct {
-	server  *Server
-	auth    *fakeAuthenticator
-	manager *fakeSessionManager
+	server      *Server
+	auth        *fakeAuthenticator
+	manager     *fakeSessionManager
+	codeServers *fakeCodeServerManager
 }
 
 func newHarness(t *testing.T) harness {
@@ -126,6 +202,14 @@ func newHarness(t *testing.T) harness {
 }
 
 func newHarnessWithTimeouts(t *testing.T, idle, absolute time.Duration) harness {
+	return newHarnessWithOptions(t, idle, absolute, false)
+}
+
+func newHarnessForTransport(t *testing.T, insecureHTTP bool) harness {
+	return newHarnessWithOptions(t, time.Hour, time.Hour, insecureHTTP)
+}
+
+func newHarnessWithOptions(t *testing.T, idle, absolute time.Duration, insecureHTTP bool) harness {
 	t.Helper()
 	web := t.TempDir()
 	if err := os.WriteFile(filepath.Join(web, "index.html"), []byte("<!doctype html><div>remote app</div>"), 0600); err != nil {
@@ -136,14 +220,16 @@ func newHarnessWithTimeouts(t *testing.T, idle, absolute time.Duration) harness 
 	}
 	authenticator := &fakeAuthenticator{}
 	manager := &fakeSessionManager{}
+	codeServerManager := &fakeCodeServerManager{}
 	server, err := New(Config{
 		AllowedUser: "operator", MachineName: "Workshop Mill", WebDir: web, AbsoluteTimeout: time.Hour, AuthConcurrency: 1,
-	}, authenticator, auth.NewStore(idle, absolute, 32), auth.NewThrottler(5, time.Minute), manager,
+		InsecureHTTP: insecureHTTP,
+	}, authenticator, auth.NewStore(idle, absolute, 32), auth.NewThrottler(5, time.Minute), manager, codeServerManager,
 		log.New(io.Discard, "", 0))
 	if err != nil {
 		t.Fatal(err)
 	}
-	return harness{server: server, auth: authenticator, manager: manager}
+	return harness{server: server, auth: authenticator, manager: manager, codeServers: codeServerManager}
 }
 
 func TestPublicConfigExposesMachineNameWithoutAuthentication(t *testing.T) {
@@ -253,6 +339,156 @@ func TestLoginSetsSecureOpaqueCookieAndUsesConfiguredPAMUser(t *testing.T) {
 	defer h.auth.mu.Unlock()
 	if len(h.auth.users) != 1 || h.auth.users[0] != "operator" || h.auth.passwords[0] != "secret" {
 		t.Fatalf("PAM calls = users %#v passwords %#v", h.auth.users, h.auth.passwords)
+	}
+}
+
+func TestAuthenticationCookieWorksThroughConfiguredTransport(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		insecureHTTP bool
+		cookieName   string
+		secure       bool
+	}{
+		{name: "https", cookieName: secureCookieName, secure: true},
+		{name: "http", insecureHTTP: true, cookieName: insecureCookieName},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			h := newHarnessForTransport(t, test.insecureHTTP)
+			var outer *httptest.Server
+			if test.insecureHTTP {
+				outer = httptest.NewServer(h.server)
+			} else {
+				outer = httptest.NewTLSServer(h.server)
+			}
+			defer outer.Close()
+			jar, err := cookiejar.New(nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			client := outer.Client()
+			client.Jar = jar
+			body := strings.NewReader(`{"username":"operator","password":"secret"}`)
+			request, err := http.NewRequest(http.MethodPost, outer.URL+"/api/auth/login", body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			request.Header.Set("Origin", outer.URL)
+			request.Header.Set("Content-Type", "application/json")
+			response, err := client.Do(request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var loginResponse struct {
+				CSRFToken string `json:"csrfToken"`
+			}
+			if err := json.NewDecoder(response.Body).Decode(&loginResponse); err != nil {
+				_ = response.Body.Close()
+				t.Fatal(err)
+			}
+			_ = response.Body.Close()
+			if response.StatusCode != http.StatusOK {
+				t.Fatalf("login status = %d", response.StatusCode)
+			}
+			var authenticationCookie *http.Cookie
+			for _, candidate := range response.Cookies() {
+				if candidate.Name == test.cookieName {
+					authenticationCookie = candidate
+				}
+			}
+			if authenticationCookie == nil || authenticationCookie.Secure != test.secure ||
+				!authenticationCookie.HttpOnly || authenticationCookie.Path != "/" ||
+				authenticationCookie.SameSite != http.SameSiteStrictMode ||
+				authenticationCookie.Domain != "" || authenticationCookie.Value == "" {
+				t.Fatalf("authentication cookie = %+v", authenticationCookie)
+			}
+
+			response, err = client.Get(outer.URL + "/api/auth/session")
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = response.Body.Close()
+			if response.StatusCode != http.StatusOK {
+				t.Fatalf("cookie-jar session status = %d", response.StatusCode)
+			}
+
+			wrongCookieName := insecureCookieName
+			if test.insecureHTTP {
+				wrongCookieName = secureCookieName
+			}
+			wrongRequest, err := http.NewRequest(http.MethodGet, outer.URL+"/api/auth/session", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wrongRequest.AddCookie(&http.Cookie{Name: wrongCookieName, Value: authenticationCookie.Value})
+			wrongClient := &http.Client{Transport: client.Transport}
+			wrongResponse, err := wrongClient.Do(wrongRequest)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = wrongResponse.Body.Close()
+			if wrongResponse.StatusCode != http.StatusUnauthorized {
+				t.Fatalf("wrong-mode cookie status = %d", wrongResponse.StatusCode)
+			}
+
+			logoutRequest, err := http.NewRequest(http.MethodPost, outer.URL+"/api/auth/logout", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			logoutRequest.Header.Set("Origin", outer.URL)
+			logoutRequest.Header.Set(csrfHeader, loginResponse.CSRFToken)
+			logoutResponse, err := client.Do(logoutRequest)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = logoutResponse.Body.Close()
+			if logoutResponse.StatusCode != http.StatusOK {
+				t.Fatalf("logout status = %d", logoutResponse.StatusCode)
+			}
+			var cleared *http.Cookie
+			for _, candidate := range logoutResponse.Cookies() {
+				if candidate.Name == test.cookieName {
+					cleared = candidate
+				}
+			}
+			if cleared == nil || cleared.Secure != test.secure || !cleared.HttpOnly ||
+				cleared.Path != "/" || cleared.SameSite != http.SameSiteStrictMode || cleared.MaxAge != -1 {
+				t.Fatalf("cleared cookie = %+v", cleared)
+			}
+		})
+	}
+}
+
+func TestValidOriginUsesDirectRequestTransport(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		requestURL string
+		origins    []string
+		forwarded  string
+		want       bool
+	}{
+		{name: "http same origin", requestURL: "http://machine.test:8080/api", origins: []string{"http://machine.test:8080"}, want: true},
+		{name: "https same origin", requestURL: "https://machine.test:8443/api", origins: []string{"https://machine.test:8443"}, want: true},
+		{name: "http rejects https origin", requestURL: "http://machine.test:8080/api", origins: []string{"https://machine.test:8080"}},
+		{name: "https rejects http origin", requestURL: "https://machine.test:8443/api", origins: []string{"http://machine.test:8443"}},
+		{name: "reject cross host", requestURL: "http://machine.test:8080/api", origins: []string{"http://attacker.test:8080"}},
+		{name: "reject missing", requestURL: "http://machine.test:8080/api"},
+		{name: "reject null", requestURL: "http://machine.test:8080/api", origins: []string{"null"}},
+		{name: "reject path", requestURL: "http://machine.test:8080/api", origins: []string{"http://machine.test:8080/path"}},
+		{name: "reject duplicate fields", requestURL: "http://machine.test:8080/api", origins: []string{"http://machine.test:8080", "http://machine.test:8080"}},
+		{name: "ignore spoofed forwarded proto", requestURL: "http://machine.test:8080/api", origins: []string{"https://machine.test:8080"}, forwarded: "https"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPost, test.requestURL, nil)
+			for _, origin := range test.origins {
+				request.Header.Add("Origin", origin)
+			}
+			if test.forwarded != "" {
+				request.Header.Set("X-Forwarded-Proto", test.forwarded)
+			}
+			if got := validOrigin(request); got != test.want {
+				t.Fatalf("validOrigin() = %t, want %t", got, test.want)
+			}
+		})
 	}
 }
 
@@ -414,6 +650,111 @@ func TestSessionConnectDeleteAndErrors(t *testing.T) {
 	}
 }
 
+func TestDirectoryAndCodeServerAPIsRequireAuthenticationAndProtectMutations(t *testing.T) {
+	h := newHarness(t)
+	parentPath := "/srv"
+	h.codeServers.listing = codeservers.DirectoryListing{
+		Path:        "/srv/projects",
+		ParentPath:  &parentPath,
+		Directories: []codeservers.Directory{{Name: "mill ui", Path: "/srv/projects/mill ui"}},
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "http://example.test/api/directories?path=%2Fsrv%2Fprojects", nil)
+	response := httptest.NewRecorder()
+	h.server.ServeHTTP(response, request)
+	if response.Code != http.StatusUnauthorized || h.codeServers.browsedPath != "" {
+		t.Fatalf("unauthenticated directory response = %d, browsed %q", response.Code, h.codeServers.browsedPath)
+	}
+
+	credentials := login(t, h.server, "operator", "secret")
+	request = authenticatedRequest(http.MethodGet, "/api/directories?path=%2Fsrv%2Fprojects", credentials.cookie, "", nil)
+	response = httptest.NewRecorder()
+	h.server.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || h.codeServers.browsedPath != "/srv/projects" ||
+		!strings.Contains(response.Body.String(), `"parentPath":"/srv"`) ||
+		!strings.Contains(response.Body.String(), `"name":"mill ui"`) {
+		t.Fatalf("directory response = %d %s, browsed %q", response.Code, response.Body.String(), h.codeServers.browsedPath)
+	}
+	if response.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("directory Cache-Control = %q", response.Header().Get("Cache-Control"))
+	}
+
+	body := strings.NewReader(`{"folderPath":"/srv/projects/mill ui"}`)
+	request = authenticatedRequest(http.MethodPost, "/api/code-servers", credentials.cookie, "wrong", body)
+	request.Header.Set("Content-Type", "application/json")
+	response = httptest.NewRecorder()
+	h.server.ServeHTTP(response, request)
+	if response.Code != http.StatusForbidden || h.codeServers.createdPath != "" {
+		t.Fatalf("unverified launch response = %d, created %q", response.Code, h.codeServers.createdPath)
+	}
+
+	body = strings.NewReader(`{"folderPath":"/srv/projects/mill ui"}`)
+	request = authenticatedRequest(http.MethodPost, "/api/code-servers", credentials.cookie, credentials.csrf, body)
+	request.Header.Set("Content-Type", "application/json")
+	response = httptest.NewRecorder()
+	h.server.ServeHTTP(response, request)
+	if response.Code != http.StatusCreated || h.codeServers.createdPath != "/srv/projects/mill ui" ||
+		!strings.Contains(response.Body.String(), `"url":"/code/`+testID+`/"`) ||
+		!strings.Contains(response.Body.String(), `"reused":false`) {
+		t.Fatalf("launch response = %d %s, created %q", response.Code, response.Body.String(), h.codeServers.createdPath)
+	}
+
+	h.codeServers.reused = true
+	body = strings.NewReader(`{"folderPath":"/srv/projects/mill ui"}`)
+	request = authenticatedRequest(http.MethodPost, "/api/code-servers", credentials.cookie, credentials.csrf, body)
+	request.Header.Set("Content-Type", "application/json")
+	response = httptest.NewRecorder()
+	h.server.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"reused":true`) {
+		t.Fatalf("reused launch response = %d %s", response.Code, response.Body.String())
+	}
+
+	request = authenticatedRequest(http.MethodGet, "/api/code-servers", credentials.cookie, "", nil)
+	response = httptest.NewRecorder()
+	h.server.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"codeServers"`) {
+		t.Fatalf("list response = %d %s", response.Code, response.Body.String())
+	}
+
+	request = authenticatedRequest(http.MethodDelete, "/api/code-servers/"+testID, credentials.cookie, credentials.csrf, nil)
+	response = httptest.NewRecorder()
+	h.server.ServeHTTP(response, request)
+	if response.Code != http.StatusNoContent || h.codeServers.deletedID != testID {
+		t.Fatalf("shutdown response = %d %s, deleted %q", response.Code, response.Body.String(), h.codeServers.deletedID)
+	}
+}
+
+func TestCodeServerAPIErrorsUseStablePublicStatuses(t *testing.T) {
+	tests := []struct {
+		name   string
+		err    error
+		status int
+		code   string
+	}{
+		{"invalid", codeservers.ErrInvalidPath, http.StatusBadRequest, "invalid_directory"},
+		{"inaccessible", codeservers.ErrDirectoryInaccessible, http.StatusForbidden, "directory_inaccessible"},
+		{"missing", codeservers.ErrDirectoryNotFound, http.StatusNotFound, "directory_not_found"},
+		{"limit", codeservers.ErrLimitReached, http.StatusConflict, "code_server_limit"},
+		{"startup", codeservers.ErrStartFailed, http.StatusBadGateway, "code_server_start_failed"},
+		{"shutdown", codeservers.ErrShuttingDown, http.StatusServiceUnavailable, "shutting_down"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			h := newHarness(t)
+			credentials := login(t, h.server, "operator", "secret")
+			h.codeServers.createErr = test.err
+			request := authenticatedRequest(http.MethodPost, "/api/code-servers", credentials.cookie, credentials.csrf,
+				strings.NewReader(`{"folderPath":"/project"}`))
+			request.Header.Set("Content-Type", "application/json")
+			response := httptest.NewRecorder()
+			h.server.ServeHTTP(response, request)
+			if response.Code != test.status || !strings.Contains(response.Body.String(), `"code":"`+test.code+`"`) {
+				t.Fatalf("response = %d %s", response.Code, response.Body.String())
+			}
+		})
+	}
+}
+
 func TestLatestSelectionRequiresAuthenticationAndReturnsNoStoreJSON(t *testing.T) {
 	h := newHarness(t)
 	h.manager.selectionText = "line one\nрядок два"
@@ -487,6 +828,79 @@ func TestTerminalProxyRequiresAuthenticationAndWebSocketOrigin(t *testing.T) {
 	}
 }
 
+func TestCodeServerProxyRequiresAuthenticationAndUsesRouteSpecificPolicy(t *testing.T) {
+	h := newHarness(t)
+	request := httptest.NewRequest(http.MethodGet, "http://example.test/code/"+testID+"/", nil)
+	response := httptest.NewRecorder()
+	h.server.ServeHTTP(response, request)
+	if response.Code != http.StatusUnauthorized || h.codeServers.proxyCalled != 0 {
+		t.Fatalf("unauthenticated proxy response = %d, calls %d", response.Code, h.codeServers.proxyCalled)
+	}
+
+	credentials := login(t, h.server, "operator", "secret")
+	request = authenticatedRequest(http.MethodGet, "/code/"+testID+"/resource.js", credentials.cookie, "", nil)
+	response = httptest.NewRecorder()
+	h.server.ServeHTTP(response, request)
+	if response.Code != http.StatusNoContent || h.codeServers.proxyCalled != 1 || h.codeServers.proxiedID != testID ||
+		h.codeServers.proxiedRequest.URL.Path != "/code/"+testID+"/resource.js" {
+		t.Fatalf("proxy response = %d, calls %d, id %q, request %+v", response.Code, h.codeServers.proxyCalled, h.codeServers.proxiedID, h.codeServers.proxiedRequest)
+	}
+	policies := response.Header().Values("Content-Security-Policy")
+	if len(policies) != 2 || policies[0] != "frame-ancestors 'self'" || !strings.Contains(policies[1], "worker-src 'self' blob:") {
+		t.Fatalf("code-server CSP values = %#v", policies)
+	}
+	for name, want := range map[string]string{
+		"X-Frame-Options":        "SAMEORIGIN",
+		"X-Content-Type-Options": "nosniff",
+		"Referrer-Policy":        "no-referrer",
+	} {
+		if got := response.Header().Get(name); got != want {
+			t.Fatalf("%s = %q, want %q", name, got, want)
+		}
+	}
+
+	request = authenticatedRequest(http.MethodPost, "/code/"+testID+"/api", credentials.cookie, "", nil)
+	request.Header.Del("Origin")
+	response = httptest.NewRecorder()
+	h.server.ServeHTTP(response, request)
+	if response.Code != http.StatusForbidden || h.codeServers.proxyCalled != 1 {
+		t.Fatalf("origin-less code-server mutation = %d, calls %d", response.Code, h.codeServers.proxyCalled)
+	}
+	request = authenticatedRequest(http.MethodPost, "/code/"+testID+"/api", credentials.cookie, "", nil)
+	request.Header.Set("Origin", "http://attacker.example")
+	response = httptest.NewRecorder()
+	h.server.ServeHTTP(response, request)
+	if response.Code != http.StatusForbidden || h.codeServers.proxyCalled != 1 {
+		t.Fatalf("cross-origin code-server mutation = %d, calls %d", response.Code, h.codeServers.proxyCalled)
+	}
+	request = authenticatedRequest(http.MethodPost, "/code/"+testID+"/api", credentials.cookie, "", nil)
+	request.Header.Set("Origin", "http://example.test")
+	response = httptest.NewRecorder()
+	h.server.ServeHTTP(response, request)
+	if response.Code != http.StatusNoContent || h.codeServers.proxyCalled != 2 {
+		t.Fatalf("same-origin code-server mutation = %d, calls %d", response.Code, h.codeServers.proxyCalled)
+	}
+
+	request = authenticatedRequest(http.MethodGet, "/code/"+testID+"/ws", credentials.cookie, "", nil)
+	request.Header.Set("Connection", "Upgrade")
+	request.Header.Set("Upgrade", "websocket")
+	response = httptest.NewRecorder()
+	h.server.ServeHTTP(response, request)
+	if response.Code != http.StatusForbidden || h.codeServers.proxyCalled != 2 {
+		t.Fatalf("origin-less WebSocket response = %d, calls %d", response.Code, h.codeServers.proxyCalled)
+	}
+
+	request = authenticatedRequest(http.MethodGet, "/code/"+testID+"/ws", credentials.cookie, "", nil)
+	request.Header.Set("Connection", "Upgrade")
+	request.Header.Set("Upgrade", "websocket")
+	request.Header.Set("Origin", "http://example.test")
+	response = httptest.NewRecorder()
+	h.server.ServeHTTP(response, request)
+	if response.Code != http.StatusNoContent || h.codeServers.proxyCalled != 3 {
+		t.Fatalf("same-origin WebSocket response = %d, calls %d", response.Code, h.codeServers.proxyCalled)
+	}
+}
+
 type upgradedClient struct {
 	connection net.Conn
 	reader     *bufio.Reader
@@ -513,6 +927,14 @@ func holdingUpgradeHandler() http.Handler {
 }
 
 func openTerminalWebSocket(t *testing.T, serverURL string, cookie *http.Cookie) upgradedClient {
+	return openProxiedWebSocket(t, serverURL, cookie, "/terminal/"+testID+"/ws")
+}
+
+func openCodeServerWebSocket(t *testing.T, serverURL string, cookie *http.Cookie) upgradedClient {
+	return openProxiedWebSocket(t, serverURL, cookie, "/code/"+testID+"/ws")
+}
+
+func openProxiedWebSocket(t *testing.T, serverURL string, cookie *http.Cookie, requestPath string) upgradedClient {
 	t.Helper()
 	address := strings.TrimPrefix(serverURL, "http://")
 	connection, err := net.Dial("tcp", address)
@@ -520,8 +942,8 @@ func openTerminalWebSocket(t *testing.T, serverURL string, cookie *http.Cookie) 
 		t.Fatal(err)
 	}
 	request := fmt.Sprintf(
-		"GET /terminal/%s/ws HTTP/1.1\r\nHost: %s\r\nOrigin: %s\r\nCookie: %s=%s\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: dGVzdA==\r\nSec-WebSocket-Version: 13\r\n\r\n",
-		testID, address, serverURL, cookieName, cookie.Value,
+		"GET %s HTTP/1.1\r\nHost: %s\r\nOrigin: %s\r\nCookie: %s=%s\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: dGVzdA==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+		requestPath, address, serverURL, cookieName, cookie.Value,
 	)
 	if _, err := io.WriteString(connection, request); err != nil {
 		_ = connection.Close()
@@ -535,7 +957,7 @@ func openTerminalWebSocket(t *testing.T, serverURL string, cookie *http.Cookie) 
 	}
 	if response.StatusCode != http.StatusSwitchingProtocols {
 		_ = connection.Close()
-		t.Fatalf("terminal upgrade status = %d", response.StatusCode)
+		t.Fatalf("proxy upgrade status = %d", response.StatusCode)
 	}
 	return upgradedClient{connection: connection, reader: reader}
 }
@@ -560,6 +982,32 @@ func TestLogoutTerminatesAlreadyUpgradedTerminalConnection(t *testing.T) {
 	service := httptest.NewServer(h.server)
 	defer service.Close()
 	client := openTerminalWebSocket(t, service.URL, credentials.cookie)
+
+	request, err := http.NewRequest(http.MethodPost, service.URL+"/api/auth/logout", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.AddCookie(credentials.cookie)
+	request.Header.Set("Origin", service.URL)
+	request.Header.Set(csrfHeader, credentials.csrf)
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("logout status = %d", response.StatusCode)
+	}
+	expectConnectionClosed(t, client, 2*time.Second)
+}
+
+func TestLogoutTerminatesAlreadyUpgradedCodeServerConnection(t *testing.T) {
+	h := newHarness(t)
+	h.codeServers.proxyHandler = holdingUpgradeHandler()
+	credentials := login(t, h.server, "operator", "secret")
+	service := httptest.NewServer(h.server)
+	defer service.Close()
+	client := openCodeServerWebSocket(t, service.URL, credentials.cookie)
 
 	request, err := http.NewRequest(http.MethodPost, service.URL+"/api/auth/logout", nil)
 	if err != nil {
@@ -625,7 +1073,7 @@ func TestAuthenticationAbsoluteExpiryTerminatesUpgradedTerminalConnection(t *tes
 	expectConnectionClosed(t, client, 3*time.Second)
 }
 
-func TestBeginShutdownRejectsNewTerminalRequests(t *testing.T) {
+func TestBeginShutdownRejectsAllNewApplicationRequests(t *testing.T) {
 	h := newHarness(t)
 	h.manager.proxyHandler = holdingUpgradeHandler()
 	credentials := login(t, h.server, "operator", "secret")
@@ -638,6 +1086,26 @@ func TestBeginShutdownRejectsNewTerminalRequests(t *testing.T) {
 	h.server.ServeHTTP(response, request)
 	if response.Code != http.StatusServiceUnavailable || h.manager.proxyCalled != 0 {
 		t.Fatalf("shutdown terminal request = %d, proxy calls = %d", response.Code, h.manager.proxyCalled)
+	}
+	request = authenticatedRequest(http.MethodGet, "/code/"+testID+"/ws", credentials.cookie, "", nil)
+	request.Header.Set("Connection", "Upgrade")
+	request.Header.Set("Upgrade", "websocket")
+	request.Header.Set("Origin", "http://example.test")
+	response = httptest.NewRecorder()
+	h.server.ServeHTTP(response, request)
+	if response.Code != http.StatusServiceUnavailable || h.codeServers.proxyCalled != 0 {
+		t.Fatalf("shutdown code-server request = %d, proxy calls = %d", response.Code, h.codeServers.proxyCalled)
+	}
+	for _, target := range []string{"/api/config", "/api/directories", "/client/route"} {
+		request = httptest.NewRequest(http.MethodGet, "http://example.test"+target, nil)
+		response = httptest.NewRecorder()
+		h.server.ServeHTTP(response, request)
+		if response.Code != http.StatusServiceUnavailable || !strings.Contains(response.Body.String(), `"code":"shutting_down"`) {
+			t.Fatalf("shutdown request %s = %d %q", target, response.Code, response.Body.String())
+		}
+	}
+	if got := response.Header().Get("Content-Security-Policy"); got == "" {
+		t.Fatal("shutdown response omitted application security headers")
 	}
 }
 
@@ -681,13 +1149,6 @@ func TestHealthStaticFallbackAndSecurityHeaders(t *testing.T) {
 	if got := response.Header().Get("Content-Security-Policy"); !strings.Contains(got, "connect-src 'self'") || strings.Contains(got, "wss:") {
 		t.Fatalf("unexpected CSP: %q", got)
 	}
-	h.server.BeginShutdown()
-	response = httptest.NewRecorder()
-	h.server.ServeHTTP(response, request)
-	if response.Code != http.StatusServiceUnavailable || response.Body.String() != "{\"ok\":false}\n" {
-		t.Fatalf("shutdown health response = %d %q", response.Code, response.Body.String())
-	}
-
 	request = httptest.NewRequest(http.MethodGet, "http://example.test/client/route", nil)
 	response = httptest.NewRecorder()
 	h.server.ServeHTTP(response, request)
@@ -699,6 +1160,14 @@ func TestHealthStaticFallbackAndSecurityHeaders(t *testing.T) {
 	h.server.ServeHTTP(response, request)
 	if response.Code != http.StatusOK || response.Body.String() != "asset" {
 		t.Fatalf("static asset = %d %q", response.Code, response.Body.String())
+	}
+
+	h.server.BeginShutdown()
+	request = httptest.NewRequest(http.MethodGet, "http://example.test/healthz", nil)
+	response = httptest.NewRecorder()
+	h.server.ServeHTTP(response, request)
+	if response.Code != http.StatusServiceUnavailable || response.Body.String() != "{\"ok\":false}\n" {
+		t.Fatalf("shutdown health response = %d %q", response.Code, response.Body.String())
 	}
 }
 

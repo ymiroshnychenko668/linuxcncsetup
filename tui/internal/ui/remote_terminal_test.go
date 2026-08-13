@@ -27,6 +27,9 @@ func TestRemoteTerminalDraftDefaults(t *testing.T) {
 	if draft.port != "8443" {
 		t.Fatalf("default port = %q; want 8443", draft.port)
 	}
+	if draft.transport != remoteTerminalTransportHTTP {
+		t.Fatalf("default transport = %q; want HTTP", draft.transport)
+	}
 	if draft.listenAddress != "" && !validRemoteTerminalIPv4(draft.listenAddress) {
 		t.Fatalf("detected address = %q; want a valid LAN IPv4 address", draft.listenAddress)
 	}
@@ -83,6 +86,23 @@ func TestRemoteTerminalFormEditing(t *testing.T) {
 		model.remoteTerminal.focusedField != remoteTerminalUserField {
 		t.Fatalf("Up selected field %d", model.remoteTerminal.focusedField)
 	}
+	model.remoteTerminal.focusedField = remoteTerminalTransportField
+	model.remoteTerminal.transport = remoteTerminalTransportHTTPS
+	if !model.updateRemoteTerminalForm(tea.KeyPressMsg{Code: tea.KeyRight}) ||
+		model.remoteTerminal.transport != remoteTerminalTransportHTTP {
+		t.Fatalf("Right selected transport %q", model.remoteTerminal.transport)
+	}
+	if !model.updateRemoteTerminalForm(tea.KeyPressMsg{Code: ' ', Text: " "}) ||
+		model.remoteTerminal.transport != remoteTerminalTransportHTTPS {
+		t.Fatalf("Space selected transport %q", model.remoteTerminal.transport)
+	}
+	if !model.updateRemoteTerminalForm(tea.KeyPressMsg{Code: 'x', Text: "x"}) ||
+		model.remoteTerminal.transport != remoteTerminalTransportHTTPS {
+		t.Fatalf("typing changed transport to %q", model.remoteTerminal.transport)
+	}
+	if !strings.Contains(model.status, "Left/Right") {
+		t.Fatalf("transport editing hint = %q", model.status)
+	}
 	for _, message := range []tea.KeyPressMsg{
 		{Code: tea.KeyEnter},
 		{Code: tea.KeyEscape},
@@ -99,6 +119,7 @@ func TestRemoteTerminalDraftValidation(t *testing.T) {
 		user:          "operator",
 		machineName:   "Workshop Mill",
 		listenAddress: "192.168.1.20",
+		transport:     remoteTerminalTransportHTTPS,
 		port:          "8443",
 	}
 	if err := validateRemoteTerminalDraftSyntax(valid); err != nil {
@@ -115,8 +136,9 @@ func TestRemoteTerminalDraftValidation(t *testing.T) {
 		{"loopback", func(d *remoteTerminalDraft) { d.listenAddress = "127.0.0.2" }, "LAN address"},
 		{"network address", func(d *remoteTerminalDraft) { d.listenAddress = "10.0.0.0" }, "LAN address"},
 		{"bad octet", func(d *remoteTerminalDraft) { d.listenAddress = "192.168.1.256" }, "LAN address"},
-		{"privileged port", func(d *remoteTerminalDraft) { d.port = "443" }, "HTTPS port"},
-		{"large port", func(d *remoteTerminalDraft) { d.port = "65536" }, "HTTPS port"},
+		{"transport", func(d *remoteTerminalDraft) { d.transport = "ftp" }, "transport"},
+		{"privileged port", func(d *remoteTerminalDraft) { d.port = "443" }, "port"},
+		{"large port", func(d *remoteTerminalDraft) { d.port = "65536" }, "port"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -153,6 +175,7 @@ func TestRemoteTerminalRenderAndVariables(t *testing.T) {
 		user:          "operator",
 		machineName:   "Workshop Mill",
 		listenAddress: "192.168.1.20",
+		transport:     remoteTerminalTransportHTTPS,
 		port:          "9443",
 	}
 	model := New()
@@ -164,6 +187,7 @@ func TestRemoteTerminalRenderAndVariables(t *testing.T) {
 		"operator",
 		"Workshop Mill",
 		"192.168.1.20",
+		"Transport:         HTTPS",
 		"9443",
 		"https://192.168.1.20:9443/",
 	} {
@@ -176,16 +200,60 @@ func TestRemoteTerminalRenderAndVariables(t *testing.T) {
 	if err != nil {
 		t.Fatalf("remoteTerminalPlaybookVariables() error: %v", err)
 	}
-	if len(variables) != 5 ||
+	if len(variables) != 6 ||
 		variables["remoteterminal_user"] != "operator" ||
 		variables["remoteterminal_machine_name"] != "Workshop Mill" ||
 		variables["remoteterminal_listen_address"] != "192.168.1.20" ||
+		variables["remoteterminal_transport"] != remoteTerminalTransportHTTPS ||
 		variables["remoteterminal_port"] != 9443 ||
 		variables["remoteterminal_source_dir"] != "/tmp/remote-source" {
 		t.Fatalf("unexpected playbook variables: %#v", variables)
 	}
 	if _, err := remoteTerminalPlaybookVariables(draft, "relative/source"); err == nil {
 		t.Fatal("relative source directory was accepted")
+	}
+}
+
+func TestRemoteTerminalHTTPDisclosureAndVariables(t *testing.T) {
+	draft := remoteTerminalDraft{
+		user:          "operator",
+		machineName:   "Workshop Mill",
+		listenAddress: "192.168.1.20",
+		transport:     remoteTerminalTransportHTTP,
+		port:          "8080",
+	}
+	model := New()
+	model.remoteTerminal = draft
+
+	form := strings.Join(model.renderRemoteTerminalForm(false), "\n")
+	confirmation := strings.Join(renderCompactRemoteTerminalConfirmation(draft), "\n")
+	for name, rendered := range map[string]string{
+		"form":         form,
+		"confirmation": confirmation,
+	} {
+		for _, expected := range []string{
+			"HTTP",
+			"system password",
+			"plaintext",
+			"code-server",
+			"secure-origin",
+			"allowlist",
+		} {
+			if !strings.Contains(rendered, expected) {
+				t.Errorf("%s does not contain %q:\n%s", name, expected, rendered)
+			}
+		}
+	}
+	if !strings.Contains(confirmation, "http://192.168.1.20:8080/") {
+		t.Errorf("confirmation does not contain the HTTP URL:\n%s", confirmation)
+	}
+
+	variables, err := remoteTerminalPlaybookVariables(draft, "/tmp/remote-source")
+	if err != nil {
+		t.Fatalf("remoteTerminalPlaybookVariables() error: %v", err)
+	}
+	if variables["remoteterminal_transport"] != remoteTerminalTransportHTTP {
+		t.Fatalf("transport variable = %#v", variables["remoteterminal_transport"])
 	}
 }
 

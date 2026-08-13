@@ -23,6 +23,23 @@ export function TerminalIcon(props: IconProps) {
   )
 }
 
+export function CodeServerIcon(props: IconProps) {
+  return (
+    <svg {...baseProps} {...props}>
+      <path d="m17.5 5-11 7 11 7V5Z" />
+      <path d="m6.5 8-3 4 3 4M17.5 9l3-2v10l-3-2" />
+    </svg>
+  )
+}
+
+export function FolderIcon(props: IconProps) {
+  return (
+    <svg {...baseProps} {...props}>
+      <path d="M3 7a2 2 0 0 1 2-2h5l2 2h7a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7Z" />
+    </svg>
+  )
+}
+
 export function PlusIcon(props: IconProps) {
   return (
     <svg {...baseProps} {...props}>

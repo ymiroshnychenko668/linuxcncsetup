@@ -4,9 +4,12 @@ Greenfield terminal interface for LinuxCNC workstation setup and diagnostics.
 
 ## Automatic installation
 
-The installer uses an existing Go 1.25+ toolchain when available. Otherwise,
-it downloads a checksum-verified Go toolchain into the current user's local
-data directory. It never requires `sudo`.
+The installer uses exactly Go 1.26.5. It reuses an existing toolchain only when
+its version matches that pin; otherwise it downloads the checksum-verified
+official toolchain into the current user's local data directory. If the
+versioned local toolchain path is incomplete or contains another version, the
+installer preserves it in a uniquely named backup before activating a fresh
+copy. It never requires `sudo` or changes the system Go installation.
 
 ```bash
 ./tui/install.sh
@@ -28,15 +31,23 @@ the `tui/` prefix.
 - `curl` or `wget`
 - `tar` and `sha256sum`
 
-Manual development requires Go 1.25 or newer.
+Manual development requires Go 1.26.5 or newer. Release builds made by the
+installer always use exactly Go 1.26.5.
 
 ## Remote Terminal
 
 The main-menu **Install Remote Terminal** workflow asks for the local account,
-a machine display name, a specific LAN IPv4 address, and an HTTPS port. The
-host name and port `8443` are provided as defaults. After review and explicit
-confirmation, the TUI runs the bundled Ansible installer and builds the web
-terminal from the source embedded in the installed TUI binary.
+a machine display name, a specific LAN IPv4 address, the transport, and a port.
+HTTP is the production appliance default, with port `8443`; the review shows
+the exact URL before installation. HTTPS remains available when trusted TLS
+material is deployed. The TUI warns that HTTP sends the Linux system password
+and terminal traffic over the LAN in plaintext, and that code-server webviews
+require the exact HTTP origin in the client browser's managed secure-origin
+allowlist.
+
+After review and explicit confirmation, the TUI passes the selected transport
+to the bundled Ansible installer and builds the web terminal from the source
+embedded in the installed TUI binary.
 
 The machine name is stored as `REMOTE_TERMINAL_MACHINE_NAME` in the managed
 service environment and is shown on both the browser login page and the

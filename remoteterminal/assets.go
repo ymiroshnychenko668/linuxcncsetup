@@ -20,11 +20,12 @@ import (
 //go:embed cmd/remoteterminal/main.go
 //go:embed internal/auth/auth.go internal/auth/pam.go internal/auth/pam_linux.go internal/auth/pam_unavailable.go internal/auth/pam_unsupported.go
 //go:embed internal/config/config.go
+//go:embed internal/codeservers/manager.go internal/codeservers/proxy.go
 //go:embed internal/httpapi/connections.go internal/httpapi/server.go
 //go:embed internal/sessions/manager.go
 //go:embed web/index.html web/package.json web/package-lock.json web/tsconfig.json web/tsconfig.app.json web/tsconfig.node.json web/vite.config.ts
 //go:embed web/src/App.tsx web/src/api.ts web/src/icons.tsx web/src/main.tsx web/src/styles.css web/src/vite-env.d.ts
-//go:embed web/src/components/CreateSessionModal.tsx web/src/components/DeleteSessionModal.tsx web/src/components/LoginView.tsx web/src/components/Modal.tsx web/src/components/TerminalPanel.tsx web/src/components/Workspace.tsx
+//go:embed web/src/components/CodeServerPanel.tsx web/src/components/CreateSessionModal.tsx web/src/components/DeleteSessionModal.tsx web/src/components/LaunchCodeServerModal.tsx web/src/components/LoginView.tsx web/src/components/Modal.tsx web/src/components/ShutdownCodeServerModal.tsx web/src/components/TerminalPanel.tsx web/src/components/Workspace.tsx
 var sourceFiles embed.FS
 
 // Materialize writes the embedded Remote Terminal source tree to a temporary

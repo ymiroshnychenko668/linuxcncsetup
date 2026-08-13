@@ -197,9 +197,7 @@ export function TerminalPanel({ session, active, focusRequestKey, reconnectKey, 
   useLayoutEffect(() => {
     const changed = focusRequestRef.current !== focusRequestKey
     focusRequestRef.current = focusRequestKey
-    if (changed) {
-      focusOwnerRef.current = document.activeElement
-    }
+    if (changed) focusOwnerRef.current = document.activeElement
     if (!active) {
       cancelScheduledFocus()
       // A focus intent belongs to the activation that created it. Do not
@@ -239,10 +237,10 @@ export function TerminalPanel({ session, active, focusRequestKey, reconnectKey, 
   return (
     <section
       ref={panelRef}
-      id={`panel-${session.id}`}
+      id={`panel-terminal-${session.id}`}
       className="terminal-panel"
       role="tabpanel"
-      aria-labelledby={`tab-${session.id}`}
+      aria-labelledby={`tab-terminal-${session.id}`}
       aria-hidden={!active}
       hidden={!active}
       tabIndex={0}

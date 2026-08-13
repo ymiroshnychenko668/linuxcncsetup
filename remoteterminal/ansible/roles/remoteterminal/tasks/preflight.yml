@@ -21,10 +21,16 @@
       - remoteterminal_listen_address | length > 0
       - remoteterminal_listen_address is match('^[0-9]{1,3}(\.[0-9]{1,3}){3}$')
       - remoteterminal_listen_address not in ['0.0.0.0', '127.0.0.1']
+      - (remoteterminal_port | string) is match('^[1-9][0-9]*$')
       - remoteterminal_port | int >= 1024
       - remoteterminal_port | int <= 65535
+      - remoteterminal_transport in ['https', 'http']
+      - (remoteterminal_max_sessions | string) is match('^[1-9][0-9]*$')
       - remoteterminal_max_sessions | int >= 1
       - remoteterminal_max_sessions | int <= 64
+      - (remoteterminal_max_code_servers | string) is match('^[1-9][0-9]*$')
+      - remoteterminal_max_code_servers | int >= 1
+      - remoteterminal_max_code_servers | int <= 8
       - remoteterminal_source_dir is match('^/')
       - remoteterminal_build_root == '/var/lib/remoteterminal-build'
       - remoteterminal_install_root == '/opt/remoteterminal'
@@ -33,28 +39,57 @@
       - remoteterminal_pam_check_path == '/usr/local/sbin/remoteterminal-pam-check'
       - remoteterminal_systemd_unit_path == '/etc/systemd/system/remoteterminal.service'
       - remoteterminal_deployment_applied_marker == '/etc/remoteterminal/deployment.applied'
+      - remoteterminal_restart_required_marker == '/etc/remoteterminal/restart-required'
       - remoteterminal_service_name == 'remoteterminal'
       - remoteterminal_runtime_directory_name == 'remoteterminal'
       - remoteterminal_state_directory_name == 'remoteterminal'
+      - remoteterminal_tmux_binary == '/usr/bin/tmux'
+      - (remoteterminal_build_jobs | string) is match('^[1-9][0-9]*$')
       - remoteterminal_build_jobs | int >= 1
+      - (remoteterminal_generated_tls_days | string) is match('^[1-9][0-9]*$')
       - remoteterminal_generated_tls_days | int >= 1
+      - (remoteterminal_generated_tls_renew_before_seconds | string) is match('^[1-9][0-9]*$')
       - remoteterminal_generated_tls_renew_before_seconds | int >= 86400
       - >-
         remoteterminal_generated_tls_days | int * 86400 >
         remoteterminal_generated_tls_renew_before_seconds | int + 86400
       - remoteterminal_tls_certificate_common_name is match('^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$')
       - (remoteterminal_tls_cert_source | length > 0) == (remoteterminal_tls_key_source | length > 0)
+      - >-
+        remoteterminal_transport == 'https' or
+        (remoteterminal_tls_cert_source | length == 0 and
+         remoteterminal_tls_key_source | length == 0)
       - remoteterminal_pam_service is match('^[A-Za-z0-9_.-]+$')
       - remoteterminal_pam_auth_include is match('^[A-Za-z0-9_.-]+$')
       - remoteterminal_pam_account_include is match('^[A-Za-z0-9_.-]+$')
       - remoteterminal_pam_policy_version is match('^[A-Za-z0-9_.-]+$')
       - remoteterminal_idle_timeout | length == 0 or remoteterminal_idle_timeout is match('^([0-9]+(ns|us|µs|ms|s|m|h))+$')
       - remoteterminal_absolute_timeout | length == 0 or remoteterminal_absolute_timeout is match('^([0-9]+(ns|us|µs|ms|s|m|h))+$')
+      - remoteterminal_go_version is match('^[0-9]+\.[0-9]+\.[0-9]+$')
+      - remoteterminal_go_archive_url is match('^https://go\.dev/dl/go[0-9]+\.[0-9]+\.[0-9]+\.linux-amd64\.tar\.gz$')
+      - >-
+        remoteterminal_go_archive_url ==
+        ('https://go.dev/dl/go' ~ remoteterminal_go_version ~
+         '.linux-amd64.tar.gz')
+      - remoteterminal_go_archive_checksum is match('^sha256:[0-9a-f]{64}$')
+      - remoteterminal_code_server_version is match('^[0-9]+\.[0-9]+\.[0-9]+$')
+      - remoteterminal_code_server_archive_url is match('^https://github\.com/coder/code-server/releases/download/v[0-9]+\.[0-9]+\.[0-9]+/code-server-[0-9]+\.[0-9]+\.[0-9]+-linux-amd64\.tar\.gz$')
+      - >-
+        remoteterminal_code_server_archive_url ==
+        ('https://github.com/coder/code-server/releases/download/v' ~
+         remoteterminal_code_server_version ~ '/code-server-' ~
+         remoteterminal_code_server_version ~ '-linux-amd64.tar.gz')
+      - remoteterminal_code_server_archive_checksum is match('^sha256:[0-9a-f]{64}$')
+      - (remoteterminal_health_retries | string) is match('^[1-9][0-9]*$')
+      - remoteterminal_health_retries | int >= 1
+      - (remoteterminal_health_delay | string) is match('^(0|[1-9][0-9]*)$')
+      - remoteterminal_health_delay | int >= 0
     fail_msg: >-
       Supply a non-root target user, a valid machine display name, and a
       specific non-loopback LAN IPv4 address. Port, session-limit, source-path,
-      TLS-pair, or build settings are invalid. Certificate and key source paths
-      must be supplied together.
+      Transport, TLS-pair, Go/code-server pin, health-check, or build settings are invalid.
+      Numeric settings must use canonical non-negative decimal integer syntax;
+      certificate and key source paths must be supplied together.
 
 - name: Split configured listen address into octets
   ansible.builtin.set_fact:
@@ -175,13 +210,19 @@
     remoteterminal_tls_cert_path: "{{ remoteterminal_config_dir }}/tls/current/server.crt"
     remoteterminal_tls_key_path: "{{ remoteterminal_config_dir }}/tls/current/server.key"
     remoteterminal_tls_marker_path: "{{ remoteterminal_config_dir }}/tls/current/config.marker"
+    remoteterminal_tls_enabled: "{{ remoteterminal_transport == 'https' }}"
+    remoteterminal_public_scheme: "{{ remoteterminal_transport }}"
+    remoteterminal_public_endpoint: >-
+      {{ remoteterminal_transport }}://{{ remoteterminal_listen_address }}:{{ remoteterminal_port | int }}/
     remoteterminal_tls_subject_alt_name: >-
       {{ 'subjectAltName=DNS:' ~ ansible_facts.hostname ~
          ',DNS:' ~ (ansible_facts.fqdn | default(ansible_facts.hostname, true)) ~
          ',IP:' ~ remoteterminal_listen_address }}
     remoteterminal_ttyd_tool_dir: >-
       {{ remoteterminal_install_root }}/tools/ttyd-{{ remoteterminal_ttyd_version }}-{{ remoteterminal_ttyd_commit[0:12] }}
-    remoteterminal_supplied_tls: "{{ remoteterminal_tls_cert_source | length > 0 }}"
+    remoteterminal_supplied_tls: >-
+      {{ remoteterminal_transport == 'https' and
+         (remoteterminal_tls_cert_source | length > 0) }}
 
 - name: Verify target account is non-root and interactive
   ansible.builtin.assert:

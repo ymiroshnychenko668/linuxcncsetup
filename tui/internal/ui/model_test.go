@@ -213,7 +213,8 @@ func TestNarrowRemoteTerminalFormKeepsFieldsVisible(t *testing.T) {
 				"Linux system user",
 				"Machine name",
 				"LAN IPv4 address",
-				"HTTPS port",
+				"Transport",
+				"Port",
 			} {
 				if !strings.Contains(view.Content, label) {
 					t.Fatalf("form does not show %q", label)
@@ -279,6 +280,7 @@ func TestConfirmationSafetyRemainsVisibleAtSupportedSizes(t *testing.T) {
 					user:          "operator",
 					machineName:   "mill",
 					listenAddress: "10.0.0.2",
+					transport:     remoteTerminalTransportHTTPS,
 					port:          "8443",
 				}
 				return model
@@ -286,6 +288,7 @@ func TestConfirmationSafetyRemainsVisibleAtSupportedSizes(t *testing.T) {
 			expected: []string{
 				"Install Remote Terminal?",
 				"Machine: mill",
+				"HTTPS https://10.0.0.2:8443/",
 				"https://10.0.0.2:8443/",
 				"self-signed",
 				"certificate.",
@@ -318,6 +321,46 @@ func TestConfirmationSafetyRemainsVisibleAtSupportedSizes(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestRemoteTerminalHTTPWarningRemainsVisibleAtSupportedSizes(t *testing.T) {
+	for _, size := range []struct {
+		width  int
+		height int
+	}{
+		{width: 80, height: 24},
+		{width: 60, height: 24},
+		{width: 40, height: 20},
+	} {
+		t.Run(fmt.Sprintf("%dx%d", size.width, size.height), func(t *testing.T) {
+			model := New()
+			model.width = size.width
+			model.height = size.height
+			model.page = menuRemoteTerminal
+			model.confirming = true
+			model.remoteTerminal = remoteTerminalDraft{
+				user:          "operator",
+				machineName:   "mill",
+				listenAddress: "10.0.0.2",
+				transport:     remoteTerminalTransportHTTP,
+				port:          "8080",
+			}
+
+			view := model.View()
+			for _, expected := range []string{
+				"HTTP http://10.0.0.2:8080/",
+				"system password",
+				"plaintext",
+				"code-server",
+				"secure-origin",
+				"allowlist.",
+			} {
+				if !strings.Contains(view.Content, expected) {
+					t.Fatalf("HTTP confirmation does not show %q:\n%s", expected, view.Content)
+				}
+			}
+		})
 	}
 }
 

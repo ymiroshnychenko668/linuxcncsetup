@@ -22,11 +22,16 @@ import (
 	"time"
 
 	"github.com/ymiroshnychenko668/linuxcncsetup/remoteterminal/internal/auth"
+	"github.com/ymiroshnychenko668/linuxcncsetup/remoteterminal/internal/codeservers"
 	"github.com/ymiroshnychenko668/linuxcncsetup/remoteterminal/internal/sessions"
 )
 
 const (
-	cookieName  = "__Host-remoteterminal_session"
+	secureCookieName   = "__Host-remoteterminal_session"
+	insecureCookieName = "remoteterminal_session"
+	// cookieName remains the secure default used by existing HTTPS-oriented
+	// tests and by callers which omit the explicit insecure-HTTP opt-in.
+	cookieName  = secureCookieName
 	csrfHeader  = "X-CSRF-Token"
 	maxJSONBody = 8 << 10
 )
@@ -41,12 +46,23 @@ type SessionManager interface {
 	ActiveTerminals() int
 }
 
+type CodeServerManager interface {
+	Browse(context.Context, string) (codeservers.DirectoryListing, error)
+	List(context.Context) ([]codeservers.Instance, error)
+	Create(context.Context, string) (codeservers.Instance, bool, error)
+	Delete(context.Context, string) error
+	Proxy(context.Context, string) (http.Handler, error)
+}
+
 type Config struct {
 	AllowedUser     string
 	MachineName     string
 	WebDir          string
 	AbsoluteTimeout time.Duration
 	AuthConcurrency int
+	// InsecureHTTP must only be set when the outer listener is plain HTTP. Its
+	// zero value deliberately preserves the secure __Host- cookie contract.
+	InsecureHTTP bool
 }
 
 // Server is an http.Handler and owns only HTTP-layer lifecycle state. Child
@@ -57,19 +73,22 @@ type Server struct {
 	authSessions  *auth.Store
 	throttler     *auth.Throttler
 	sessions      SessionManager
+	codeServers   CodeServerManager
 	logger        *log.Logger
 	static        http.Handler
 	authSlots     chan struct{}
 	connections   *connectionTracker
+	cookieName    string
+	cookieSecure  bool
 	shuttingDown  uint32
 }
 
 func New(config Config, authenticator auth.Authenticator, authSessions *auth.Store,
-	throttler *auth.Throttler, manager SessionManager, logger *log.Logger) (*Server, error) {
+	throttler *auth.Throttler, manager SessionManager, codeServerManager CodeServerManager, logger *log.Logger) (*Server, error) {
 	if config.AllowedUser == "" || config.MachineName == "" || config.WebDir == "" || config.AbsoluteTimeout <= 0 || config.AuthConcurrency <= 0 {
 		return nil, errors.New("invalid HTTP server configuration")
 	}
-	if authenticator == nil || authSessions == nil || throttler == nil || manager == nil {
+	if authenticator == nil || authSessions == nil || throttler == nil || manager == nil || codeServerManager == nil {
 		return nil, errors.New("HTTP server dependencies must not be nil")
 	}
 	if logger == nil {
@@ -79,16 +98,25 @@ func New(config Config, authenticator auth.Authenticator, authSessions *auth.Sto
 	if err != nil {
 		return nil, err
 	}
+	authenticationCookieName := secureCookieName
+	authenticationCookieSecure := true
+	if config.InsecureHTTP {
+		authenticationCookieName = insecureCookieName
+		authenticationCookieSecure = false
+	}
 	return &Server{
 		config:        config,
 		authenticator: authenticator,
 		authSessions:  authSessions,
 		throttler:     throttler,
 		sessions:      manager,
+		codeServers:   codeServerManager,
 		logger:        logger,
 		static:        static,
 		authSlots:     make(chan struct{}, config.AuthConcurrency),
 		connections:   newConnectionTracker(),
+		cookieName:    authenticationCookieName,
+		cookieSecure:  authenticationCookieSecure,
 	}, nil
 }
 
@@ -98,13 +126,23 @@ func (s *Server) BeginShutdown() {
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	s.setSecurityHeaders(w)
+	codeServerRoute := strings.HasPrefix(r.URL.Path, "/code/")
+	if !codeServerRoute {
+		s.setSecurityHeaders(w)
+	}
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			s.logger.Printf("panic serving request: %v", recovered)
 			writeError(w, http.StatusInternalServerError, "internal_error", "The request could not be completed.")
 		}
 	}()
+	if atomic.LoadUint32(&s.shuttingDown) != 0 && r.URL.Path != "/healthz" {
+		if codeServerRoute {
+			s.setSecurityHeaders(w)
+		}
+		writeError(w, http.StatusServiceUnavailable, "shutting_down", "The service is shutting down.")
+		return
+	}
 
 	switch {
 	case r.URL.Path == "/healthz":
@@ -113,6 +151,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.api(w, r)
 	case strings.HasPrefix(r.URL.Path, "/terminal/"):
 		s.terminal(w, r)
+	case strings.HasPrefix(r.URL.Path, "/code/"):
+		s.codeServer(w, r)
 	default:
 		s.static.ServeHTTP(w, r)
 	}
@@ -143,11 +183,19 @@ func (s *Server) api(w http.ResponseWriter, r *http.Request) {
 		s.logout(w, r)
 	case "/api/sessions":
 		s.sessionsCollection(w, r)
+	case "/api/directories":
+		s.directories(w, r)
+	case "/api/code-servers":
+		s.codeServersCollection(w, r)
 	case "/api/status":
 		s.status(w, r)
 	default:
 		if strings.HasPrefix(r.URL.Path, "/api/sessions/") {
 			s.sessionItem(w, r)
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/api/code-servers/") {
+			s.codeServerItem(w, r)
 			return
 		}
 		writeError(w, http.StatusNotFound, "not_found", "The requested resource was not found.")
@@ -219,10 +267,10 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 	s.throttler.Success(ipKey)
 	s.throttler.Success(usernameKey)
 	http.SetCookie(w, &http.Cookie{
-		Name:     cookieName,
+		Name:     s.cookieName,
 		Value:    token,
 		Path:     "/",
-		Secure:   true,
+		Secure:   s.cookieSecure,
 		HttpOnly: true,
 		SameSite: http.SameSiteStrictMode,
 		Expires:  session.ExpiresAt,
@@ -307,6 +355,94 @@ func (s *Server) sessionsCollection(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (s *Server) directories(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w, http.MethodGet)
+		return
+	}
+	if _, _, ok := s.authenticate(w, r); !ok {
+		return
+	}
+	paths, present := r.URL.Query()["path"]
+	if len(paths) > 1 {
+		writeError(w, http.StatusBadRequest, "invalid_directory", "The directory path is invalid.")
+		return
+	}
+	requestedPath := ""
+	if present && len(paths) == 1 {
+		requestedPath = paths[0]
+	}
+	listing, err := s.codeServers.Browse(r.Context(), requestedPath)
+	if err != nil {
+		s.codeServerError(w, "browse directories", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, listing)
+}
+
+func (s *Server) codeServersCollection(w http.ResponseWriter, r *http.Request) {
+	_, authSession, ok := s.authenticate(w, r)
+	if !ok {
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		items, err := s.codeServers.List(r.Context())
+		if err != nil {
+			s.codeServerError(w, "list code servers", err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{"codeServers": items})
+	case http.MethodPost:
+		if !s.authorizeMutation(w, r, authSession) {
+			return
+		}
+		var request struct {
+			FolderPath string `json:"folderPath"`
+		}
+		if err := decodeJSON(w, r, &request); err != nil {
+			writeDecodeError(w, err)
+			return
+		}
+		instance, reused, err := s.codeServers.Create(r.Context(), request.FolderPath)
+		if err != nil {
+			s.codeServerError(w, "create code server", err)
+			return
+		}
+		status := http.StatusCreated
+		if reused {
+			status = http.StatusOK
+		}
+		writeJSON(w, status, map[string]interface{}{"codeServer": instance, "reused": reused})
+	default:
+		methodNotAllowed(w, http.MethodGet, http.MethodPost)
+	}
+}
+
+func (s *Server) codeServerItem(w http.ResponseWriter, r *http.Request) {
+	_, authSession, ok := s.authenticate(w, r)
+	if !ok {
+		return
+	}
+	remainder := strings.TrimPrefix(r.URL.Path, "/api/code-servers/")
+	if strings.Contains(remainder, "/") || !codeservers.ValidID(remainder) {
+		writeError(w, http.StatusNotFound, "not_found", "The requested code server was not found.")
+		return
+	}
+	if r.Method != http.MethodDelete {
+		methodNotAllowed(w, http.MethodDelete)
+		return
+	}
+	if !s.authorizeMutation(w, r, authSession) {
+		return
+	}
+	if err := s.codeServers.Delete(r.Context(), remainder); err != nil {
+		s.codeServerError(w, "stop code server", err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (s *Server) sessionItem(w http.ResponseWriter, r *http.Request) {
 	_, authSession, ok := s.authenticate(w, r)
 	if !ok {
@@ -377,13 +513,20 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 	if _, _, ok := s.authenticate(w, r); !ok {
 		return
 	}
+	codeServers, err := s.codeServers.List(r.Context())
+	if err != nil {
+		s.codeServerError(w, "inspect code servers", err)
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"ok": true,
 		"dependencies": map[string]interface{}{
-			"tmux": map[string]bool{"available": true},
-			"ttyd": map[string]bool{"available": true},
+			"tmux":       map[string]bool{"available": true},
+			"ttyd":       map[string]bool{"available": true},
+			"codeServer": map[string]bool{"available": true},
 		},
-		"activeTerminals": s.sessions.ActiveTerminals(),
+		"activeTerminals":   s.sessions.ActiveTerminals(),
+		"activeCodeServers": len(codeServers),
 	})
 }
 
@@ -436,8 +579,62 @@ func (s *Server) terminal(w http.ResponseWriter, r *http.Request) {
 	proxy.ServeHTTP(w, r)
 }
 
+func (s *Server) codeServer(w http.ResponseWriter, r *http.Request) {
+	if atomic.LoadUint32(&s.shuttingDown) != 0 {
+		writeError(w, http.StatusServiceUnavailable, "shutting_down", "The service is shutting down.")
+		return
+	}
+	token, authSession, ok := s.authenticate(w, r)
+	if !ok {
+		return
+	}
+	remainder := strings.TrimPrefix(r.URL.Path, "/code/")
+	id, _, _ := strings.Cut(remainder, "/")
+	if !codeservers.ValidID(id) {
+		http.NotFound(w, r)
+		return
+	}
+	// Browser-driven mutations must originate from this exact request origin.
+	// code-server does not use Remote Terminal's CSRF token, so this check is
+	// the HTTP counterpart to the mandatory WebSocket Origin validation.
+	unsafeMethod := r.Method != http.MethodGet && r.Method != http.MethodHead
+	if (isWebSocket(r) || unsafeMethod) && !validOrigin(r) {
+		writeError(w, http.StatusForbidden, "origin_rejected", "The request origin is not allowed.")
+		return
+	}
+	proxy, err := s.codeServers.Proxy(r.Context(), id)
+	if err != nil {
+		switch {
+		case errors.Is(err, codeservers.ErrNotFound), errors.Is(err, codeservers.ErrInvalidID):
+			http.NotFound(w, r)
+		case errors.Is(err, codeservers.ErrNotRunning):
+			http.Error(w, "code server is unavailable", http.StatusBadGateway)
+		case errors.Is(err, codeservers.ErrShuttingDown):
+			writeError(w, http.StatusServiceUnavailable, "shutting_down", "The service is shutting down.")
+		default:
+			s.logger.Printf("proxy code server: %v", err)
+			http.Error(w, "code server is unavailable", http.StatusBadGateway)
+		}
+		return
+	}
+	if isWebSocket(r) {
+		trackedWriter := &trackedResponseWriter{
+			ResponseWriter: w,
+			tracker:        s.connections,
+			token:          token,
+			deadline:       authSession.Deadline(),
+			validUntil: func() (time.Time, bool) {
+				return s.authSessions.DeadlineFor(token)
+			},
+		}
+		proxy.ServeHTTP(trackedWriter, r)
+		return
+	}
+	proxy.ServeHTTP(w, r)
+}
+
 func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) (string, auth.Session, bool) {
-	cookie, err := r.Cookie(cookieName)
+	cookie, err := r.Cookie(s.cookieName)
 	if err != nil {
 		writeError(w, http.StatusUnauthorized, "unauthorized", "Authentication is required.")
 		return "", auth.Session{}, false
@@ -488,6 +685,28 @@ func (s *Server) sessionError(w http.ResponseWriter, action string, err error) {
 	}
 }
 
+func (s *Server) codeServerError(w http.ResponseWriter, action string, err error) {
+	switch {
+	case errors.Is(err, codeservers.ErrInvalidPath), errors.Is(err, codeservers.ErrInvalidID):
+		writeError(w, http.StatusBadRequest, "invalid_directory", "The directory path or identifier is invalid.")
+	case errors.Is(err, codeservers.ErrDirectoryInaccessible):
+		writeError(w, http.StatusForbidden, "directory_inaccessible", "The directory is not accessible.")
+	case errors.Is(err, codeservers.ErrDirectoryNotFound):
+		writeError(w, http.StatusNotFound, "directory_not_found", "The directory was not found.")
+	case errors.Is(err, codeservers.ErrNotFound):
+		writeError(w, http.StatusNotFound, "code_server_not_found", "The requested code server was not found.")
+	case errors.Is(err, codeservers.ErrLimitReached):
+		writeError(w, http.StatusConflict, "code_server_limit", "The maximum number of code servers has been reached.")
+	case errors.Is(err, codeservers.ErrStartFailed):
+		s.logger.Printf("%s: %v", action, err)
+		writeError(w, http.StatusBadGateway, "code_server_start_failed", "Code Server could not be started.")
+	case errors.Is(err, codeservers.ErrShuttingDown):
+		writeError(w, http.StatusServiceUnavailable, "shutting_down", "The service is shutting down.")
+	default:
+		s.internalError(w, action, err)
+	}
+}
+
 func (s *Server) internalError(w http.ResponseWriter, action string, err error) {
 	s.logger.Printf("%s: %v", action, err)
 	writeError(w, http.StatusInternalServerError, "internal_error", "The request could not be completed.")
@@ -495,7 +714,7 @@ func (s *Server) internalError(w http.ResponseWriter, action string, err error) 
 
 func (s *Server) clearCookie(w http.ResponseWriter) {
 	http.SetCookie(w, &http.Cookie{
-		Name: cookieName, Value: "", Path: "/", Secure: true, HttpOnly: true,
+		Name: s.cookieName, Value: "", Path: "/", Secure: s.cookieSecure, HttpOnly: true,
 		SameSite: http.SameSiteStrictMode, MaxAge: -1, Expires: time.Unix(1, 0),
 	})
 }
@@ -509,7 +728,11 @@ func (s *Server) setSecurityHeaders(w http.ResponseWriter) {
 }
 
 func validOrigin(r *http.Request) bool {
-	raw := r.Header.Get("Origin")
+	values := r.Header.Values("Origin")
+	if len(values) != 1 {
+		return false
+	}
+	raw := values[0]
 	if raw == "" || strings.Contains(raw, ",") {
 		return false
 	}

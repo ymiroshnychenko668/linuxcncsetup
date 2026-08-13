@@ -214,7 +214,7 @@ describe('TerminalPanel', () => {
     await waitFor(() => expect(mocks.connectSession).toHaveBeenCalledTimes(1))
   })
 
-  it('retries an explicit focus request until xterm is ready', async () => {
+  it('retries a requested keyboard focus until xterm is ready and abandons inactive requests', async () => {
     const onStateChange = vi.fn()
     const onSessionChange = vi.fn()
     const { rerender } = render(
@@ -228,10 +228,10 @@ describe('TerminalPanel', () => {
       />,
     )
     const frame = await screen.findByTitle('alpha terminal') as HTMLIFrameElement
+    const frameFocus = vi.spyOn(frame, 'focus')
 
     vi.useFakeTimers()
     try {
-      frame.focus()
       rerender(
         <TerminalPanel
           session={session}
@@ -243,6 +243,7 @@ describe('TerminalPanel', () => {
         />,
       )
       flushAnimationFrames()
+      expect(frameFocus).toHaveBeenCalledTimes(1)
 
       const terminal = installTerminal(frame)
       let focusCalls = 0
@@ -254,19 +255,45 @@ describe('TerminalPanel', () => {
       act(() => vi.advanceTimersByTime(50))
       flushAnimationFrames()
       expect(terminal.focus).toHaveBeenCalledTimes(1)
-      expect(terminal.textarea.ownerDocument.activeElement).not.toBe(terminal.textarea)
 
       act(() => vi.advanceTimersByTime(100))
       flushAnimationFrames()
       expect(terminal.focus).toHaveBeenCalledTimes(2)
       expect(terminal.textarea.ownerDocument.activeElement).toBe(terminal.textarea)
-      expect(document.activeElement).toBe(frame)
+
+      terminal.focus.mockClear()
+      rerender(
+        <TerminalPanel
+          session={session}
+          active={false}
+          focusRequestKey={2}
+          reconnectKey={0}
+          onStateChange={onStateChange}
+          onSessionChange={onSessionChange}
+        />,
+      )
+      act(() => vi.advanceTimersByTime(2000))
+      flushAnimationFrames()
+      expect(terminal.focus).not.toHaveBeenCalled()
+
+      rerender(
+        <TerminalPanel
+          session={session}
+          active
+          focusRequestKey={2}
+          reconnectKey={0}
+          onStateChange={onStateChange}
+          onSessionChange={onSessionChange}
+        />,
+      )
+      flushAnimationFrames()
+      expect(terminal.focus).not.toHaveBeenCalled()
     } finally {
       vi.useRealTimers()
     }
   })
 
-  it('abandons pending focus when the user moves to another control or tab', async () => {
+  it('does not steal focus back when the user moves on while xterm is loading', async () => {
     const onStateChange = vi.fn()
     const onSessionChange = vi.fn()
     const { rerender } = render(
@@ -284,7 +311,6 @@ describe('TerminalPanel', () => {
 
     vi.useFakeTimers()
     try {
-      frame.focus()
       rerender(
         <TerminalPanel
           session={session}
@@ -296,35 +322,14 @@ describe('TerminalPanel', () => {
         />,
       )
       flushAnimationFrames()
-      panel.focus()
+      expect(document.activeElement).toBe(frame)
 
+      panel.focus()
       const terminal = installTerminal(frame)
       act(() => vi.advanceTimersByTime(50))
       flushAnimationFrames()
-      expect(terminal.focus).not.toHaveBeenCalled()
-      expect(document.activeElement).toBe(panel)
 
-      rerender(
-        <TerminalPanel
-          session={session}
-          active={false}
-          focusRequestKey={2}
-          reconnectKey={0}
-          onStateChange={onStateChange}
-          onSessionChange={onSessionChange}
-        />,
-      )
-      rerender(
-        <TerminalPanel
-          session={session}
-          active
-          focusRequestKey={2}
-          reconnectKey={0}
-          onStateChange={onStateChange}
-          onSessionChange={onSessionChange}
-        />,
-      )
-      flushAnimationFrames()
+      expect(document.activeElement).toBe(panel)
       expect(terminal.focus).not.toHaveBeenCalled()
     } finally {
       vi.useRealTimers()

@@ -2,9 +2,9 @@
 
 ## Status
 
-The agreed version 1 design is implemented in this repository. The source tree now contains the Go backend, React/TypeScript frontend, tmux/ttyd manager and authenticated proxy, setup-menu integration, Ansible source-build/deployment and uninstall role, systemd/PAM/TLS templates, and automated tests.
+The agreed design is implemented in this repository. The source tree contains the Go backend, React/TypeScript frontend, tmux/ttyd terminal manager, tmux/code-server workspace manager, authenticated proxies, setup-menu integration, Ansible source-build/deployment and uninstall role, systemd/PAM/TLS templates, and automated tests.
 
-Source-level unit tests and a strictly opt-in real tmux/ttyd lifecycle test are available. Clean AMD64 Debian/LinuxCNC installation, interactive PAM behavior, supported-browser clipboard/input behavior, second-run idempotence, reboot, and uninstall remain target-machine acceptance work. Nothing in this document claims those target-only checks have run.
+Source-level unit tests and strictly opt-in real tmux/ttyd and tmux/code-server lifecycle tests are available. Clean AMD64 Debian/LinuxCNC installation, interactive PAM behavior, supported-browser clipboard/input behavior, second-run idempotence, reboot, and uninstall remain target-machine acceptance work. Nothing in this document claims those target-only checks have run.
 
 This document is retained as the architecture, security contract, implementation record, and acceptance plan. Future choices are identified separately from current version 1 defaults.
 
@@ -15,6 +15,7 @@ This document is retained as the architecture, security contract, implementation
 - Go backend.
 - React and TypeScript frontend.
 - tmux and ttyd integration.
+- On-demand code-server workspaces for user-selected folders.
 - Multiple terminal sessions presented as vertical tabs.
 - Terminal copy and paste support.
 - LAN access only; no Tailscale integration.
@@ -26,11 +27,12 @@ This document is retained as the architecture, security contract, implementation
 
 - One non-root LinuxCNC system account is selected during installation.
 - PAM authenticates only that configured account.
-- The Go service, tmux server, ttyd processes, and terminal shells all run as that account.
+- The Go service, private tmux servers, ttyd processes, terminal shells, and code-server processes all run as that account.
 - Browser disconnection does not destroy tmux sessions.
 - Persistence across a systemd service restart, upgrade restart, or machine reboot is not provided in version 1; the persistence guarantee covers browser disconnects, tab closure, and logout while the service remains running.
-- The browser connects over HTTPS because the login uses the real system password.
+- The production appliance profile defaults to plaintext HTTP on an isolated machine LAN so client certificates are not required. It is never presented as equivalent security: the real system password and all session traffic are observable on that LAN. HTTPS remains selectable when trusted TLS material is available.
 - The default maximum number of sessions is eight.
+- The default maximum number of active code servers is two, configurable from one through eight.
 - The default service port is `8443`.
 - Browser authentication sessions are in-memory, with a 30-minute idle timeout and 12-hour absolute timeout by default.
 
@@ -39,23 +41,24 @@ Supporting arbitrary local users with different shell identities is outside vers
 ## Architecture
 
 ```text
-Browser over HTTPS
+Browser over selected HTTP/HTTPS transport
         |
         v
 Go service
   |- PAM login and server-side authentication sessions
   |- React static application
-  |- tmux session-management API
-  `- authenticated HTTP/WebSocket reverse proxy
+  |- terminal tmux session-management API
+  |- code-server folder/lifecycle API
+  `- authenticated HTTP/WebSocket reverse proxies
                          |
                   Unix-domain sockets
-                         |
-                  ttyd per session
-                         |
-             dedicated tmux server socket
+                    /           \
+          ttyd per terminal   code-server per folder
+                    |             |
+             dedicated private tmux server sockets
 ```
 
-Only the Go HTTPS listener is exposed to the LAN. ttyd listens on permission-restricted Unix-domain sockets and cannot be contacted directly over the network.
+Only the Go listener is exposed to the LAN. ttyd and code-server listen on permission-restricted Unix-domain sockets and cannot be contacted directly over the network.
 
 ## Implemented source layout
 
@@ -71,6 +74,7 @@ remoteterminal/
 |     `- main.go
 |- internal/
 |  |- auth/
+|  |- codeservers/
 |  |- config/
 |  |- httpapi/
 |  `- sessions/
@@ -101,6 +105,7 @@ The implemented TUI path is responsible for:
 - Requesting privilege escalation.
 - Selecting or supplying the target system user.
 - Selecting the LAN listen address and port.
+- Selecting the default plaintext HTTP appliance transport or optional HTTPS transport.
 - Displaying Ansible progress and the final service URL.
 - Invoking the local playbook with the selected user, address, and port, equivalent to:
 
@@ -112,41 +117,42 @@ ansible-playbook \
   --extra-vars 'remoteterminal_user=linuxcnc' \
   --extra-vars '{"remoteterminal_machine_name":"Workshop Mill"}' \
   --extra-vars 'remoteterminal_listen_address=192.168.1.20' \
+  --extra-vars 'remoteterminal_transport=http' \
   --extra-vars 'remoteterminal_port=8443' \
   remoteterminal/ansible/install.yml
 ```
 
-Optional TLS paths and advanced overrides are supported by direct Ansible invocation; prompting for them in the TUI is a future UI choice.
+Optional TLS paths and advanced overrides are supported by direct Ansible invocation.
 
 The playbook is responsible for:
 
 1. Verifying AMD64, Debian, systemd, the source directory, and the selected non-root account.
 2. Installing build and runtime dependencies:
-   - Go toolchain.
    - Node.js and npm.
    - tmux.
    - PAM runtime and development packages.
    - Git, compiler, CMake, pkg-config, and ttyd library dependencies.
-3. Obtaining a pinned ttyd source revision and verifying it before building.
-4. Building ttyd from source.
-5. Running `npm ci` and building the React application.
-6. Running Go tests and compiling the Go service with PAM/cgo support.
-7. Installing versioned artifacts below `/opt/remoteterminal`.
-8. Installing configuration, PAM policy, and TLS material below `/etc/remoteterminal`.
-9. Installing, enabling, and starting the systemd service.
-10. Checking the HTTPS health endpoint before reporting success.
+3. Downloading the official Go 1.26.5 Linux AMD64 archive, verifying its fixed SHA-256 digest and archive-member safety, checking its exact reported version as the selected account, and atomically promoting the root-owned tool below `/opt/remoteterminal/tools`.
+4. Obtaining a pinned ttyd source revision, verifying it, and building ttyd from source.
+5. Downloading the official code-server 4.132.0 AMD64 standalone archive, verifying its fixed SHA-256 digest and archive-member safety, validating it as the selected account, and atomically promoting the root-owned tool. Repair writes a durable restart marker before mutation, stops only the validated private code-server tmux server after exchange, and retains the displaced tree until deployment health verification.
+6. Running `npm ci` and building the React application.
+7. Running Go tests and compiling the Go service with PAM/cgo support using only the pinned application-owned toolchain with automatic toolchain downloads disabled.
+8. Installing versioned artifacts below `/opt/remoteterminal`.
+9. Installing configuration and PAM policy below `/etc/remoteterminal`, plus atomic TLS material when HTTPS is selected.
+10. Installing, enabling, and starting the systemd service.
+11. Checking the selected-transport health endpoint before reporting success.
 
 Third-party source builds must run as the selected non-root account. Root privileges are used only for package installation and deployment of system-owned files.
 
-The playbook uses checksum-pinned sources, content-addressed application releases, atomic release/TLS links, and durable restart markers to make unchanged reruns idempotent and changed-source reruns controlled upgrades. Second-run idempotence still requires confirmation on the supported target. The uninstall playbook stops and disables the service, removes application-owned files by default, and explicitly reports preservation behavior.
+The playbook uses checksum-pinned sources, content-addressed application and tool releases, atomic promotion/TLS links, deferred cleanup of displaced dependency trees, and durable restart markers to make unchanged reruns idempotent and changed-source reruns controlled upgrades. Second-run idempotence still requires confirmation on the supported target. The uninstall playbook stops and disables the service, removes application-owned files by default, and explicitly reports preservation behavior.
 
-Source installation initially requires network access for APT, npm modules, Go modules, and the pinned ttyd source. A fully vendored/offline installation can be added later.
+Source installation initially requires network access for APT, npm modules, Go modules, the checksum-pinned Go toolchain archive, the pinned ttyd source, and the checksum-pinned code-server archive. A fully vendored/offline installation can be added later.
 
 ## Authentication design
 
 ### Login
 
-- The React login screen submits the configured username and password once over HTTPS.
+- The React login screen submits the configured username and password once. HTTPS encrypts it; the default HTTP appliance mode warns that it is plaintext on the network.
 - The backend authenticates through Linux PAM using `/etc/pam.d/remoteterminal`.
 - Both PAM authentication and account-management checks are required so locked or expired accounts are rejected.
 - Only the account selected during installation is accepted.
@@ -158,7 +164,7 @@ Source installation initially requires network access for APT, npm modules, Go m
 After successful PAM authentication, the backend creates a cryptographically random, opaque, server-side session and sends a cookie with:
 
 - `HttpOnly`.
-- `Secure`.
+- `Secure` and a `__Host-` name in HTTPS mode; HTTP uses a distinct host-only non-`Secure` cookie because browsers reject the secure cookie on plaintext origins.
 - `SameSite=Strict`.
 - An idle expiration.
 - An absolute expiration.
@@ -202,6 +208,22 @@ The Go reverse proxy must support ttyd's normal HTTP requests and WebSocket upgr
 
 The version 1 persistence boundary is intentionally narrow. The manager leaves tmux state alone on an ordinary browser disconnect and its shutdown path does not issue a broad/default-server kill, but the deployed systemd cgroup, runtime-directory lifecycle, upgrade restart, and reboot do not promise managed-session survival. Operators must treat service restart, upgrade, reboot, and uninstall as session-ending boundaries. Durable restart/reboot restoration is a future design choice.
 
+## tmux and code-server integration
+
+- Browse directories as the configured account, starting at its home directory, and accept only canonical absolute directories that account can traverse and read.
+- Canonicalize symbolic links before identity and profile decisions. Reuse the active instance when a requested folder resolves to the same canonical directory.
+- Enforce `remoteterminal_max_code_servers`, default two and validated from one through eight.
+- Launch each instance through direct tmux argument arrays on `/run/remoteterminal/code-server.tmux.sock`; never interpolate a folder into a shell command.
+- Bind each code-server HTTP listener and session IPC endpoint to a private Unix-domain socket below `/run/remoteterminal/code-server/INSTANCE/`.
+- Disable code-server authentication only because the Go proxy authenticates every HTTP and WebSocket request. Disable telemetry, update checks, and code-server's built-in port proxy.
+- Give each canonical folder an isolated persistent user-data and extensions profile under `/var/lib/remoteterminal/code-server/profiles`.
+- Keep an instance running across tab closure, browser closure, and logout. Stop it only through explicit **Shutdown**, natural process exit, or Remote Terminal service shutdown/restart/upgrade/reboot.
+- On startup and list operations, reconcile private tmux state with runtime sockets so stale processes and entries are not presented as active.
+
+The reverse proxy strips `/code/INSTANCE/`, preserves unrelated editor cookies, removes Remote Terminal credentials before forwarding, supplies trusted forwarding headers, and rewrites upstream root paths and cookie/service-worker scopes back beneath the instance prefix. It applies authentication and exact-origin validation to both HTTP and WebSocket traffic. The SPA content-security policy is not applied to editor responses; upstream editor policy is preserved with same-origin framing and standard containment headers.
+
+The embedded editor is deliberately inside the trusted same-origin application boundary. Workspace content, editor webviews, extensions, and tasks execute with the configured account's effective workstation authority and can interact with authenticated Remote Terminal APIs through that origin. Operators must open only trusted workspaces and install only trusted extensions; this version does not claim a security boundary between code-server content and a terminal for the same account.
+
 ## Backend API
 
 ```text
@@ -215,7 +237,13 @@ POST   /api/sessions
 DELETE /api/sessions/{id}
 POST   /api/sessions/{id}/connect
 
+GET    /api/directories?path=/absolute/path
+GET    /api/code-servers
+POST   /api/code-servers
+DELETE /api/code-servers/{id}
+
 GET    /terminal/{id}/...
+GET    /code/{id}/...
 GET    /healthz
 ```
 
@@ -230,6 +258,8 @@ API rules:
 
 Closing a frontend tab only detaches that browser view. Deleting a session is a separate confirmed action that kills the tmux session.
 
+Closing a code-server tab also only detaches the browser view. Shutting down a code server is a separate confirmed action. Requests for canonical folders that already have an active instance return that instance so the frontend can focus it.
+
 ## React frontend
 
 ### Main layout
@@ -242,6 +272,9 @@ Closing a frontend tab only detaches that browser view. Deleting a session is a 
 - Deleting requires confirmation and is visually distinct from closing a tab.
 - The selected tab and tab order may be stored locally, scoped to the authenticated username; credentials and authentication tokens are never stored in browser storage.
 - Open terminal frames remain mounted while switching tabs so live connections, terminal state, and scrollback are preserved.
+- Editor tabs have a distinct icon and blue/cyan treatment, and editor frames remain mounted after first activation so switching does not reload the workspace.
+- The folder picker supports breadcrumb/up navigation, directory rows, and a validated absolute-path entry. The active-code-server list offers open/focus and confirmed shutdown actions.
+- Non-sensitive tab state uses typed terminal/editor records, with migration from the terminal-only storage format; paths, URLs, credentials, and tokens are not stored.
 - Interrupted connections display a reconnect state without destroying the tmux session.
 
 ### Accessibility
@@ -277,31 +310,31 @@ click that Firefox and other user-activation-gated browsers accept.
 - Use systemd-managed runtime and state directories with restrictive permissions.
 - Load non-secret settings, including `REMOTE_TERMINAL_MACHINE_NAME`, from `/etc/remoteterminal`.
 - Restart on unexpected failure with bounded restart frequency.
-- Use graceful shutdown for HTTP, WebSockets, and ttyd child processes.
+- Use graceful shutdown for HTTP, WebSockets, ttyd child processes, and managed code-server instances.
 - Do not apply sandboxing directives that silently prevent the terminal account from performing its normal work.
 - Do not grant additional capabilities or privileges to the service.
-- Ensure only the configured HTTPS address and port are exposed.
+- Ensure only the configured HTTP or HTTPS address and port are exposed.
 
 ## LAN and TLS behavior
 
 - The installer receives a specific LAN address from the TUI instead of exposing every interface by default.
 - The default port is `8443`; it is configurable.
-- The backend serves HTTPS directly.
+- The backend serves the explicitly selected transport directly. The production role and TUI select HTTP by default; HTTPS is the optional trusted-certificate mode.
 - If certificate and key paths are supplied together, Ansible validates, copies, and uses them. Changed source-file checksums cause an atomic rotation on a later run.
 - Otherwise, Ansible generates a self-signed RSA-3072 certificate for 825 days with hostname, FQDN, and selected LAN IP subject alternative names, and reports its SHA-256 fingerprint.
 - Active and candidate TLS material is checked for validity, key matching, and a 30-day default renewal window. Generated material is replaced when its profile/address changes, it becomes invalid, or it enters that window. A complete validated candidate is atomically activated; failure retains the prior active set and a successful change requests a controlled service restart.
 - Automatic firewall modification is excluded to avoid interfering with LinuxCNC network configuration. The role verifies a specific non-loopback IPv4 address and, by default, that the address belongs to the host. Binding plus host/router/firewall policy define LAN reachability; the service must not be exposed directly to the public internet.
-- Plain HTTP with a system password is not an accepted default.
+- Plain HTTP with a system password is the accepted appliance default only for the isolated trusted machine LAN requested by the product. It has a persistent login-page and installer warning, and cannot provide normal remote code-server webviews unless the exact origin is placed in a managed Chromium secure-origin policy or reached as `localhost` through an encrypted tunnel.
 
 ## Uninstall behavior
 
-Uninstall always stops and disables the service, stops only the tmux server addressed through `/run/remoteterminal/tmux.sock`, removes the runtime directory, and removes the systemd unit, PAM policy, and interactive PAM helper. Live Remote Terminal tmux/ttyd state is therefore not preserved. Unrelated tmux servers, the selected user's home files, LinuxCNC configuration, firewall policy, and Debian dependency packages remain untouched.
+Uninstall always stops and disables the service, stops only the tmux servers addressed through `/run/remoteterminal/tmux.sock` and `/run/remoteterminal/code-server.tmux.sock`, removes the runtime directory, and removes the systemd unit, PAM policy, and interactive PAM helper. Live terminal and code-server state is therefore not preserved. Unrelated tmux servers, the selected user's home files, LinuxCNC configuration, firewall policy, and Debian dependency packages remain untouched.
 
 Application-owned files are removed by default. Four explicit boolean overrides retain selected categories:
 
-- `remoteterminal_uninstall_preserve_installation=true` retains `/opt/remoteterminal`.
+- `remoteterminal_uninstall_preserve_installation=true` retains `/opt/remoteterminal`, including the pinned Go, ttyd, and code-server tools.
 - `remoteterminal_uninstall_preserve_config=true` retains `/etc/remoteterminal`, including TLS and the PAM verification marker.
-- `remoteterminal_uninstall_preserve_state=true` retains `/var/lib/remoteterminal`.
+- `remoteterminal_uninstall_preserve_state=true` retains `/var/lib/remoteterminal`, including isolated code-server profiles.
 - `remoteterminal_uninstall_preserve_build_cache=true` retains `/var/lib/remoteterminal-build`.
 
 These flags do not retain live processes or `/run/remoteterminal`; all default to `false`.
@@ -311,7 +344,8 @@ These flags do not retain live processes or `/run/remoteterminal`; all default t
 - Pin all npm dependencies and commit `package-lock.json`.
 - Pin all Go modules and commit `go.sum`.
 - Pin ttyd to an exact source revision and verify its archive or commit.
-- Keep the Go source compatible with the toolchain installed by the Debian target, or have Ansible install an explicitly pinned newer toolchain.
+- Pin the official code-server standalone archive to an exact version and SHA-256 digest; validate archive paths/types before extraction and activate only a complete root-owned candidate.
+- Build and test only with the checksum-pinned application-owned Go 1.26.5 Linux AMD64 toolchain; disable automatic Go toolchain switching/downloads.
 - Keep the frontend build compatible with the selected Node.js version.
 - Embed or atomically install the production React assets so the service cannot serve a frontend from a different application version.
 - Do not use unpinned `curl | shell` installation steps.
@@ -328,26 +362,29 @@ These flags do not retain live processes or `/run/remoteterminal`; all default t
 - The PAM adapter, fake-authenticator coverage, installed account probe, interactive verifier, and optional strict gate are implemented; real target credentials remain an interactive acceptance check.
 - The checksum-pinned ttyd 1.7.7 source-build path is implemented; compilation on the clean supported target remains an acceptance check.
 - The opt-in real-process test covers ttyd HTTP and WebSocket proxying through a Unix socket and session base path.
+- A separate opt-in real-process test covers canonical-folder reuse, limits, private tmux/socket isolation, HTTP proxying, profile persistence, and graceful code-server shutdown with the production argument set.
 - Clipboard, Unicode, and Ukrainian input in Chrome/Chromium and Firefox remain manual browser acceptance checks.
 
 ### Phase 2: Go backend — implemented
 
 - Configuration/startup validation, PAM login, in-memory authentication sessions, CSRF/origin enforcement, throttling, and security headers are implemented.
 - Concurrency-safe tmux session management, ttyd process/socket lifecycle, authenticated reverse proxying, graceful HTTP shutdown, cleanup, logging, and health checks are implemented.
+- Canonical-folder code-server management, per-instance private sockets and profiles, authenticated HTTP/WebSocket proxying, active limits, reconciliation, and graceful shutdown are implemented.
 
 ### Phase 3: React frontend — implemented
 
 - Login/logout, session loading/creation/deletion, error and reconnect states, accessible vertical tabs, mounted terminal frames, responsive styling, and clipboard permissions/help are implemented.
+- Folder browsing, launch/reuse, active-code-server management, confirmed shutdown, visually distinct mounted editor tabs, and responsive editor controls are implemented.
 - Actual clipboard and keyboard behavior remains subject to supported-browser acceptance.
 
 ### Phase 4: Ansible and TUI integration — implemented
 
-- The source-build role, deployment templates, setup-menu entry, selected user/address/port handoff, content-addressed upgrades, systemd health verification, and uninstall path are implemented.
-- Supplied TLS paths and advanced variables are available through direct Ansible invocation; additional TUI prompts are a future enhancement.
+- The source-build role, deployment templates, setup-menu entry, selected user/address/transport/port handoff, content-addressed upgrades, systemd health verification, and uninstall path are implemented.
+- Supplied TLS paths and advanced variables are available through direct Ansible invocation.
 
 ### Phase 5: Verification and documentation — partially complete
 
-- Backend and frontend automated suites and the opt-in real tmux/ttyd integration test are present.
+- Backend and frontend automated suites and opt-in real tmux/ttyd and tmux/code-server integration tests are present.
 - Operation, configuration, logs, recovery, persistence limits, TLS, PAM verification, and security boundaries are documented.
 - Clean-target installation, second-run idempotence, upgrade/restart, reboot, supported-browser behavior, interactive PAM positive/negative cases, and uninstall remain manual acceptance work.
 
@@ -359,9 +396,9 @@ These flags do not retain live processes or `/run/remoteterminal`; all default t
 - Authentication expiration, logout, throttling, and generic failures.
 - CSRF and origin enforcement.
 - Session-name and identifier validation.
-- Safe tmux and ttyd argument construction.
-- Concurrent create/connect/delete operations.
-- WebSocket proxy authorization and path handling.
+- Safe tmux, ttyd, and code-server argument construction.
+- Concurrent create/connect/delete and launch/list/shutdown operations.
+- Terminal and code-server HTTP/WebSocket proxy authorization and path handling.
 - Process cleanup and stale-state recovery.
 
 ### Automated React tests
@@ -370,11 +407,12 @@ These flags do not retain live processes or `/run/remoteterminal`; all default t
 - Multiple vertical-tab creation, selection, ordering, Arrow-key navigation, and mounted-panel behavior.
 - Close-tab behavior versus confirmed session deletion.
 - Lazy connection and restoration of non-sensitive per-user tab state.
+- Code-server folder browsing, launch/reuse, active-list refresh, mounted editor tabs, and confirmed shutdown.
 - In-memory CSRF propagation and rejection of terminal URLs outside the same-origin proxy path.
 
 ### Opt-in real-process integration
 
-The Linux-only test is skipped unless all three controls are explicit:
+The Linux-only terminal test is skipped unless all three controls are explicit:
 
 ```bash
 REMOTETERMINAL_RUN_PROCESS_INTEGRATION=1 \
@@ -390,6 +428,17 @@ An extracted dynamically linked ttyd may additionally require `LD_LIBRARY_PATH`.
 - Verify HTTP through the manager's Unix-socket reverse proxy and a WebSocket `101` handshake with ttyd's `tty` subprotocol.
 - Verify prior terminal output and shell state after reconnect, and verify process/socket cleanup without touching the canary tmux server.
 
+The code-server lifecycle has a separate Linux-only test using the same explicit enable flag:
+
+```bash
+REMOTETERMINAL_RUN_PROCESS_INTEGRATION=1 \
+REMOTETERMINAL_TMUX_BINARY=/absolute/path/to/tmux \
+REMOTETERMINAL_CODE_SERVER_BINARY=/absolute/path/to/code-server \
+go test -run '^TestCodeServerManagerRealProcessLifecycle$' -count=1 -v ./internal/codeservers
+```
+
+It launches code-server with the production Unix-socket, session-socket, isolated-profile, proxy-disabled, and working-folder arguments. It verifies managed-config isolation, canonical-folder reuse, the active-instance limit, private socket modes, HTTP proxying, graceful deletion, persistent profile state, shell-metacharacter safety, and isolation from an unrelated tmux server.
+
 ### Pending integration and browser tests
 
 - Verify multiple simultaneous vertical tabs.
@@ -402,8 +451,9 @@ An extracted dynamically linked ttyd may additionally require `LD_LIBRARY_PATH`.
 - Install on a clean AMD64 Debian target.
 - Confirm the service runs as the selected non-root account.
 - Confirm service startup after reboot.
-- Confirm only the Go HTTPS port is listening on the selected LAN address.
+- Confirm only the Go listener is present on the selected LAN address and uses the requested transport.
 - Confirm ttyd uses only private Unix sockets.
+- Confirm code-server uses only private Unix sockets, no upstream systemd unit, and the reported pinned version.
 - Apply Ansible a second time and confirm idempotency.
 - Upgrade after a source change and verify a controlled service restart.
 - Uninstall without modifying unrelated tmux sessions or LinuxCNC configuration.
@@ -413,7 +463,7 @@ An extracted dynamically linked ttyd may additionally require `LD_LIBRARY_PATH`.
 These remain the release criteria. Source implementation and local automation do not substitute for the pending clean-target and supported-browser checks in the README checklist.
 
 - The TUI invokes the Ansible playbook directly without a root-level shell installer.
-- The playbook builds the application and ttyd from source on AMD64.
+- The playbook builds the application and ttyd from source with the exact checksum-pinned official Go 1.26.5 Linux AMD64 toolchain and installs the checksum-pinned official code-server standalone dependency.
 - Installation completes with a healthy, enabled systemd service.
 - Only the configured system account can log in with its current PAM password.
 - The service and all terminal processes run as that non-root account.
@@ -424,21 +474,27 @@ These remain the release criteria. Source implementation and local automation do
 - Session deletion is explicit and confirmed.
 - Copy and paste work with documented terminal shortcuts.
 - ttyd is never directly exposed to the LAN.
+- code-server is never directly exposed to the LAN; every HTTP/WebSocket request passes through the authenticated same-origin proxy.
 - Re-running the playbook is idempotent.
 - Existing LinuxCNC setup behavior remains working.
 
 ## Current version 1 decisions and defaults
 
-1. **TLS:** A generated self-signed certificate is accepted as the default. Operators must verify its reported fingerprint; a supplied certificate/key pair is the supported override. Requiring a trusted certificate or adding certificate prompts to the TUI remains a future policy/UI choice.
+1. **Transport:** HTTP is the production appliance default for the isolated machine LAN. It skips TLS, uses a separate cookie name, exposes credentials/session traffic on the LAN, and requires an exact managed Chromium secure-origin exception for normal remote code-server webviews. HTTPS remains available; operators then verify the generated certificate fingerprint or supply a trusted certificate/key pair.
 2. **Clipboard:** Dragging creates a yellow tmux selection. The visible **Copy selection** button fetches that selection and copies it during an explicit browser click; when a selection was not prefetched, the UI asks for a second **Copy now** click. `Shift`-drag followed by `Ctrl+C` is the native browser-selection fallback. Paste uses `Ctrl+V` or `Shift+Insert`.
-3. **Port:** `8443` is the default HTTPS port. `remoteterminal_port` overrides it within the validated unprivileged port range.
+3. **Port:** `8443` is the default listener port. `remoteterminal_port` overrides it within the validated unprivileged port range.
 4. **Session limit:** Eight managed sessions is the default. `remoteterminal_max_sessions` overrides it from 1 through 64.
 5. **Persistence:** Version 1 preserves tmux sessions across browser disconnect, tab closure, and logout while the service continues running. Service restart, upgrade restart, reboot, and uninstall are outside that guarantee. Durable restart/reboot persistence is a future design choice.
 6. **Authentication lifetime:** Browser sessions default to 30 minutes idle and 12 hours absolute. Both are configurable with validated duration overrides; persistent authentication across service restart is not a version 1 feature.
+7. **Code-server limit:** Two active code servers is the default. `remoteterminal_max_code_servers` overrides it from 1 through 8; a canonical folder has at most one active instance.
+8. **Code-server lifecycle:** Tab closure, browser closure, and logout detach only. Explicit shutdown, service stop/restart/upgrade, reboot, and uninstall stop active editors; per-folder profiles persist unless application state is removed.
+9. **Code-server proxy:** The built-in port proxy is disabled. Per-instance paths are served only through Remote Terminal's authenticated same-origin proxy.
+10. **Code-server trust boundary:** The editor shares the Remote Terminal origin and the configured account's effective authority. Workspaces, webviews, tasks, and extensions are trusted content; users must open and install only content they trust. They are not isolated from authenticated Remote Terminal APIs or from a terminal running as that account.
 
 ## References
 
 - ttyd project and command-line capabilities: <https://github.com/tsl0922/ttyd>
+- code-server project and standalone releases: <https://github.com/coder/code-server>
 - Linux-PAM used by the direct cgo adapter: <https://github.com/linux-pam/linux-pam>
 - Ansible systemd service module: <https://docs.ansible.com/projects/ansible/latest/collections/ansible/builtin/systemd_service_module.html>
 - Ansible verified download module: <https://docs.ansible.com/projects/ansible/latest/collections/ansible/builtin/get_url_module.html>

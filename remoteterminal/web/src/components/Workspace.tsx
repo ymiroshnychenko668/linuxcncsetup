@@ -1,16 +1,24 @@
 import {
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
   type KeyboardEvent,
   type PointerEvent,
 } from 'react'
-import { ApiError, api, type TerminalSession } from '../api'
+import {
+  ApiError,
+  api,
+  type CodeServerInstance,
+  type LaunchCodeServerResult,
+  type TerminalSession,
+} from '../api'
 import {
   AlertIcon,
   CheckIcon,
+  CodeServerIcon,
   CopyIcon,
   KeyboardIcon,
   LogOutIcon,
@@ -21,9 +29,12 @@ import {
   TrashIcon,
   XIcon,
 } from '../icons'
+import { CodeServerPanel, type CodeServerState } from './CodeServerPanel'
 import { CreateSessionModal } from './CreateSessionModal'
 import { DeleteSessionModal } from './DeleteSessionModal'
+import { LaunchCodeServerModal } from './LaunchCodeServerModal'
 import { Modal } from './Modal'
+import { ShutdownCodeServerModal } from './ShutdownCodeServerModal'
 import { TerminalPanel, type TerminalState } from './TerminalPanel'
 
 interface WorkspaceProps {
@@ -32,34 +43,101 @@ interface WorkspaceProps {
   onLogout: (message?: string) => void
 }
 
-interface StoredWorkspace {
+type WorkspaceTab =
+  | { kind: 'terminal'; id: string }
+  | { kind: 'codeServer'; id: string }
+
+interface StoredWorkspaceV2 {
+  openTabs: WorkspaceTab[]
+  selectedTab: WorkspaceTab | null
+}
+
+interface StoredWorkspaceV1 {
   openIds: string[]
   selectedId: string | null
 }
 
+type OpenWorkspaceItem =
+  | { tab: Extract<WorkspaceTab, { kind: 'terminal' }>; session: TerminalSession; codeServer: null }
+  | { tab: Extract<WorkspaceTab, { kind: 'codeServer' }>; session: null; codeServer: CodeServerInstance }
+
 function storageKey(username: string): string {
+  return `remoteterminal.workspace.v2:${username}`
+}
+
+function legacyStorageKey(username: string): string {
   return `remoteterminal.workspace.v1:${username}`
 }
 
-function readStoredWorkspace(username: string): StoredWorkspace {
+function isWorkspaceTab(value: unknown): value is WorkspaceTab {
+  if (!value || typeof value !== 'object') return false
+  const candidate = value as Partial<WorkspaceTab>
+  return (candidate.kind === 'terminal' || candidate.kind === 'codeServer')
+    && typeof candidate.id === 'string'
+    && candidate.id.length > 0
+}
+
+function tabKey(tab: WorkspaceTab): string {
+  return `${tab.kind}:${tab.id}`
+}
+
+function sameTab(left: WorkspaceTab | null, right: WorkspaceTab | null): boolean {
+  if (!left || !right) return left === right
+  return left.kind === right.kind && left.id === right.id
+}
+
+function deduplicateTabs(tabs: WorkspaceTab[]): WorkspaceTab[] {
+  const seen = new Set<string>()
+  return tabs.filter((tab) => {
+    const key = tabKey(tab)
+    if (seen.has(key)) return false
+    seen.add(key)
+    return true
+  })
+}
+
+function readStoredWorkspace(username: string): StoredWorkspaceV2 {
   try {
-    const parsed = JSON.parse(localStorage.getItem(storageKey(username)) ?? 'null') as Partial<StoredWorkspace> | null
-    return {
-      openIds: Array.isArray(parsed?.openIds)
-        ? parsed.openIds.filter((id): id is string => typeof id === 'string')
-        : [],
-      selectedId: typeof parsed?.selectedId === 'string' ? parsed.selectedId : null,
+    const parsed = JSON.parse(localStorage.getItem(storageKey(username)) ?? 'null') as Partial<StoredWorkspaceV2> | null
+    if (parsed) {
+      const openTabs = deduplicateTabs(Array.isArray(parsed.openTabs) ? parsed.openTabs.filter(isWorkspaceTab) : [])
+      return {
+        openTabs,
+        selectedTab: isWorkspaceTab(parsed.selectedTab) ? parsed.selectedTab : null,
+      }
     }
   } catch {
-    return { openIds: [], selectedId: null }
+    // Fall through to the legacy terminal-only workspace.
+  }
+
+  try {
+    const parsed = JSON.parse(localStorage.getItem(legacyStorageKey(username)) ?? 'null') as Partial<StoredWorkspaceV1> | null
+    const openIds = Array.isArray(parsed?.openIds)
+      ? parsed.openIds.filter((id): id is string => typeof id === 'string' && id.length > 0)
+      : []
+    return {
+      openTabs: deduplicateTabs(openIds.map((id) => ({ kind: 'terminal' as const, id }))),
+      selectedTab: typeof parsed?.selectedId === 'string'
+        ? { kind: 'terminal', id: parsed.selectedId }
+        : null,
+    }
+  } catch {
+    return { openTabs: [], selectedTab: null }
   }
 }
 
-function connectionLabel(state: TerminalState | undefined): string {
+function terminalConnectionLabel(state: TerminalState | undefined): string {
   if (state === 'connected') return 'Connected'
   if (state === 'error') return 'Connection interrupted'
   if (state === 'connecting') return 'Connecting'
   return 'Ready to open'
+}
+
+function codeServerConnectionLabel(state: CodeServerState | undefined): string {
+  if (state === 'ready') return 'Editor ready'
+  if (state === 'error') return 'Load interrupted'
+  if (state === 'loading') return 'Loading editor'
+  return 'Code Server · ready to open'
 }
 
 type CopyState = 'idle' | 'loading' | 'ready' | 'copied' | 'error'
@@ -69,83 +147,258 @@ interface CachedSelection {
   text: string
 }
 
+interface InFlightCodeServerList {
+  controller: AbortController
+  promise: Promise<void>
+}
+
+const MOBILE_NAVIGATION_QUERY = '(max-width: 800px)'
+
+function useMobileNavigation(): boolean {
+  const [mobile, setMobile] = useState(() => (
+    typeof window.matchMedia === 'function'
+      ? window.matchMedia(MOBILE_NAVIGATION_QUERY).matches
+      : false
+  ))
+
+  useEffect(() => {
+    if (typeof window.matchMedia !== 'function') return
+    const query = window.matchMedia(MOBILE_NAVIGATION_QUERY)
+    const update = () => setMobile(query.matches)
+    update()
+    query.addEventListener('change', update)
+    return () => query.removeEventListener('change', update)
+  }, [])
+
+  return mobile
+}
+
 export function Workspace({ machineName, username, onLogout }: WorkspaceProps) {
+  const initialWorkspaceRef = useRef<StoredWorkspaceV2 | null>(null)
+  if (initialWorkspaceRef.current === null) {
+    initialWorkspaceRef.current = readStoredWorkspace(username)
+  }
+  const initialWorkspace = initialWorkspaceRef.current
+  const storedSelectionIsOpen = initialWorkspace.selectedTab !== null
+    && initialWorkspace.openTabs.some((tab) => sameTab(tab, initialWorkspace.selectedTab))
+  const initialTerminalSelection = storedSelectionIsOpen && initialWorkspace.selectedTab?.kind === 'terminal'
+    ? initialWorkspace.selectedTab
+    : initialWorkspace.openTabs.find((tab) => tab.kind === 'terminal') ?? null
+
   const [sessions, setSessions] = useState<TerminalSession[] | null>(null)
-  const [openIds, setOpenIds] = useState<string[]>([])
-  const [selectedId, setSelectedId] = useState<string | null>(null)
-  const [activatedIds, setActivatedIds] = useState<string[]>([])
-  const [connectionStates, setConnectionStates] = useState<Record<string, TerminalState>>({})
-  const [focusRequestKeys, setFocusRequestKeys] = useState<Record<string, number>>({})
-  const [reconnectKeys, setReconnectKeys] = useState<Record<string, number>>({})
-  const [loadError, setLoadError] = useState<string | null>(null)
+  const [codeServers, setCodeServers] = useState<CodeServerInstance[] | null>(null)
+  const [openTabs, setOpenTabs] = useState<WorkspaceTab[]>(initialWorkspace.openTabs)
+  const [selectedTab, setSelectedTab] = useState<WorkspaceTab | null>(initialTerminalSelection)
+  const [activatedKeys, setActivatedKeys] = useState<string[]>(
+    initialTerminalSelection ? [tabKey(initialTerminalSelection)] : [],
+  )
+  const [terminalListReady, setTerminalListReady] = useState(false)
+  const [codeServerListReady, setCodeServerListReady] = useState(false)
+  const [terminalStates, setTerminalStates] = useState<Record<string, TerminalState>>({})
+  const [codeServerStates, setCodeServerStates] = useState<Record<string, CodeServerState>>({})
+  const [terminalFocusKeys, setTerminalFocusKeys] = useState<Record<string, number>>({})
+  const [terminalReconnectKeys, setTerminalReconnectKeys] = useState<Record<string, number>>({})
+  const [codeServerReloadKeys, setCodeServerReloadKeys] = useState<Record<string, number>>({})
+  const [terminalLoadError, setTerminalLoadError] = useState<string | null>(null)
+  const [codeServerLoadError, setCodeServerLoadError] = useState<string | null>(null)
   const [actionError, setActionError] = useState<string | null>(null)
   const [showCreate, setShowCreate] = useState(false)
+  const [showLaunchCodeServer, setShowLaunchCodeServer] = useState(false)
   const [deleteTarget, setDeleteTarget] = useState<TerminalSession | null>(null)
+  const [shutdownTarget, setShutdownTarget] = useState<CodeServerInstance | null>(null)
   const [showHelp, setShowHelp] = useState(false)
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [loggingOut, setLoggingOut] = useState(false)
-  const [restored, setRestored] = useState(false)
   const [copyState, setCopyState] = useState<CopyState>('idle')
   const [copyMessage, setCopyMessage] = useState<string | null>(null)
   const cachedSelectionRef = useRef<CachedSelection | null>(null)
   const selectionRequestRef = useRef<Promise<CachedSelection> | null>(null)
   const suppressNextFocusWarmRef = useRef(false)
+  const codeServerListGenerationRef = useRef(0)
+  const codeServerListRequestRef = useRef<InFlightCodeServerList | null>(null)
+  const codeServerListReadyRef = useRef(false)
+  const selectionChangedByUserRef = useRef(false)
+  const pendingTabFocusRef = useRef<WorkspaceTab | 'workspace-action' | null>(null)
+  const sidebarRef = useRef<HTMLElement>(null)
+  const sidebarMenuButtonRef = useRef<HTMLButtonElement>(null)
+  const sidebarCloseButtonRef = useRef<HTMLButtonElement>(null)
+  const newSessionButtonRef = useRef<HTMLButtonElement>(null)
+  const mobileNavigation = useMobileNavigation()
+  const pendingStoredCodeSelectionRef = useRef<WorkspaceTab | null>(
+    storedSelectionIsOpen && initialWorkspace.selectedTab?.kind === 'codeServer'
+      ? initialWorkspace.selectedTab
+      : null,
+  )
 
   const loadSessions = useCallback(async (signal?: AbortSignal) => {
-    setLoadError(null)
+    setTerminalLoadError(null)
     try {
       const loaded = await api.getSessions(signal)
       setSessions(loaded)
-      setOpenIds((current) => current.filter((id) => loaded.some((session) => session.id === id)))
-      setSelectedId((current) => current && loaded.some((session) => session.id === current) ? current : null)
-      setActivatedIds((current) => current.filter((id) => loaded.some((session) => session.id === id)))
+      setTerminalListReady(true)
     } catch (cause) {
       if (cause instanceof DOMException && cause.name === 'AbortError') return
-      setLoadError(cause instanceof ApiError ? cause.message : 'Sessions could not be loaded.')
+      setTerminalLoadError(cause instanceof ApiError ? cause.message : 'Sessions could not be loaded.')
     }
   }, [])
 
-  useEffect(() => {
+  const loadCodeServers = useCallback(async (signal?: AbortSignal) => {
+    const generation = ++codeServerListGenerationRef.current
+    setCodeServerLoadError(null)
+    try {
+      const loaded = await api.getCodeServers(signal)
+      if (generation !== codeServerListGenerationRef.current) return
+
+      const firstSuccessfulList = !codeServerListReadyRef.current
+      codeServerListReadyRef.current = true
+      setCodeServers(loaded)
+      setCodeServerListReady(true)
+
+      if (firstSuccessfulList) {
+        const pendingSelection = pendingStoredCodeSelectionRef.current
+        pendingStoredCodeSelectionRef.current = null
+        if (
+          pendingSelection
+          && !selectionChangedByUserRef.current
+          && loaded.some((codeServer) => codeServer.id === pendingSelection.id)
+        ) {
+          setSelectedTab(pendingSelection)
+          setActivatedKeys((current) => {
+            const key = tabKey(pendingSelection)
+            return current.includes(key) ? current : [...current, key]
+          })
+        }
+      }
+    } catch (cause) {
+      if (cause instanceof DOMException && cause.name === 'AbortError') return
+      if (generation === codeServerListGenerationRef.current) {
+        setCodeServerLoadError(cause instanceof ApiError ? cause.message : 'Active Code Servers could not be loaded.')
+      }
+    }
+  }, [])
+
+  const cancelCodeServerList = useCallback(() => {
+    codeServerListGenerationRef.current += 1
+    const request = codeServerListRequestRef.current
+    codeServerListRequestRef.current = null
+    request?.controller.abort()
+  }, [])
+
+  const loadLatestCodeServers = useCallback(() => {
+    const current = codeServerListRequestRef.current
+    if (current && !current.controller.signal.aborted) return current.promise
+
     const controller = new AbortController()
-    void loadSessions(controller.signal)
-    return () => controller.abort()
-  }, [loadSessions])
+    let request: InFlightCodeServerList
+    const promise = loadCodeServers(controller.signal).finally(() => {
+      if (codeServerListRequestRef.current === request) {
+        codeServerListRequestRef.current = null
+      }
+    })
+    request = { controller, promise }
+    codeServerListRequestRef.current = request
+    return promise
+  }, [loadCodeServers])
 
   useEffect(() => {
-    if (!sessions || restored) return
-    const stored = readStoredWorkspace(username)
-    const validOpenIds = stored.openIds.filter((id) => sessions.some((session) => session.id === id))
-    const restoredSelection = stored.selectedId && validOpenIds.includes(stored.selectedId)
-      ? stored.selectedId
-      : validOpenIds[0] ?? null
-    setOpenIds(validOpenIds)
-    setSelectedId(restoredSelection)
-    setActivatedIds(restoredSelection ? [restoredSelection] : [])
-    setRestored(true)
-  }, [restored, sessions, username])
+    const terminalController = new AbortController()
+    void loadSessions(terminalController.signal)
+    void loadLatestCodeServers()
+    return () => {
+      terminalController.abort()
+      cancelCodeServerList()
+    }
+  }, [cancelCodeServerList, loadLatestCodeServers, loadSessions])
 
   useEffect(() => {
-    if (!restored) return
-    localStorage.setItem(storageKey(username), JSON.stringify({ openIds, selectedId }))
-  }, [openIds, restored, selectedId, username])
+    let interval: number | undefined
+
+    const schedule = () => {
+      if (interval !== undefined) window.clearInterval(interval)
+      interval = undefined
+      if (document.visibilityState === 'visible') {
+        interval = window.setInterval(() => void loadLatestCodeServers(), 5000)
+      }
+    }
+    const refreshWhenVisible = () => {
+      if (document.visibilityState === 'visible') void loadLatestCodeServers()
+    }
+    const onVisibilityChange = () => {
+      refreshWhenVisible()
+      schedule()
+    }
+
+    schedule()
+    document.addEventListener('visibilitychange', onVisibilityChange)
+    window.addEventListener('focus', refreshWhenVisible)
+    return () => {
+      if (interval !== undefined) window.clearInterval(interval)
+      document.removeEventListener('visibilitychange', onVisibilityChange)
+      window.removeEventListener('focus', refreshWhenVisible)
+    }
+  }, [loadLatestCodeServers])
 
   const sessionById = useMemo(
     () => new Map((sessions ?? []).map((session) => [session.id, session])),
     [sessions],
   )
-  const openSessions = openIds.flatMap((id) => {
-    const session = sessionById.get(id)
-    return session ? [session] : []
-  })
-  const closedSessions = (sessions ?? []).filter((session) => !openIds.includes(session.id))
-  const activeSession = selectedId ? sessionById.get(selectedId) ?? null : null
+  const codeServerById = useMemo(
+    () => new Map((codeServers ?? []).map((codeServer) => [codeServer.id, codeServer])),
+    [codeServers],
+  )
+
+  useEffect(() => {
+    if (!terminalListReady && !codeServerListReady) return
+    const validTabs = openTabs.filter((tab) => {
+      if (tab.kind === 'terminal') return !terminalListReady || sessionById.has(tab.id)
+      return !codeServerListReady || codeServerById.has(tab.id)
+    })
+    const validKeys = new Set(validTabs.map(tabKey))
+    const selectedStillValid = selectedTab !== null && validKeys.has(tabKey(selectedTab))
+    const nextSelection = selectedStillValid
+      ? selectedTab
+      : validTabs.find((tab) => (
+          tab.kind === 'terminal' ? sessionById.has(tab.id) : codeServerById.has(tab.id)
+        )) ?? null
+    if (validTabs.length === openTabs.length && sameTab(selectedTab, nextSelection)) return
+
+    setOpenTabs(validTabs)
+    setActivatedKeys((current) => {
+      const next = current.filter((key) => validKeys.has(key))
+      if (!nextSelection) return next
+      const selectedKey = tabKey(nextSelection)
+      return next.includes(selectedKey) ? next : [...next, selectedKey]
+    })
+    if (!sameTab(selectedTab, nextSelection)) setSelectedTab(nextSelection)
+  }, [codeServerById, codeServerListReady, openTabs, selectedTab, sessionById, terminalListReady])
+
+  useEffect(() => {
+    if (!terminalListReady || !codeServerListReady) return
+    localStorage.setItem(storageKey(username), JSON.stringify({ openTabs, selectedTab }))
+  }, [codeServerListReady, openTabs, selectedTab, terminalListReady, username])
+
+  const openItems = openTabs.reduce<OpenWorkspaceItem[]>((items, tab) => {
+    if (tab.kind === 'terminal') {
+      const session = sessionById.get(tab.id)
+      if (session) items.push({ tab, session, codeServer: null })
+    } else {
+      const codeServer = codeServerById.get(tab.id)
+      if (codeServer) items.push({ tab, session: null, codeServer })
+    }
+    return items
+  }, [])
+  const openTerminalIds = new Set(openTabs.filter((tab) => tab.kind === 'terminal').map((tab) => tab.id))
+  const closedSessions = (sessions ?? []).filter((session) => !openTerminalIds.has(session.id))
+  const activeTerminal = selectedTab?.kind === 'terminal' ? sessionById.get(selectedTab.id) ?? null : null
+  const activeCodeServer = selectedTab?.kind === 'codeServer' ? codeServerById.get(selectedTab.id) ?? null : null
+  const hasActiveItem = activeTerminal !== null || activeCodeServer !== null
 
   useEffect(() => {
     cachedSelectionRef.current = null
     selectionRequestRef.current = null
     setCopyState('idle')
     setCopyMessage(null)
-  }, [selectedId])
+  }, [selectedTab])
 
   const loadSelection = useCallback((sessionId: string, refresh = false) => {
     if (selectionRequestRef.current) return selectionRequestRef.current
@@ -155,8 +408,8 @@ export function Workspace({ machineName, username, onLogout }: WorkspaceProps) {
 
     setCopyState('loading')
     setCopyMessage('Loading the yellow tmux selection…')
-    const pending = api.getLatestSelection(sessionId).then((text) => {
-      const result = { sessionId, text }
+    const pending = api.getLatestSelection(sessionId).then((selectionText) => {
+      const result = { sessionId, text: selectionText }
       if (selectionRequestRef.current !== pending) return result
       cachedSelectionRef.current = result
       setCopyState('ready')
@@ -177,18 +430,18 @@ export function Workspace({ machineName, username, onLogout }: WorkspaceProps) {
 
   const prepareSelection = (event: PointerEvent<HTMLButtonElement>) => {
     if (event.pointerType === 'mouse' && event.button !== 0) return
-    if (!activeSession) return
+    if (!activeTerminal) return
     suppressNextFocusWarmRef.current = true
     window.setTimeout(() => {
       suppressNextFocusWarmRef.current = false
     }, 0)
-    if (cachedSelectionRef.current?.sessionId === activeSession.id) return
-    void loadSelection(activeSession.id).catch(() => {})
+    if (cachedSelectionRef.current?.sessionId === activeTerminal.id) return
+    void loadSelection(activeTerminal.id).catch(() => {})
   }
 
   const warmSelection = () => {
-    if (!activeSession || selectionRequestRef.current) return
-    void loadSelection(activeSession.id, true).catch(() => {})
+    if (!activeTerminal || selectionRequestRef.current) return
+    void loadSelection(activeTerminal.id, true).catch(() => {})
   }
 
   const warmSelectionOnFocus = () => {
@@ -200,10 +453,10 @@ export function Workspace({ machineName, username, onLogout }: WorkspaceProps) {
   }
 
   const copySelection = async () => {
-    if (!activeSession) return
+    if (!activeTerminal) return
     const cached = cachedSelectionRef.current
-    if (cached?.sessionId !== activeSession.id) {
-      void loadSelection(activeSession.id).catch(() => {})
+    if (cached?.sessionId !== activeTerminal.id) {
+      void loadSelection(activeTerminal.id).catch(() => {})
       return
     }
 
@@ -227,56 +480,113 @@ export function Workspace({ machineName, username, onLogout }: WorkspaceProps) {
     return () => window.clearTimeout(timeout)
   }, [copyState])
 
-  const activateSession = useCallback((id: string, focusTerminal = false) => {
-    setActivatedIds((current) => current.includes(id) ? current : [...current, id])
-    setSelectedId(id)
-    if (focusTerminal) {
-      setFocusRequestKeys((current) => ({
+  const activateTab = useCallback((tab: WorkspaceTab, focusTerminal = false) => {
+    selectionChangedByUserRef.current = true
+    const key = tabKey(tab)
+    setActivatedKeys((current) => current.includes(key) ? current : [...current, key])
+    setSelectedTab(tab)
+    if (focusTerminal && tab.kind === 'terminal') {
+      setTerminalFocusKeys((current) => ({
         ...current,
-        [id]: (current[id] ?? 0) + 1,
+        [tab.id]: (current[tab.id] ?? 0) + 1,
       }))
     }
   }, [])
 
-  const openSession = useCallback((id: string) => {
-    setOpenIds((current) => current.includes(id) ? current : [...current, id])
-    activateSession(id, true)
+  const openTab = useCallback((tab: WorkspaceTab) => {
+    setOpenTabs((current) => current.some((item) => sameTab(item, tab)) ? current : [...current, tab])
+    activateTab(tab, tab.kind === 'terminal')
     setSidebarOpen(false)
-  }, [activateSession])
+    if (mobileNavigation) sidebarMenuButtonRef.current?.focus()
+  }, [activateTab, mobileNavigation])
 
-  const closeTab = useCallback((id: string) => {
-    const index = openIds.indexOf(id)
-    const remaining = openIds.filter((openId) => openId !== id)
-    setOpenIds(remaining)
-    setActivatedIds((current) => current.filter((activeId) => activeId !== id))
-    if (selectedId === id) {
-      const nextId = remaining[Math.min(index, remaining.length - 1)] ?? null
-      if (nextId) activateSession(nextId)
-      else setSelectedId(null)
-    }
-    setConnectionStates((current) => {
-      const next = { ...current }
-      delete next[id]
-      return next
-    })
-  }, [activateSession, openIds, selectedId])
+  const openSession = useCallback((id: string) => openTab({ kind: 'terminal', id }), [openTab])
+  const openCodeServer = useCallback((id: string) => openTab({ kind: 'codeServer', id }), [openTab])
 
-  const handleTabKeyDown = (event: KeyboardEvent<HTMLButtonElement>, id: string) => {
-    const index = openIds.indexOf(id)
-    let targetId: string | undefined
-    if (event.key === 'ArrowDown') targetId = openIds[(index + 1) % openIds.length]
-    if (event.key === 'ArrowUp') targetId = openIds[(index - 1 + openIds.length) % openIds.length]
-    if (event.key === 'Home') targetId = openIds[0]
-    if (event.key === 'End') targetId = openIds[openIds.length - 1]
-    if (event.key === 'Delete') {
-      event.preventDefault()
-      closeTab(id)
+  const openSidebar = useCallback(() => {
+    setSidebarOpen(true)
+  }, [])
+
+  const closeSidebar = useCallback((restoreFocus: boolean) => {
+    setSidebarOpen(false)
+    if (restoreFocus) sidebarMenuButtonRef.current?.focus()
+  }, [])
+
+  useEffect(() => {
+    if (mobileNavigation && sidebarOpen) sidebarCloseButtonRef.current?.focus()
+  }, [mobileNavigation, sidebarOpen])
+
+  useLayoutEffect(() => {
+    sidebarRef.current?.toggleAttribute('inert', mobileNavigation && !sidebarOpen)
+  }, [mobileNavigation, sidebarOpen])
+
+  useEffect(() => {
+    const pendingTab = pendingTabFocusRef.current
+    if (!pendingTab) return
+    pendingTabFocusRef.current = null
+
+    if (pendingTab === 'workspace-action') {
+      if (mobileNavigation) sidebarMenuButtonRef.current?.focus()
+      else newSessionButtonRef.current?.focus()
       return
     }
-    if (targetId) {
+    const target = document.getElementById(`tab-${pendingTab.kind}-${pendingTab.id}`)
+    if (target instanceof HTMLElement) {
+      target.focus()
+      return
+    }
+    if (mobileNavigation) sidebarMenuButtonRef.current?.focus()
+    else newSessionButtonRef.current?.focus()
+  }, [mobileNavigation, openTabs, selectedTab])
+
+  const closeTab = useCallback((tab: WorkspaceTab) => {
+    selectionChangedByUserRef.current = true
+    const index = openTabs.findIndex((item) => sameTab(item, tab))
+    const remaining = openTabs.filter((item) => !sameTab(item, tab))
+    const nextTab = sameTab(selectedTab, tab)
+      ? remaining[Math.min(index, remaining.length - 1)] ?? null
+      : selectedTab && remaining.find((item) => sameTab(item, selectedTab))
+        ? selectedTab
+        : remaining[Math.min(index, remaining.length - 1)] ?? null
+    pendingTabFocusRef.current = nextTab ?? 'workspace-action'
+    setOpenTabs(remaining)
+    setActivatedKeys((current) => current.filter((key) => key !== tabKey(tab)))
+    if (sameTab(selectedTab, tab)) {
+      if (nextTab) activateTab(nextTab)
+      else setSelectedTab(null)
+    }
+
+    if (tab.kind === 'terminal') {
+      setTerminalStates((current) => {
+        const next = { ...current }
+        delete next[tab.id]
+        return next
+      })
+    } else {
+      setCodeServerStates((current) => {
+        const next = { ...current }
+        delete next[tab.id]
+        return next
+      })
+    }
+  }, [activateTab, openTabs, selectedTab])
+
+  const handleTabKeyDown = (event: KeyboardEvent<HTMLButtonElement>, tab: WorkspaceTab) => {
+    const index = openTabs.findIndex((item) => sameTab(item, tab))
+    let target: WorkspaceTab | undefined
+    if (event.key === 'ArrowDown') target = openTabs[(index + 1) % openTabs.length]
+    if (event.key === 'ArrowUp') target = openTabs[(index - 1 + openTabs.length) % openTabs.length]
+    if (event.key === 'Home') target = openTabs[0]
+    if (event.key === 'End') target = openTabs[openTabs.length - 1]
+    if (event.key === 'Delete') {
       event.preventDefault()
-      activateSession(targetId)
-      document.getElementById(`tab-${targetId}`)?.focus()
+      closeTab(tab)
+      return
+    }
+    if (target) {
+      event.preventDefault()
+      activateTab(target)
+      document.getElementById(`tab-${target.kind}-${target.id}`)?.focus()
     }
   }
 
@@ -286,10 +596,30 @@ export function Workspace({ machineName, username, onLogout }: WorkspaceProps) {
     openSession(session.id)
   }
 
+  const onCodeServerLaunched = (result: LaunchCodeServerResult) => {
+    cancelCodeServerList()
+    setCodeServerLoadError(null)
+    setCodeServers((current) => [
+      ...(current ?? []).filter((item) => item.id !== result.codeServer.id),
+      result.codeServer,
+    ])
+    setShowLaunchCodeServer(false)
+    openCodeServer(result.codeServer.id)
+    if (result.reused) setActionError(null)
+  }
+
   const onDeleted = (id: string) => {
     setDeleteTarget(null)
-    closeTab(id)
+    closeTab({ kind: 'terminal', id })
     setSessions((current) => (current ?? []).filter((session) => session.id !== id))
+  }
+
+  const onCodeServerShutdown = (id: string) => {
+    cancelCodeServerList()
+    setCodeServerLoadError(null)
+    setShutdownTarget(null)
+    closeTab({ kind: 'codeServer', id })
+    setCodeServers((current) => (current ?? []).filter((codeServer) => codeServer.id !== id))
   }
 
   const onSessionChange = useCallback((updated: TerminalSession) => {
@@ -297,7 +627,15 @@ export function Workspace({ machineName, username, onLogout }: WorkspaceProps) {
   }, [])
 
   const onTerminalStateChange = useCallback((id: string, state: TerminalState) => {
-    setConnectionStates((current) => current[id] === state ? current : { ...current, [id]: state })
+    setTerminalStates((current) => current[id] === state ? current : { ...current, [id]: state })
+  }, [])
+
+  const onCodeServerStateChange = useCallback((id: string, state: CodeServerState) => {
+    setCodeServerStates((current) => current[id] === state ? current : { ...current, [id]: state })
+  }, [])
+
+  const reloadCodeServer = useCallback((id: string) => {
+    setCodeServerReloadKeys((current) => ({ ...current, [id]: (current[id] ?? 0) + 1 }))
   }, [])
 
   const logout = async () => {
@@ -318,11 +656,17 @@ export function Workspace({ machineName, username, onLogout }: WorkspaceProps) {
         className={`sidebar-scrim ${sidebarOpen ? 'sidebar-scrim--visible' : ''}`}
         type="button"
         aria-label="Close session navigation"
+        aria-hidden={!sidebarOpen}
         tabIndex={sidebarOpen ? 0 : -1}
-        onClick={() => setSidebarOpen(false)}
+        onClick={() => closeSidebar(true)}
       />
 
-      <aside className={`sidebar ${sidebarOpen ? 'sidebar--open' : ''}`} aria-label="Session navigation">
+      <aside
+        ref={sidebarRef}
+        className={`sidebar ${sidebarOpen ? 'sidebar--open' : ''}`}
+        aria-label="Session navigation"
+        aria-hidden={mobileNavigation && !sidebarOpen ? true : undefined}
+      >
         <div className="sidebar__header">
           <div className="brand">
             <span className="brand__mark"><TerminalIcon /></span>
@@ -331,55 +675,80 @@ export function Workspace({ machineName, username, onLogout }: WorkspaceProps) {
               <small>{machineName}</small>
             </span>
           </div>
-          <button className="icon-button sidebar__mobile-close" type="button" aria-label="Close navigation" onClick={() => setSidebarOpen(false)}>
+          <button
+            ref={sidebarCloseButtonRef}
+            className="icon-button sidebar__mobile-close"
+            type="button"
+            aria-label="Close navigation"
+            onClick={() => closeSidebar(true)}
+          >
             <XIcon />
           </button>
         </div>
 
-        <button className="button button--new-session" type="button" onClick={() => setShowCreate(true)}>
-          <PlusIcon /> New session
-        </button>
+        <div className="sidebar__launch-actions">
+          <button ref={newSessionButtonRef} className="button button--new-session" type="button" onClick={() => setShowCreate(true)}>
+            <PlusIcon /> New terminal session
+          </button>
+          <button className="button button--new-code-server" type="button" onClick={() => setShowLaunchCodeServer(true)}>
+            <CodeServerIcon /> Launch Code Server
+          </button>
+        </div>
 
         <div className="sidebar__scroll">
           <div className="sidebar-section">
             <div className="sidebar-section__heading">
               <span>Open tabs</span>
-              <span className="count-badge">{openSessions.length}</span>
+              <span className="count-badge">{openItems.length}</span>
             </div>
 
-            {openSessions.length ? (
-              <div className="session-tabs" role="tablist" aria-label="Open terminal sessions" aria-orientation="vertical">
-                {openSessions.map((session) => {
-                  const state = activatedIds.includes(session.id) ? connectionStates[session.id] : undefined
-                  const selected = session.id === selectedId
+            {openItems.length ? (
+              <div className="session-tabs" role="tablist" aria-label="Open terminal sessions and Code Servers" aria-orientation="vertical">
+                {openItems.map(({ tab, session, codeServer }) => {
+                  const key = tabKey(tab)
+                  const selected = sameTab(tab, selectedTab)
+                  const state = activatedKeys.includes(key)
+                    ? session ? terminalStates[session.id] : codeServerStates[codeServer!.id]
+                    : undefined
+                  const name = session?.name ?? codeServer!.name
                   return (
-                    <div className={`session-tab ${selected ? 'session-tab--selected' : ''}`} key={session.id}>
+                    <div
+                      className={`session-tab ${codeServer ? 'session-tab--code-server' : ''} ${selected ? 'session-tab--selected' : ''}`}
+                      key={key}
+                    >
                       <button
-                        id={`tab-${session.id}`}
+                        id={`tab-${tab.kind}-${tab.id}`}
                         className="session-tab__select"
                         type="button"
                         role="tab"
                         aria-selected={selected}
-                        aria-controls={`panel-${session.id}`}
-                        tabIndex={selected || selectedId === null ? 0 : -1}
+                        aria-controls={`panel-${tab.kind}-${tab.id}`}
+                        tabIndex={selected || selectedTab === null ? 0 : -1}
                         onClick={() => {
-                          activateSession(session.id, true)
+                          activateTab(tab, tab.kind === 'terminal')
                           setSidebarOpen(false)
+                          if (mobileNavigation) sidebarMenuButtonRef.current?.focus()
                         }}
-                        onKeyDown={(event) => handleTabKeyDown(event, session.id)}
+                        onKeyDown={(event) => handleTabKeyDown(event, tab)}
                       >
-                        <span className={`status-dot status-dot--${state ?? 'idle'}`} aria-hidden="true" />
+                        {session ? (
+                          <span className={`status-dot status-dot--${state ?? 'idle'}`} aria-hidden="true" />
+                        ) : (
+                          <span className={`code-server-tab-icon code-server-tab-icon--${state ?? 'idle'}`}><CodeServerIcon width={16} height={16} /></span>
+                        )}
                         <span className="session-tab__text">
-                          <strong>{session.name}</strong>
-                          <small>{connectionLabel(state)}</small>
+                          <strong>{name}</strong>
+                          <small>{session
+                            ? terminalConnectionLabel(state as TerminalState | undefined)
+                            : codeServerConnectionLabel(state as CodeServerState | undefined)}</small>
                         </span>
                       </button>
                       <button
                         className="session-tab__action"
                         type="button"
-                        aria-label={`Close ${session.name} browser tab`}
-                        title="Close browser tab (session keeps running)"
-                        onClick={() => closeTab(session.id)}
+                        aria-label={`Close ${name} browser tab`}
+                        title={`Close browser tab (${session ? 'session' : 'Code Server'} keeps running)`}
+                        onClick={() => closeTab(tab)}
                       >
                         <XIcon width={15} height={15} />
                       </button>
@@ -388,7 +757,7 @@ export function Workspace({ machineName, username, onLogout }: WorkspaceProps) {
                 })}
               </div>
             ) : (
-              <p className="sidebar-empty">Open a running session or create a new one.</p>
+              <p className="sidebar-empty">Open a running terminal or Code Server.</p>
             )}
           </div>
 
@@ -427,6 +796,54 @@ export function Workspace({ machineName, username, onLogout }: WorkspaceProps) {
               <p className="sidebar-empty">No unopened sessions.</p>
             )}
           </div>
+
+          <div className="sidebar-section sidebar-section--code-servers">
+            <div className="sidebar-section__heading">
+              <span>Active Code Servers</span>
+              <span className="count-badge count-badge--code">{codeServers?.length ?? 0}</span>
+            </div>
+
+            {codeServers === null ? (
+              <div className="session-list-skeleton" aria-label="Loading Code Servers">
+                <span /><span />
+              </div>
+            ) : codeServers.length ? (
+              <ul className="available-list code-server-list">
+                {codeServers.map((codeServer) => {
+                  const isOpen = openTabs.some((tab) => tab.kind === 'codeServer' && tab.id === codeServer.id)
+                  return (
+                    <li key={codeServer.id}>
+                      <button
+                        className="available-session code-server-list__open"
+                        type="button"
+                        aria-label={`${isOpen ? 'Focus' : 'Open'} ${codeServer.name} Code Server at ${codeServer.folderPath}`}
+                        title={codeServer.folderPath}
+                        onClick={() => openCodeServer(codeServer.id)}
+                      >
+                        <CodeServerIcon width={17} height={17} />
+                        <span className="code-server-list__text">
+                          <strong>{codeServer.name}</strong>
+                          <small>{codeServer.folderPath}</small>
+                        </span>
+                        <span className="available-session__open">{isOpen ? 'Focus' : 'Open'}</span>
+                      </button>
+                      <button
+                        className="available-session__delete code-server-list__shutdown"
+                        type="button"
+                        aria-label={`Shut down ${codeServer.name} Code Server`}
+                        title="Shut down Code Server"
+                        onClick={() => setShutdownTarget(codeServer)}
+                      >
+                        <TrashIcon width={15} height={15} />
+                      </button>
+                    </li>
+                  )
+                })}
+              </ul>
+            ) : (
+              <p className="sidebar-empty">No Code Servers are running.</p>
+            )}
+          </div>
         </div>
 
         <div className="sidebar__footer">
@@ -443,62 +860,120 @@ export function Workspace({ machineName, username, onLogout }: WorkspaceProps) {
         </div>
       </aside>
 
-      <main className="workspace-main">
+      <main className={`workspace-main ${activeCodeServer ? 'workspace-main--code-server' : ''}`}>
         <header className="topbar">
           <div className="topbar__title">
-            <button className="icon-button topbar__menu" type="button" aria-label="Open session navigation" onClick={() => setSidebarOpen(true)}>
+            <button
+              ref={sidebarMenuButtonRef}
+              className="icon-button topbar__menu"
+              type="button"
+              aria-label="Open session navigation"
+              onClick={openSidebar}
+            >
               <MenuIcon />
             </button>
             <div>
-              <p className="eyebrow">Terminal session</p>
-              <h1>{machineName} / {activeSession?.name ?? 'Workspace'}</h1>
+              <p className="eyebrow">{activeCodeServer ? 'Code Server' : 'Terminal session'}</p>
+              <h1>{machineName} / {activeTerminal?.name ?? activeCodeServer?.name ?? 'Workspace'}</h1>
             </div>
           </div>
           <div className="topbar__actions">
-            {activeSession ? (
+            {activeTerminal ? (
+              <>
+                <button
+                  className="button button--ghost"
+                  type="button"
+                  aria-label={copyState === 'ready' ? 'Copy selection now' : 'Copy selection'}
+                  aria-busy={copyState === 'loading'}
+                  title={copyMessage ?? 'Copy the latest yellow tmux selection'}
+                  onPointerEnter={warmSelection}
+                  onPointerDown={prepareSelection}
+                  onFocus={warmSelectionOnFocus}
+                  onClick={() => void copySelection()}
+                >
+                  {copyState === 'copied' ? <CheckIcon /> : copyState === 'loading' ? <span className="spinner" aria-hidden="true" /> : <CopyIcon />}
+                  <span>{copyState === 'ready' ? 'Copy now' : copyState === 'copied' ? 'Copied' : 'Copy selection'}</span>
+                </button>
+                <button
+                  className="button button--ghost"
+                  type="button"
+                  aria-label="Copy & paste"
+                  title="Copy and paste help"
+                  onClick={() => setShowHelp(true)}
+                >
+                  <KeyboardIcon /> <span>Copy &amp; paste</span>
+                </button>
+                <button
+                  className="button button--ghost"
+                  type="button"
+                  aria-label="Reconnect terminal"
+                  title="Reconnect terminal"
+                  onClick={() => setTerminalReconnectKeys((current) => ({
+                    ...current,
+                    [activeTerminal.id]: (current[activeTerminal.id] ?? 0) + 1,
+                  }))}
+                >
+                  <RefreshIcon /> <span>Reconnect</span>
+                </button>
+                <button
+                  className="button button--ghost button--danger-ghost"
+                  type="button"
+                  aria-label="Delete current terminal session"
+                  title="Delete current terminal session"
+                  onClick={() => setDeleteTarget(activeTerminal)}
+                >
+                  <TrashIcon /> <span>Delete session</span>
+                </button>
+              </>
+            ) : activeCodeServer ? (
+              <>
+                <button
+                  className="button button--ghost button--code-ghost"
+                  type="button"
+                  aria-label="Reload Code Server editor"
+                  title="Reload Code Server editor"
+                  onClick={() => reloadCodeServer(activeCodeServer.id)}
+                >
+                  <RefreshIcon /> <span>Reload editor</span>
+                </button>
+                <button
+                  className="button button--ghost button--danger-ghost"
+                  type="button"
+                  aria-label={`Shut down ${activeCodeServer.name} Code Server`}
+                  title={`Shut down ${activeCodeServer.name} Code Server`}
+                  onClick={() => setShutdownTarget(activeCodeServer)}
+                >
+                  <TrashIcon /> <span>Shut down</span>
+                </button>
+              </>
+            ) : (
               <button
                 className="button button--ghost"
                 type="button"
-                aria-label={copyState === 'ready' ? 'Copy selection now' : 'Copy selection'}
-                aria-busy={copyState === 'loading'}
-                title={copyMessage ?? 'Copy the latest yellow tmux selection'}
-                onPointerEnter={warmSelection}
-                onPointerDown={prepareSelection}
-                onFocus={warmSelectionOnFocus}
-                onClick={() => void copySelection()}
+                aria-label="Copy & paste"
+                title="Copy and paste help"
+                onClick={() => setShowHelp(true)}
               >
-                {copyState === 'copied' ? <CheckIcon /> : copyState === 'loading' ? <span className="spinner" aria-hidden="true" /> : <CopyIcon />}
-                <span>{copyState === 'ready' ? 'Copy now' : copyState === 'copied' ? 'Copied' : 'Copy selection'}</span>
+                <KeyboardIcon /> <span>Copy &amp; paste</span>
               </button>
-            ) : null}
-            <button className="button button--ghost" type="button" onClick={() => setShowHelp(true)}>
-              <KeyboardIcon /> <span>Copy &amp; paste</span>
-            </button>
-            {activeSession ? (
-              <button
-                className="button button--ghost"
-                type="button"
-                onClick={() => setReconnectKeys((current) => ({
-                  ...current,
-                  [activeSession.id]: (current[activeSession.id] ?? 0) + 1,
-                }))}
-              >
-                <RefreshIcon /> <span>Reconnect</span>
-              </button>
-            ) : null}
-            {activeSession ? (
-              <button className="button button--ghost button--danger-ghost" type="button" onClick={() => setDeleteTarget(activeSession)}>
-                <TrashIcon /> <span>Delete session</span>
-              </button>
-            ) : null}
+            )}
           </div>
         </header>
 
-        {loadError ? (
+        {terminalLoadError ? (
           <div className="workspace-notice notice notice--error" role="alert">
             <AlertIcon />
-            <span>{loadError}</span>
+            <span>{terminalLoadError}</span>
             <button className="button button--compact button--secondary" type="button" onClick={() => void loadSessions()}>
+              <RefreshIcon /> Retry
+            </button>
+          </div>
+        ) : null}
+        {codeServerLoadError ? (
+          <div className="workspace-notice notice notice--error" role="alert">
+            <AlertIcon />
+            <span>{codeServerLoadError}</span>
+            <button className="button button--compact button--secondary" type="button" onClick={() => void loadLatestCodeServers()}>
               <RefreshIcon /> Retry
             </button>
           </div>
@@ -521,37 +996,60 @@ export function Workspace({ machineName, username, onLogout }: WorkspaceProps) {
         ) : null}
 
         <div className="terminal-stage">
-          {openSessions.map((session) => activatedIds.includes(session.id) ? (
-              <TerminalPanel
-                key={session.id}
-                session={session}
-                active={session.id === selectedId}
-                focusRequestKey={focusRequestKeys[session.id] ?? 0}
-                reconnectKey={reconnectKeys[session.id] ?? 0}
-                onStateChange={onTerminalStateChange}
-                onSessionChange={onSessionChange}
+          {openItems.map(({ tab, session, codeServer }) => {
+            const key = tabKey(tab)
+            if (!activatedKeys.includes(key)) {
+              return (
+                <section
+                  key={key}
+                  id={`panel-${tab.kind}-${tab.id}`}
+                  role="tabpanel"
+                  aria-labelledby={`tab-${tab.kind}-${tab.id}`}
+                  hidden
+                />
+              )
+            }
+            if (session) {
+              return (
+                <TerminalPanel
+                  key={key}
+                  session={session}
+                  active={sameTab(tab, selectedTab)}
+                  focusRequestKey={terminalFocusKeys[session.id] ?? 0}
+                  reconnectKey={terminalReconnectKeys[session.id] ?? 0}
+                  onStateChange={onTerminalStateChange}
+                  onSessionChange={onSessionChange}
+                />
+              )
+            }
+            return (
+              <CodeServerPanel
+                key={key}
+                codeServer={codeServer!}
+                active={sameTab(tab, selectedTab)}
+                reloadKey={codeServerReloadKeys[codeServer!.id] ?? 0}
+                onStateChange={onCodeServerStateChange}
+                onReload={reloadCodeServer}
               />
-            ) : (
-              <section
-                key={session.id}
-                id={`panel-${session.id}`}
-                role="tabpanel"
-                aria-labelledby={`tab-${session.id}`}
-                hidden
-              />
-            ))}
+            )
+          })}
 
-          {!activeSession ? (
+          {!hasActiveItem ? (
             <section className="workspace-empty" aria-labelledby="workspace-empty-title">
               <span className="workspace-empty__graphic"><TerminalIcon width={36} height={36} /></span>
-              <p className="eyebrow">Persistent shells</p>
+              <p className="eyebrow">Persistent remote workspaces</p>
               <h2 id="workspace-empty-title">Choose where to pick up</h2>
               <p>
-                Open a running tmux session from the sidebar, or create a clean terminal for a new task.
+                Open a running tmux session or Code Server from the sidebar, or start a new workspace.
               </p>
-              <button className="button button--primary button--large" type="button" onClick={() => setShowCreate(true)}>
-                <PlusIcon /> Create a session
-              </button>
+              <div className="workspace-empty__actions">
+                <button className="button button--primary button--large" type="button" onClick={() => setShowCreate(true)}>
+                  <PlusIcon /> Create a terminal session
+                </button>
+                <button className="button button--code-primary button--large" type="button" onClick={() => setShowLaunchCodeServer(true)}>
+                  <CodeServerIcon /> Launch Code Server
+                </button>
+              </div>
               <div className="shortcut-note"><KeyboardIcon /> Copy: drag to make a yellow selection, then click Copy selection. Or hold <kbd>Shift</kbd>, drag, and press <kbd>Ctrl</kbd>+<kbd>C</kbd>.</div>
             </section>
           ) : null}
@@ -559,7 +1057,9 @@ export function Workspace({ machineName, username, onLogout }: WorkspaceProps) {
       </main>
 
       {showCreate ? <CreateSessionModal onClose={() => setShowCreate(false)} onCreated={onCreated} /> : null}
+      {showLaunchCodeServer ? <LaunchCodeServerModal onClose={() => setShowLaunchCodeServer(false)} onLaunched={onCodeServerLaunched} /> : null}
       {deleteTarget ? <DeleteSessionModal session={deleteTarget} onClose={() => setDeleteTarget(null)} onDeleted={onDeleted} /> : null}
+      {shutdownTarget ? <ShutdownCodeServerModal codeServer={shutdownTarget} onClose={() => setShutdownTarget(null)} onShutdown={onCodeServerShutdown} /> : null}
       {showHelp ? (
         <Modal title="Terminal copy and paste" onClose={() => setShowHelp(false)}>
           <div className="shortcut-grid">

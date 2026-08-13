@@ -1,0 +1,691 @@
+---
+- name: Calculate pinned Go toolchain identity
+  ansible.builtin.set_fact:
+    remoteterminal_go_archive_digest: >-
+      {{ remoteterminal_go_archive_checksum | regex_replace('^sha256:', '') }}
+    remoteterminal_go_install_fingerprint: >-
+      {{ (remoteterminal_go_version ~ '\n' ~
+          remoteterminal_go_archive_url ~ '\n' ~
+          remoteterminal_go_archive_checksum) | hash('sha256') }}
+
+- name: Record content-addressed Go toolchain paths
+  ansible.builtin.set_fact:
+    remoteterminal_go_tool_dir: >-
+      {{ remoteterminal_install_root }}/tools/go-{{ remoteterminal_go_version }}-{{
+         remoteterminal_go_archive_digest[0:12] }}
+    remoteterminal_go_archive_path: >-
+      {{ remoteterminal_build_root }}/go-toolchain/go-{{ remoteterminal_go_version }}.linux-amd64.tar.gz
+    remoteterminal_go_completion_prefix: |
+      version={{ remoteterminal_go_version }}
+      archive={{ remoteterminal_go_archive_checksum }}
+      install={{ remoteterminal_go_install_fingerprint }}
+
+- name: Record pinned Go executable path
+  ansible.builtin.set_fact:
+    remoteterminal_go_binary: "{{ remoteterminal_go_tool_dir }}/bin/go"
+
+- name: Inspect root-owned Go tool hierarchy without following links
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+  loop:
+    - "{{ remoteterminal_install_root }}"
+    - "{{ remoteterminal_install_root }}/tools"
+    - "{{ remoteterminal_go_tool_dir }}"
+  register: remoteterminal_go_tool_path_stats
+
+- name: Reject unsafe Go tool hierarchy
+  ansible.builtin.assert:
+    that:
+      - >-
+        not item.stat.exists or
+        (item.stat.isdir and not (item.stat.islnk | default(false)) and
+         item.stat.uid | int == 0 and item.stat.gid | int == 0 and
+         item.stat.mode is match('^0?[0-7][0145][0145]$'))
+    fail_msg: >-
+      Refusing the Go install because {{ item.item }} is not absent or a
+      root-owned, non-symlink directory without group/other write permission.
+  loop: "{{ remoteterminal_go_tool_path_stats.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Create root-owned Go tool parent
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  loop:
+    - "{{ remoteterminal_install_root }}"
+    - "{{ remoteterminal_install_root }}/tools"
+
+- name: Find stale inactive Go candidates in validated tool parent
+  ansible.builtin.find:
+    paths: "{{ remoteterminal_install_root }}/tools"
+    patterns: ".go-*"
+    file_type: any
+    recurse: false
+    hidden: true
+  register: remoteterminal_go_stale_candidates
+
+- name: Reject unsafe stale Go candidate entries
+  ansible.builtin.assert:
+    that:
+      - (item.path | dirname) == (remoteterminal_install_root ~ '/tools')
+      - (item.path | basename) is match('^\\.go-[0-9a-f]{12}-[A-Za-z0-9_.-]+$')
+      - item.isdir
+      - not (item.islnk | default(false))
+      - item.uid | int == 0
+      - item.gid | int == 0
+      - item.mode is match('^0?[0-7][0145][0145]$')
+    fail_msg: "Refusing to prune unexpected Go candidate {{ item.path }}."
+  loop: "{{ remoteterminal_go_stale_candidates.files }}"
+  loop_control:
+    label: "{{ item.path }}"
+
+- name: Remove validated stale inactive Go candidates
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: absent
+  loop: "{{ remoteterminal_go_stale_candidates.files }}"
+  loop_control:
+    label: "{{ item.path }}"
+
+- name: Inspect installed Go completion artifacts without following links
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+    checksum_algorithm: sha256
+  loop:
+    - "{{ remoteterminal_go_tool_dir }}"
+    - "{{ remoteterminal_go_binary }}"
+    - "{{ remoteterminal_go_tool_dir }}/VERSION"
+    - "{{ remoteterminal_go_tool_dir }}/.complete"
+  register: remoteterminal_go_installed_artifacts
+
+- name: Read installed Go completion marker
+  ansible.builtin.slurp:
+    src: "{{ remoteterminal_go_tool_dir }}/.complete"
+  register: remoteterminal_go_installed_marker
+  when:
+    - remoteterminal_go_installed_artifacts.results[3].stat.exists
+    - remoteterminal_go_installed_artifacts.results[3].stat.isreg | default(false)
+    - not (remoteterminal_go_installed_artifacts.results[3].stat.islnk | default(false))
+    - remoteterminal_go_installed_artifacts.results[3].stat.uid | int == 0
+
+- name: Read installed Go VERSION file
+  ansible.builtin.slurp:
+    src: "{{ remoteterminal_go_tool_dir }}/VERSION"
+  register: remoteterminal_go_installed_version_file
+  when:
+    - remoteterminal_go_installed_artifacts.results[2].stat.exists
+    - remoteterminal_go_installed_artifacts.results[2].stat.isreg | default(false)
+    - not (remoteterminal_go_installed_artifacts.results[2].stat.islnk | default(false))
+    - remoteterminal_go_installed_artifacts.results[2].stat.uid | int == 0
+
+- name: Probe installed Go version as selected account
+  ansible.builtin.command:
+    argv:
+      - "{{ remoteterminal_go_binary }}"
+      - version
+  register: remoteterminal_go_installed_version_probe
+  changed_when: false
+  failed_when: false
+  become: true
+  become_user: "{{ remoteterminal_user }}"
+  environment:
+    GOENV: "off"
+    GOROOT: "{{ remoteterminal_go_tool_dir }}"
+    GOTELEMETRY: "off"
+    GOTOOLCHAIN: "local"
+    GOWORK: "off"
+    HOME: "{{ remoteterminal_selected_home }}"
+    PATH: "{{ remoteterminal_go_tool_dir }}/bin:/usr/bin:/bin"
+  when:
+    - remoteterminal_go_installed_artifacts.results[1].stat.exists
+    - remoteterminal_go_installed_artifacts.results[1].stat.isreg | default(false)
+    - not (remoteterminal_go_installed_artifacts.results[1].stat.islnk | default(false))
+    - remoteterminal_go_installed_artifacts.results[1].stat.uid | int == 0
+
+- name: Probe installed Go environment as selected account
+  ansible.builtin.command:
+    argv:
+      - "{{ remoteterminal_go_binary }}"
+      - env
+      - GOROOT
+      - GOOS
+      - GOARCH
+      - GOVERSION
+  register: remoteterminal_go_installed_environment_probe
+  changed_when: false
+  failed_when: false
+  become: true
+  become_user: "{{ remoteterminal_user }}"
+  environment:
+    GOENV: "off"
+    GOROOT: "{{ remoteterminal_go_tool_dir }}"
+    GOTELEMETRY: "off"
+    GOTOOLCHAIN: "local"
+    GOWORK: "off"
+    HOME: "{{ remoteterminal_selected_home }}"
+    PATH: "{{ remoteterminal_go_tool_dir }}/bin:/usr/bin:/bin"
+  when:
+    - remoteterminal_go_installed_artifacts.results[1].stat.exists
+    - remoteterminal_go_installed_artifacts.results[1].stat.isreg | default(false)
+    - not (remoteterminal_go_installed_artifacts.results[1].stat.islnk | default(false))
+    - remoteterminal_go_installed_artifacts.results[1].stat.uid | int == 0
+
+- name: Audit installed Go tree permissions, links, types, and bounds
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/python3
+      - -c
+      - |
+        import os
+        import stat
+        import sys
+
+        root = os.path.realpath(sys.argv[1])
+        count = 0
+        total = 0
+        for current, directories, files in os.walk(root, topdown=True, followlinks=False):
+            for entry in directories + files:
+                count += 1
+                path = os.path.join(current, entry)
+                details = os.lstat(path)
+                total += details.st_size if stat.S_ISREG(details.st_mode) else 0
+                if count > 100000 or total > 2 * 1024 * 1024 * 1024:
+                    raise SystemExit("installed Go tree exceeds safety bounds")
+                if details.st_uid != 0 or details.st_gid != 0:
+                    raise SystemExit(f"non-root-owned Go entry: {path}")
+                if stat.S_ISLNK(details.st_mode):
+                    target = os.path.realpath(path)
+                    if os.path.commonpath((root, target)) != root:
+                        raise SystemExit(f"Go link escapes tool root: {path}")
+                    continue
+                if not (stat.S_ISDIR(details.st_mode) or stat.S_ISREG(details.st_mode)):
+                    raise SystemExit(f"unsupported Go entry: {path}")
+                if details.st_mode & (stat.S_ISUID | stat.S_ISGID | stat.S_ISVTX | 0o022):
+                    raise SystemExit(f"unsafe Go entry permissions: {path}")
+                if stat.S_ISDIR(details.st_mode) and details.st_mode & 0o005 != 0o005:
+                    raise SystemExit(f"Go directory is not traversable: {path}")
+                if stat.S_ISREG(details.st_mode) and details.st_mode & 0o004 == 0:
+                    raise SystemExit(f"Go file is not readable: {path}")
+        print("ok")
+      - "{{ remoteterminal_go_tool_dir }}"
+  register: remoteterminal_go_installed_tree_audit
+  changed_when: false
+  failed_when: false
+  when:
+    - remoteterminal_go_installed_artifacts.results[0].stat.exists
+    - remoteterminal_go_installed_artifacts.results[0].stat.isdir | default(false)
+    - not (remoteterminal_go_installed_artifacts.results[0].stat.islnk | default(false))
+    - remoteterminal_go_installed_artifacts.results[0].stat.uid | int == 0
+
+- name: Determine whether installed Go toolchain is complete and reusable
+  ansible.builtin.set_fact:
+    remoteterminal_go_installed_valid: >-
+      {{ remoteterminal_go_installed_artifacts.results[0].stat.exists and
+         (remoteterminal_go_installed_artifacts.results[0].stat.isdir | default(false)) and
+         not (remoteterminal_go_installed_artifacts.results[0].stat.islnk | default(false)) and
+         remoteterminal_go_installed_artifacts.results[0].stat.uid | int == 0 and
+         remoteterminal_go_installed_artifacts.results[0].stat.gid | int == 0 and
+         remoteterminal_go_installed_artifacts.results[0].stat.mode == '0755' and
+         remoteterminal_go_installed_artifacts.results[1].stat.exists and
+         (remoteterminal_go_installed_artifacts.results[1].stat.isreg | default(false)) and
+         not (remoteterminal_go_installed_artifacts.results[1].stat.islnk | default(false)) and
+         remoteterminal_go_installed_artifacts.results[1].stat.uid | int == 0 and
+         remoteterminal_go_installed_artifacts.results[1].stat.gid | int == 0 and
+         remoteterminal_go_installed_artifacts.results[1].stat.mode == '0755' and
+         (remoteterminal_go_installed_artifacts.results[1].stat.checksum | default('') | length) == 64 and
+         remoteterminal_go_installed_artifacts.results[2].stat.exists and
+         (remoteterminal_go_installed_artifacts.results[2].stat.isreg | default(false)) and
+         not (remoteterminal_go_installed_artifacts.results[2].stat.islnk | default(false)) and
+         remoteterminal_go_installed_artifacts.results[2].stat.uid | int == 0 and
+         remoteterminal_go_installed_artifacts.results[2].stat.gid | int == 0 and
+         remoteterminal_go_installed_artifacts.results[2].stat.mode == '0644' and
+         ((remoteterminal_go_installed_version_file.content | default('') | b64decode).splitlines() | first | trim) ==
+         ('go' ~ remoteterminal_go_version) and
+         remoteterminal_go_installed_artifacts.results[3].stat.exists and
+         (remoteterminal_go_installed_artifacts.results[3].stat.isreg | default(false)) and
+         not (remoteterminal_go_installed_artifacts.results[3].stat.islnk | default(false)) and
+         remoteterminal_go_installed_artifacts.results[3].stat.uid | int == 0 and
+         remoteterminal_go_installed_artifacts.results[3].stat.gid | int == 0 and
+         remoteterminal_go_installed_artifacts.results[3].stat.mode == '0644' and
+         (remoteterminal_go_installed_marker.content | default('') | b64decode).splitlines() ==
+         ((remoteterminal_go_completion_prefix | trim).splitlines() +
+          ['binary_sha256=' ~
+           (remoteterminal_go_installed_artifacts.results[1].stat.checksum | default(''))]) and
+         (remoteterminal_go_installed_version_probe.rc | default(1)) == 0 and
+         (remoteterminal_go_installed_version_probe.stdout | default('') | trim) ==
+         ('go version go' ~ remoteterminal_go_version ~ ' linux/amd64') and
+         (remoteterminal_go_installed_environment_probe.rc | default(1)) == 0 and
+         (remoteterminal_go_installed_environment_probe.stdout_lines | default([])) ==
+         [remoteterminal_go_tool_dir, 'linux', 'amd64', 'go' ~ remoteterminal_go_version] and
+         (remoteterminal_go_installed_tree_audit.rc | default(1)) == 0 and
+         (remoteterminal_go_installed_tree_audit.stdout | default('') | trim) == 'ok' }}
+
+- name: Install or repair the checksum-pinned Go toolchain
+  when: not (remoteterminal_go_installed_valid | bool)
+  block:
+    - name: Inspect root-owned Go download hierarchy without following links
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        follow: false
+      loop:
+        - "{{ remoteterminal_build_root }}/go-toolchain"
+        - "{{ remoteterminal_go_archive_path }}"
+      register: remoteterminal_go_download_path_stats
+
+    - name: Reject unsafe Go download hierarchy
+      ansible.builtin.assert:
+        that:
+          - >-
+            (item.item == (remoteterminal_build_root ~ '/go-toolchain') and
+             (not item.stat.exists or
+              (item.stat.isdir and not (item.stat.islnk | default(false)) and
+               item.stat.uid | int == 0 and item.stat.gid | int == 0 and
+               item.stat.mode is match('^0?[0-7][0145][0145]$')))) or
+            (item.item == remoteterminal_go_archive_path and
+             (not item.stat.exists or
+              ((item.stat.isreg | default(false)) and
+               not (item.stat.islnk | default(false)) and
+               item.stat.uid | int == 0 and item.stat.gid | int == 0 and
+               item.stat.mode == '0644')))
+        fail_msg: "Unsafe Go download path detected: {{ item.item }}"
+      loop: "{{ remoteterminal_go_download_path_stats.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: Create root-owned Go download directory
+      ansible.builtin.file:
+        path: "{{ remoteterminal_build_root }}/go-toolchain"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Download official checksum-pinned Go archive
+      ansible.builtin.get_url:
+        url: "{{ remoteterminal_go_archive_url }}"
+        dest: "{{ remoteterminal_go_archive_path }}"
+        checksum: "{{ remoteterminal_go_archive_checksum }}"
+        owner: root
+        group: root
+        mode: "0644"
+        timeout: 60
+
+    - name: Verify downloaded Go archive metadata and digest
+      ansible.builtin.stat:
+        path: "{{ remoteterminal_go_archive_path }}"
+        follow: false
+        checksum_algorithm: sha256
+      register: remoteterminal_go_downloaded_archive
+
+    - name: Enforce downloaded Go archive postconditions
+      ansible.builtin.assert:
+        that:
+          - remoteterminal_go_downloaded_archive.stat.exists
+          - remoteterminal_go_downloaded_archive.stat.isreg
+          - not (remoteterminal_go_downloaded_archive.stat.islnk | default(false))
+          - remoteterminal_go_downloaded_archive.stat.uid | int == 0
+          - remoteterminal_go_downloaded_archive.stat.gid | int == 0
+          - remoteterminal_go_downloaded_archive.stat.mode == '0644'
+          - remoteterminal_go_downloaded_archive.stat.checksum == remoteterminal_go_archive_digest
+
+    - name: Validate Go archive members before extraction
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/python3
+          - -c
+          - |
+            import posixpath
+            import sys
+            import tarfile
+
+            count = 0
+            total = 0
+            seen = set()
+            with tarfile.open(sys.argv[1], "r:gz") as archive:
+                for member in archive:
+                    count += 1
+                    total += max(member.size, 0)
+                    name = member.name
+                    normalized = posixpath.normpath(name)
+                    if (count > 100000 or total > 2 * 1024 * 1024 * 1024 or
+                            not name or "\x00" in name or name.startswith("/") or
+                            normalized == "." or
+                            (normalized != "go" and not normalized.startswith("go/")) or
+                            normalized in seen):
+                        raise SystemExit(f"unsafe archive member: {name!r}")
+                    seen.add(normalized)
+                    if normalized == "go" and not member.isdir():
+                        raise SystemExit("top-level go archive member is not a directory")
+                    if not (member.isfile() or member.isdir() or
+                            member.issym() or member.islnk()):
+                        raise SystemExit(f"unsupported archive member: {name!r}")
+                    if member.issym() or member.islnk():
+                        base = posixpath.dirname(normalized) if member.issym() else ""
+                        target = posixpath.normpath(posixpath.join(base, member.linkname))
+                        if (not member.linkname or member.linkname.startswith("/") or
+                                target == "go" or not target.startswith("go/")):
+                            raise SystemExit(f"archive link escapes go/: {name!r}")
+          - "{{ remoteterminal_go_archive_path }}"
+      changed_when: false
+
+    - name: Create inactive Go tool candidate
+      ansible.builtin.tempfile:
+        path: "{{ remoteterminal_install_root }}/tools"
+        prefix: ".go-{{ remoteterminal_go_archive_digest[0:12] }}-"
+        state: directory
+      register: remoteterminal_go_candidate
+
+    - name: Set secure Go candidate root ownership and mode
+      ansible.builtin.file:
+        path: "{{ remoteterminal_go_candidate.path }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Extract verified Go archive into inactive candidate
+      ansible.builtin.unarchive:
+        src: "{{ remoteterminal_go_archive_path }}"
+        dest: "{{ remoteterminal_go_candidate.path }}"
+        remote_src: true
+        extra_opts:
+          - --strip-components=1
+          - --no-same-owner
+          - --no-same-permissions
+
+    - name: Normalize extracted Go ownership
+      ansible.builtin.file:
+        path: "{{ remoteterminal_go_candidate.path }}"
+        state: directory
+        owner: root
+        group: root
+        recurse: true
+
+    - name: Audit extracted Go tree permissions, links, and bounds
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/python3
+          - -c
+          - |
+            import os
+            import stat
+            import sys
+
+            root = os.path.realpath(sys.argv[1])
+            count = 0
+            total = 0
+            for current, directories, files in os.walk(root, topdown=True, followlinks=False):
+                for entry in directories + files:
+                    count += 1
+                    path = os.path.join(current, entry)
+                    details = os.lstat(path)
+                    total += details.st_size if stat.S_ISREG(details.st_mode) else 0
+                    if count > 100000 or total > 2 * 1024 * 1024 * 1024:
+                        raise SystemExit("extracted Go tree exceeds safety bounds")
+                    if details.st_uid != 0 or details.st_gid != 0:
+                        raise SystemExit(f"non-root-owned Go entry: {path}")
+                    if stat.S_ISLNK(details.st_mode):
+                        target = os.path.realpath(path)
+                        if os.path.commonpath((root, target)) != root:
+                            raise SystemExit(f"Go link escapes tool root: {path}")
+                        continue
+                    if not (stat.S_ISDIR(details.st_mode) or stat.S_ISREG(details.st_mode)):
+                        raise SystemExit(f"unsupported Go entry: {path}")
+                    if details.st_mode & (stat.S_ISUID | stat.S_ISGID | stat.S_ISVTX | 0o022):
+                        raise SystemExit(f"unsafe Go entry permissions: {path}")
+                    if stat.S_ISDIR(details.st_mode) and details.st_mode & 0o005 != 0o005:
+                        raise SystemExit(f"Go directory is not traversable: {path}")
+                    if stat.S_ISREG(details.st_mode) and details.st_mode & 0o004 == 0:
+                        raise SystemExit(f"Go file is not readable: {path}")
+          - "{{ remoteterminal_go_candidate.path }}"
+      changed_when: false
+
+    - name: Inspect inactive Go candidate artifacts
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        follow: false
+        checksum_algorithm: sha256
+      loop:
+        - "{{ remoteterminal_go_candidate.path }}/bin/go"
+        - "{{ remoteterminal_go_candidate.path }}/VERSION"
+      register: remoteterminal_go_candidate_artifacts
+
+    - name: Read inactive Go candidate VERSION file
+      ansible.builtin.slurp:
+        src: "{{ remoteterminal_go_candidate.path }}/VERSION"
+      register: remoteterminal_go_candidate_version_file
+
+    - name: Probe inactive Go candidate version as selected account
+      ansible.builtin.command:
+        argv:
+          - "{{ remoteterminal_go_candidate.path }}/bin/go"
+          - version
+      register: remoteterminal_go_candidate_version_probe
+      changed_when: false
+      become: true
+      become_user: "{{ remoteterminal_user }}"
+      environment:
+        GOENV: "off"
+        GOROOT: "{{ remoteterminal_go_candidate.path }}"
+        GOTELEMETRY: "off"
+        GOTOOLCHAIN: "local"
+        GOWORK: "off"
+        HOME: "{{ remoteterminal_selected_home }}"
+        PATH: "{{ remoteterminal_go_candidate.path }}/bin:/usr/bin:/bin"
+
+    - name: Probe inactive Go candidate environment as selected account
+      ansible.builtin.command:
+        argv:
+          - "{{ remoteterminal_go_candidate.path }}/bin/go"
+          - env
+          - GOROOT
+          - GOOS
+          - GOARCH
+          - GOVERSION
+      register: remoteterminal_go_candidate_environment_probe
+      changed_when: false
+      become: true
+      become_user: "{{ remoteterminal_user }}"
+      environment:
+        GOENV: "off"
+        GOROOT: "{{ remoteterminal_go_candidate.path }}"
+        GOTELEMETRY: "off"
+        GOTOOLCHAIN: "local"
+        GOWORK: "off"
+        HOME: "{{ remoteterminal_selected_home }}"
+        PATH: "{{ remoteterminal_go_candidate.path }}/bin:/usr/bin:/bin"
+
+    - name: Verify inactive Go candidate is the exact pinned linux-amd64 toolchain
+      ansible.builtin.assert:
+        that:
+          - remoteterminal_go_candidate_artifacts.results[0].stat.exists
+          - remoteterminal_go_candidate_artifacts.results[0].stat.isreg
+          - not (remoteterminal_go_candidate_artifacts.results[0].stat.islnk | default(false))
+          - remoteterminal_go_candidate_artifacts.results[0].stat.uid | int == 0
+          - remoteterminal_go_candidate_artifacts.results[0].stat.gid | int == 0
+          - remoteterminal_go_candidate_artifacts.results[0].stat.mode == '0755'
+          - (remoteterminal_go_candidate_artifacts.results[0].stat.checksum | length) == 64
+          - remoteterminal_go_candidate_artifacts.results[1].stat.exists
+          - remoteterminal_go_candidate_artifacts.results[1].stat.isreg
+          - not (remoteterminal_go_candidate_artifacts.results[1].stat.islnk | default(false))
+          - remoteterminal_go_candidate_artifacts.results[1].stat.uid | int == 0
+          - remoteterminal_go_candidate_artifacts.results[1].stat.gid | int == 0
+          - remoteterminal_go_candidate_artifacts.results[1].stat.mode == '0644'
+          - ((remoteterminal_go_candidate_version_file.content | b64decode).splitlines() | first | trim) == ('go' ~ remoteterminal_go_version)
+          - (remoteterminal_go_candidate_version_probe.stdout | trim) == ('go version go' ~ remoteterminal_go_version ~ ' linux/amd64')
+          - remoteterminal_go_candidate_environment_probe.stdout_lines == [remoteterminal_go_candidate.path, 'linux', 'amd64', 'go' ~ remoteterminal_go_version]
+        fail_msg: >-
+          The verified archive did not produce the exact expected Go
+          {{ remoteterminal_go_version }} linux/amd64 toolchain.
+
+    - name: Write inactive Go completion marker
+      ansible.builtin.copy:
+        dest: "{{ remoteterminal_go_candidate.path }}/.complete"
+        content: |
+          {{ remoteterminal_go_completion_prefix | trim }}
+          binary_sha256={{ remoteterminal_go_candidate_artifacts.results[0].stat.checksum }}
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Atomically activate complete Go tool candidate
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/python3
+          - -c
+          - |
+            import ctypes
+            import errno
+            import os
+            import sys
+
+            source = os.fsencode(sys.argv[1])
+            destination = os.fsencode(sys.argv[2])
+            if os.path.lexists(sys.argv[2]):
+                libc = ctypes.CDLL(None, use_errno=True)
+                renameat2 = libc.renameat2
+                renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p,
+                                      ctypes.c_int, ctypes.c_char_p,
+                                      ctypes.c_uint]
+                if renameat2(-100, source, -100, destination, 2) != 0:
+                    error = ctypes.get_errno()
+                    raise OSError(error, os.strerror(error))
+            else:
+                os.rename(sys.argv[1], sys.argv[2])
+          - "{{ remoteterminal_go_candidate.path }}"
+          - "{{ remoteterminal_go_tool_dir }}"
+      changed_when: true
+  rescue:
+    - name: Remove failed inactive Go candidate when safely identified
+      ansible.builtin.file:
+        path: "{{ remoteterminal_go_candidate.path }}"
+        state: absent
+      when:
+        - remoteterminal_go_candidate is defined
+        - remoteterminal_go_candidate.path is defined
+        - (remoteterminal_go_candidate.path | dirname) == (remoteterminal_install_root ~ '/tools')
+        - (remoteterminal_go_candidate.path | basename) is match('^\\.go-[0-9a-f]{12}-[A-Za-z0-9_.-]+$')
+
+    - name: Stop after pinned Go installation failure
+      ansible.builtin.fail:
+        msg: >-
+          The checksum-pinned Go toolchain could not be validated and
+          atomically installed. Any safely identified inactive candidate was
+          removed; the active tool path was not partially overwritten.
+
+- name: Inspect final Go completion artifacts
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+    checksum_algorithm: sha256
+  loop:
+    - "{{ remoteterminal_go_tool_dir }}"
+    - "{{ remoteterminal_go_binary }}"
+    - "{{ remoteterminal_go_tool_dir }}/VERSION"
+    - "{{ remoteterminal_go_tool_dir }}/.complete"
+  register: remoteterminal_go_final_artifacts
+
+- name: Read final Go completion marker
+  ansible.builtin.slurp:
+    src: "{{ remoteterminal_go_tool_dir }}/.complete"
+  register: remoteterminal_go_final_marker
+
+- name: Read final Go VERSION file
+  ansible.builtin.slurp:
+    src: "{{ remoteterminal_go_tool_dir }}/VERSION"
+  register: remoteterminal_go_final_version_file
+
+- name: Verify final Go version as selected account
+  ansible.builtin.command:
+    argv:
+      - "{{ remoteterminal_go_binary }}"
+      - version
+  register: remoteterminal_go_final_version_probe
+  changed_when: false
+  become: true
+  become_user: "{{ remoteterminal_user }}"
+  environment:
+    GOENV: "off"
+    GOROOT: "{{ remoteterminal_go_tool_dir }}"
+    GOTELEMETRY: "off"
+    GOTOOLCHAIN: "local"
+    GOWORK: "off"
+    HOME: "{{ remoteterminal_selected_home }}"
+    PATH: "{{ remoteterminal_go_tool_dir }}/bin:/usr/bin:/bin"
+
+- name: Enforce final Go toolchain postconditions
+  ansible.builtin.assert:
+    that:
+      - remoteterminal_go_final_artifacts.results[0].stat.exists
+      - remoteterminal_go_final_artifacts.results[0].stat.isdir
+      - not (remoteterminal_go_final_artifacts.results[0].stat.islnk | default(false))
+      - remoteterminal_go_final_artifacts.results[0].stat.uid | int == 0
+      - remoteterminal_go_final_artifacts.results[0].stat.gid | int == 0
+      - remoteterminal_go_final_artifacts.results[0].stat.mode == '0755'
+      - remoteterminal_go_final_artifacts.results[1].stat.exists
+      - remoteterminal_go_final_artifacts.results[1].stat.isreg
+      - not (remoteterminal_go_final_artifacts.results[1].stat.islnk | default(false))
+      - remoteterminal_go_final_artifacts.results[1].stat.uid | int == 0
+      - remoteterminal_go_final_artifacts.results[1].stat.gid | int == 0
+      - remoteterminal_go_final_artifacts.results[1].stat.mode == '0755'
+      - (remoteterminal_go_final_artifacts.results[1].stat.checksum | length) == 64
+      - remoteterminal_go_final_artifacts.results[2].stat.exists
+      - remoteterminal_go_final_artifacts.results[2].stat.isreg
+      - not (remoteterminal_go_final_artifacts.results[2].stat.islnk | default(false))
+      - remoteterminal_go_final_artifacts.results[2].stat.uid | int == 0
+      - remoteterminal_go_final_artifacts.results[2].stat.gid | int == 0
+      - remoteterminal_go_final_artifacts.results[2].stat.mode == '0644'
+      - ((remoteterminal_go_final_version_file.content | b64decode).splitlines() | first | trim) == ('go' ~ remoteterminal_go_version)
+      - remoteterminal_go_final_artifacts.results[3].stat.exists
+      - remoteterminal_go_final_artifacts.results[3].stat.isreg
+      - not (remoteterminal_go_final_artifacts.results[3].stat.islnk | default(false))
+      - remoteterminal_go_final_artifacts.results[3].stat.uid | int == 0
+      - remoteterminal_go_final_artifacts.results[3].stat.gid | int == 0
+      - remoteterminal_go_final_artifacts.results[3].stat.mode == '0644'
+      - >-
+        (remoteterminal_go_final_marker.content | b64decode).splitlines() ==
+        ((remoteterminal_go_completion_prefix | trim).splitlines() +
+         ['binary_sha256=' ~ remoteterminal_go_final_artifacts.results[1].stat.checksum])
+      - (remoteterminal_go_final_version_probe.stdout | trim) == ('go version go' ~ remoteterminal_go_version ~ ' linux/amd64')
+    fail_msg: >-
+      The application-owned Go toolchain failed its final ownership, marker, or
+      exact-version verification.
+
+- name: Remove displaced invalid Go tool after verified atomic exchange
+  ansible.builtin.file:
+    path: "{{ remoteterminal_go_candidate.path }}"
+    state: absent
+  when:
+    - remoteterminal_go_candidate is defined
+    - remoteterminal_go_candidate.path is defined
+    - remoteterminal_go_candidate.path != remoteterminal_go_tool_dir
+    - (remoteterminal_go_candidate.path | dirname) == (remoteterminal_install_root ~ '/tools')
+    - (remoteterminal_go_candidate.path | basename) is match('^\\.go-[0-9a-f]{12}-[A-Za-z0-9_.-]+$')
+
+- name: Record isolated Go build environment and release fingerprint
+  ansible.builtin.set_fact:
+    remoteterminal_go_build_environment:
+      GOENV: "off"
+      GOROOT: "{{ remoteterminal_go_tool_dir }}"
+      GOTELEMETRY: "off"
+      GOTOOLCHAIN: "local"
+      GOWORK: "off"
+      HOME: "{{ remoteterminal_selected_home }}"
+      PATH: "{{ remoteterminal_go_tool_dir }}/bin:/usr/bin:/bin"
+    remoteterminal_go_release_fingerprint: >-
+      {{ (remoteterminal_go_install_fingerprint ~ '\n' ~
+          (remoteterminal_go_final_version_probe.stdout | trim) ~ '\n' ~
+          remoteterminal_go_final_artifacts.results[1].stat.checksum) | hash('sha256') }}
+
+- name: Report verified application-owned Go toolchain
+  ansible.builtin.debug:
+    msg: >-
+      Using {{ remoteterminal_go_final_version_probe.stdout | trim }} from
+      {{ remoteterminal_go_binary }} (release input
+      {{ remoteterminal_go_release_fingerprint }}).

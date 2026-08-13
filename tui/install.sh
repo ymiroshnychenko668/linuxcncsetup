@@ -3,8 +3,9 @@
 set -Eeuo pipefail
 
 readonly APP_NAME="linuxcncsetup"
-readonly MIN_GO_VERSION="1.25.0"
 readonly GO_VERSION="1.26.5"
+readonly GO_AMD64_SHA256="5c2c3b16caefa1d968a94c1daca04a7ca301a496d9b086e17ad77bb81393f053"
+readonly GO_ARM64_SHA256="fe4789e92b1f33358680864bbe8704289e7bb5fc207d80623c308935bd696d49"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 DATA_DIR="${LINUXCNCSETUP_DATA_DIR:-${XDG_DATA_HOME:-${HOME}/.local/share}/${APP_NAME}}"
@@ -14,6 +15,7 @@ TOOLCHAIN_DIR="${DATA_DIR}/toolchains/go${GO_VERSION}"
 TARGET_BINARY="${BIN_DIR}/${APP_NAME}"
 
 temporary_dir=""
+temporary_toolchain_staging=""
 temporary_binary=""
 run_after_install=false
 selected_go_binary=""
@@ -58,15 +60,20 @@ cleanup() {
 			;;
 		esac
 	fi
+
+	if [[ -n "${temporary_toolchain_staging}" && -d "${temporary_toolchain_staging}" ]]; then
+		local toolchain_parent
+		toolchain_parent="$(dirname -- "${TOOLCHAIN_DIR}")"
+		case "${temporary_toolchain_staging}" in
+		"${toolchain_parent}"/.go"${GO_VERSION}".install.*)
+			chmod -R u+w "${temporary_toolchain_staging}" 2>/dev/null || true
+			rm -rf -- "${temporary_toolchain_staging}"
+			;;
+		esac
+	fi
 }
 
 trap cleanup EXIT
-
-version_at_least() {
-	local actual="$1"
-	local required="$2"
-	[[ "$(printf '%s\n%s\n' "${required}" "${actual}" | sort -V | head -n 1)" == "${required}" ]]
-}
 
 installed_go_version() {
 	local go_binary="$1"
@@ -95,11 +102,11 @@ install_local_go() {
 	case "$(uname -m)" in
 	x86_64 | amd64)
 		go_arch="amd64"
-		expected_sha256="5c2c3b16caefa1d968a94c1daca04a7ca301a496d9b086e17ad77bb81393f053"
+		expected_sha256="${GO_AMD64_SHA256}"
 		;;
 	aarch64 | arm64)
 		go_arch="arm64"
-		expected_sha256="fe4789e92b1f33358680864bbe8704289e7bb5fc207d80623c308935bd696d49"
+		expected_sha256="${GO_ARM64_SHA256}"
 		;;
 	*)
 		die "unsupported CPU architecture: $(uname -m)"
@@ -124,41 +131,65 @@ install_local_go() {
 	tar -C "${temporary_dir}" -xzf "${archive}"
 	[[ -x "${temporary_dir}/go/bin/go" ]] || die "downloaded Go archive is incomplete"
 
-	mkdir -p "$(dirname -- "${TOOLCHAIN_DIR}")"
-	if [[ -e "${TOOLCHAIN_DIR}" ]]; then
-		local backup="${TOOLCHAIN_DIR}.incomplete.$(date +%Y%m%d%H%M%S)"
-		mv -- "${TOOLCHAIN_DIR}" "${backup}"
-		log "Moved incomplete toolchain to ${backup}"
-	fi
-	mv -- "${temporary_dir}/go" "${TOOLCHAIN_DIR}"
+	local toolchain_parent
+	toolchain_parent="$(dirname -- "${TOOLCHAIN_DIR}")"
+	mkdir -p "${toolchain_parent}"
+	temporary_toolchain_staging="$(mktemp -d "${toolchain_parent}/.go${GO_VERSION}.install.XXXXXX")"
+	mv --no-target-directory -- "${temporary_dir}/go" "${temporary_toolchain_staging}/go"
 
 	local installed_version
-	installed_version="$(installed_go_version "${TOOLCHAIN_DIR}/bin/go")"
+	installed_version="$(installed_go_version "${temporary_toolchain_staging}/go/bin/go")" \
+		|| die "downloaded Go toolchain cannot report its version"
 	[[ "${installed_version}" == "${GO_VERSION}" ]] \
 		|| die "installed Go version ${installed_version} does not match ${GO_VERSION}"
+
+	local backup_container=""
+	if [[ -e "${TOOLCHAIN_DIR}" || -L "${TOOLCHAIN_DIR}" ]]; then
+		backup_container="$(mktemp -d "${toolchain_parent}/.go${GO_VERSION}.replaced.XXXXXX")"
+		if ! mv --no-target-directory -- "${TOOLCHAIN_DIR}" "${backup_container}/go"; then
+			rmdir -- "${backup_container}" 2>/dev/null || true
+			die "could not preserve the existing Go toolchain"
+		fi
+		log "Preserved unusable local toolchain in ${backup_container}/go"
+	fi
+
+	if ! mv --no-target-directory -- "${temporary_toolchain_staging}/go" "${TOOLCHAIN_DIR}"; then
+		if [[ -n "${backup_container}" && ! -e "${TOOLCHAIN_DIR}" && ! -L "${TOOLCHAIN_DIR}" ]]; then
+			mv --no-target-directory -- "${backup_container}/go" "${TOOLCHAIN_DIR}" 2>/dev/null || true
+			rmdir -- "${backup_container}" 2>/dev/null || true
+		fi
+		die "could not activate Go ${GO_VERSION}"
+	fi
+	rmdir -- "${temporary_toolchain_staging}"
+	temporary_toolchain_staging=""
 }
 
 select_go() {
 	local candidate
 	local version
 
-	if candidate="$(command -v go 2>/dev/null)"; then
-		version="$(installed_go_version "${candidate}")"
-		if [[ -n "${version}" ]] && version_at_least "${version}" "${MIN_GO_VERSION}"; then
-			log "Using Go ${version} from ${candidate}"
-			selected_go_binary="${candidate}"
-			return
-		fi
-		log "Existing Go ${version:-unknown} is older than ${MIN_GO_VERSION}"
-	fi
-
-	if [[ -x "${TOOLCHAIN_DIR}/bin/go" ]]; then
-		version="$(installed_go_version "${TOOLCHAIN_DIR}/bin/go")"
-		if [[ -n "${version}" ]] && version_at_least "${version}" "${MIN_GO_VERSION}"; then
-			log "Using local Go ${version}"
+	if [[ -e "${TOOLCHAIN_DIR}" || -L "${TOOLCHAIN_DIR}" ]]; then
+		if [[ -x "${TOOLCHAIN_DIR}/bin/go" ]] &&
+			version="$(installed_go_version "${TOOLCHAIN_DIR}/bin/go")" &&
+			[[ "${version}" == "${GO_VERSION}" ]]; then
+			log "Using pinned local Go ${version}"
 			selected_go_binary="${TOOLCHAIN_DIR}/bin/go"
 			return
 		fi
+		log "Local pinned-toolchain path contains Go ${version:-unknown}; repairing it with ${GO_VERSION}"
+		install_local_go
+		log "Installed Go ${GO_VERSION} in ${TOOLCHAIN_DIR}"
+		selected_go_binary="${TOOLCHAIN_DIR}/bin/go"
+		return
+	fi
+
+	if candidate="$(command -v go 2>/dev/null)"; then
+		if version="$(installed_go_version "${candidate}")" && [[ "${version}" == "${GO_VERSION}" ]]; then
+			log "Using exact Go ${version} from ${candidate}"
+			selected_go_binary="${candidate}"
+			return
+		fi
+		log "Existing Go ${version:-unknown} does not match required Go ${GO_VERSION}"
 	fi
 
 	install_local_go
@@ -227,4 +258,6 @@ main() {
 	printf '\nLaunch with:\n  %s\n' "${TARGET_BINARY}"
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+	main "$@"
+fi

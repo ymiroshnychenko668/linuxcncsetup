@@ -23,8 +23,14 @@ const (
 	remoteTerminalUserField = iota
 	remoteTerminalMachineNameField
 	remoteTerminalListenAddressField
+	remoteTerminalTransportField
 	remoteTerminalPortField
 	remoteTerminalFieldCount
+)
+
+const (
+	remoteTerminalTransportHTTPS = "https"
+	remoteTerminalTransportHTTP  = "http"
 )
 
 var (
@@ -47,6 +53,7 @@ type remoteTerminalDraft struct {
 	user          string
 	machineName   string
 	listenAddress string
+	transport     string
 	port          string
 	focusedField  int
 }
@@ -62,14 +69,15 @@ func newRemoteTerminalDraft() remoteTerminalDraft {
 		user:          targetUser,
 		machineName:   strings.TrimSpace(hostname),
 		listenAddress: firstRemoteTerminalIPv4(),
+		transport:     remoteTerminalTransportHTTP,
 		port:          "8443",
 	}
 }
 
 // updateRemoteTerminalForm applies an editing key and reports whether it was
 // consumed. Enter, Escape, and Ctrl-C remain available to the root model for
-// review, navigation, and quitting. Printable text, including "q", always
-// belongs to the focused field.
+// review, navigation, and quitting. Printable text, including "q", belongs to
+// editable text fields; the transport toggle uses Left/Right or Space.
 func (m *Model) updateRemoteTerminalForm(message tea.KeyPressMsg) bool {
 	key := message.Key()
 	if key.Code == tea.KeyEnter || key.Code == tea.KeyReturn ||
@@ -88,7 +96,17 @@ func (m *Model) updateRemoteTerminalForm(message tea.KeyPressMsg) bool {
 			(m.remoteTerminal.focusedField + remoteTerminalFieldCount - 1) % remoteTerminalFieldCount
 		m.status = ""
 		return true
+	case "left", "right", " ", "space":
+		if m.remoteTerminal.focusedField == remoteTerminalTransportField {
+			m.remoteTerminal.toggleTransport()
+			m.status = ""
+			return true
+		}
 	case "backspace":
+		if m.remoteTerminal.focusedField == remoteTerminalTransportField {
+			m.status = "Use Left/Right or Space to choose HTTPS or HTTP."
+			return true
+		}
 		value := []rune(m.remoteTerminal.fieldValue(m.remoteTerminal.focusedField))
 		if len(value) > 0 {
 			m.remoteTerminal.setFieldValue(
@@ -102,6 +120,10 @@ func (m *Model) updateRemoteTerminalForm(message tea.KeyPressMsg) bool {
 
 	if key.Text == "" {
 		return false
+	}
+	if m.remoteTerminal.focusedField == remoteTerminalTransportField {
+		m.status = "Use Left/Right or Space to choose HTTPS or HTTP."
+		return true
 	}
 	for _, character := range key.Text {
 		if unicode.IsControl(character) {
@@ -125,6 +147,8 @@ func (draft remoteTerminalDraft) fieldValue(field int) string {
 		return draft.machineName
 	case remoteTerminalListenAddressField:
 		return draft.listenAddress
+	case remoteTerminalTransportField:
+		return draft.transport
 	case remoteTerminalPortField:
 		return draft.port
 	default:
@@ -140,6 +164,8 @@ func (draft *remoteTerminalDraft) setFieldValue(field int, value string) {
 		draft.machineName = value
 	case remoteTerminalListenAddressField:
 		draft.listenAddress = value
+	case remoteTerminalTransportField:
+		draft.transport = value
 	case remoteTerminalPortField:
 		draft.port = value
 	}
@@ -149,43 +175,81 @@ func (draft remoteTerminalDraft) normalized() remoteTerminalDraft {
 	draft.user = strings.TrimSpace(draft.user)
 	draft.machineName = strings.TrimSpace(draft.machineName)
 	draft.listenAddress = strings.TrimSpace(draft.listenAddress)
+	draft.transport = strings.ToLower(strings.TrimSpace(draft.transport))
+	if draft.transport == "" {
+		draft.transport = remoteTerminalTransportHTTP
+	}
 	draft.port = strings.TrimSpace(draft.port)
 	return draft
+}
+
+func (draft *remoteTerminalDraft) toggleTransport() {
+	if draft.normalized().transport == remoteTerminalTransportHTTP {
+		draft.transport = remoteTerminalTransportHTTPS
+		return
+	}
+	draft.transport = remoteTerminalTransportHTTP
+}
+
+func (draft remoteTerminalDraft) transportDisplayValue() string {
+	if draft.normalized().transport == remoteTerminalTransportHTTP {
+		return "HTTP (LAN default)"
+	}
+	return "HTTPS (optional)"
+}
+
+func (draft remoteTerminalDraft) endpointURL() string {
+	draft = draft.normalized()
+	return fmt.Sprintf("%s://%s:%s/", draft.transport, draft.listenAddress, draft.port)
 }
 
 func (m Model) renderRemoteTerminalForm(confirming bool) []string {
 	draft := m.remoteTerminal
 	if confirming {
 		draft = draft.normalized()
-		return []string{
+		lines := []string{
 			warningStyle.Render("Install Remote Terminal?"),
 			"",
 			fmt.Sprintf("Linux system user: %s", draft.user),
 			fmt.Sprintf("Machine name:      %s", draft.machineName),
 			fmt.Sprintf("LAN IPv4 address:  %s", draft.listenAddress),
-			fmt.Sprintf("HTTPS port:        %s", draft.port),
+			fmt.Sprintf("Transport:         %s", strings.ToUpper(draft.transport)),
+			fmt.Sprintf("Port:              %s", draft.port),
 			"",
-			fmt.Sprintf("Endpoint: https://%s:%s/", draft.listenAddress, draft.port),
+			fmt.Sprintf("Endpoint: %s", draft.endpointURL()),
 			"",
 			"Ansible builds and installs the service,",
 			"web application, and pinned ttyd dependency.",
+		}
+		if draft.transport == remoteTerminalTransportHTTP {
+			lines = append(lines,
+				"",
+				"DANGER: HTTP sends the Linux system password",
+				"and terminal traffic over the LAN in plaintext.",
+				"code-server webviews require this exact HTTP origin",
+				"in the client browser's secure-origin allowlist.",
+			)
+			return append(lines, "", "sudo will ask for your account password.", "Press y to continue or n to cancel.")
+		}
+		return append(lines,
 			"It creates a self-signed TLS certificate",
 			"unless trusted TLS material is supplied later.",
 			"",
 			"sudo will ask for your account password.",
 			"Press y to continue or n to cancel.",
-		}
+		)
 	}
 
 	labels := []string{
 		"Linux system user",
 		"Machine name",
 		"LAN IPv4 address",
-		"HTTPS port",
+		"Transport",
+		"Port",
 	}
 	lines := []string{
 		"Choose the local account that owns terminal sessions",
-		"and the LAN endpoint exposed over HTTPS.",
+		"and the transport used by the LAN endpoint.",
 		"",
 	}
 	for field, label := range labels {
@@ -194,30 +258,56 @@ func (m Model) renderRemoteTerminalForm(confirming bool) []string {
 			prefix = "› "
 		}
 		value := draft.fieldValue(field)
+		if field == remoteTerminalTransportField {
+			value = draft.transportDisplayValue()
+		}
 		if value == "" {
 			value = "(required)"
 		}
 		lines = append(lines, fmt.Sprintf("%s%-18s %s", prefix, label+":", value))
 	}
+	if draft.normalized().transport == remoteTerminalTransportHTTP {
+		lines = append(lines,
+			"",
+			"DANGER: HTTP sends the system password and",
+			"terminal traffic over the LAN in plaintext.",
+			"code-server webviews need this origin in",
+			"the client browser secure-origin allowlist.",
+		)
+	}
 	return append(lines,
 		"",
-		"Type to edit. Tab or ↑/↓ changes field.",
+		"Type to edit; Left/Right or Space selects transport.",
+		"Tab or ↑/↓ changes field.",
 		"Press Enter to validate and review the installation.",
 	)
 }
 
 func renderCompactRemoteTerminalConfirmation(draft remoteTerminalDraft) []string {
 	draft = draft.normalized()
-	return []string{
+	lines := []string{
 		warningStyle.Render("Install Remote Terminal?"),
-		fmt.Sprintf("User: %s", draft.user),
-		fmt.Sprintf("Machine: %s", draft.machineName),
-		fmt.Sprintf("URL: https://%s:%s/", draft.listenAddress, draft.port),
-		"Builds service, web UI, and pinned ttyd.",
-		"TLS: creates a self-signed certificate.",
-		"sudo will ask for your password.",
-		"Press y to install or n to cancel.",
+		fmt.Sprintf("Machine: %s; user: %s", draft.machineName, draft.user),
+		fmt.Sprintf("%s %s", strings.ToUpper(draft.transport), draft.endpointURL()),
 	}
+	if draft.transport == remoteTerminalTransportHTTP {
+		return append(lines,
+			"DANGER: system password is",
+			"plaintext over LAN HTTP.",
+			"Terminal traffic is plaintext.",
+			"code-server webviews need this",
+			"origin in the client browser",
+			"secure-origin allowlist.",
+			"sudo will ask for your password.",
+			"Press y to install; n to cancel.",
+		)
+	}
+	return append(lines,
+		"Builds service, web UI, and ttyd.",
+		"TLS: self-signed certificate.",
+		"sudo will ask for your password.",
+		"Press y to install; n to cancel.",
+	)
 }
 
 func (m *Model) prepareRemoteTerminalInstall() bool {
@@ -292,17 +382,20 @@ func validateRemoteTerminalDraftSyntax(draft remoteTerminalDraft) error {
 	if !validRemoteTerminalIPv4(draft.listenAddress) {
 		return fmt.Errorf("LAN address must be a valid non-loopback IPv4 address whose final octet is not 0 or 255")
 	}
+	if draft.transport != remoteTerminalTransportHTTPS && draft.transport != remoteTerminalTransportHTTP {
+		return fmt.Errorf("transport must be HTTPS or HTTP")
+	}
 	if draft.port == "" {
-		return fmt.Errorf("HTTPS port must be between 1024 and 65535")
+		return fmt.Errorf("port must be between 1024 and 65535")
 	}
 	for _, character := range draft.port {
 		if character < '0' || character > '9' {
-			return fmt.Errorf("HTTPS port must be between 1024 and 65535")
+			return fmt.Errorf("port must be between 1024 and 65535")
 		}
 	}
 	port, err := strconv.ParseUint(draft.port, 10, 16)
 	if err != nil || port < 1024 || port > 65535 {
-		return fmt.Errorf("HTTPS port must be between 1024 and 65535")
+		return fmt.Errorf("port must be between 1024 and 65535")
 	}
 	return nil
 }
@@ -387,12 +480,13 @@ func remoteTerminalPlaybookVariables(
 	}
 	port, err := strconv.Atoi(draft.port)
 	if err != nil {
-		return nil, fmt.Errorf("parse HTTPS port: %w", err)
+		return nil, fmt.Errorf("parse port: %w", err)
 	}
 	return map[string]any{
 		"remoteterminal_user":           draft.user,
 		"remoteterminal_machine_name":   draft.machineName,
 		"remoteterminal_listen_address": draft.listenAddress,
+		"remoteterminal_transport":      draft.transport,
 		"remoteterminal_port":           port,
 		"remoteterminal_source_dir":     sourceDirectory,
 	}, nil

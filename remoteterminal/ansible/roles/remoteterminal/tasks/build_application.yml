@@ -163,7 +163,9 @@
     remoteterminal_release_digest: >-
       {{ (remoteterminal_source_manifest | join('\n') ~ '\n' ~
           remoteterminal_ttyd_commit ~ '\n' ~
-          remoteterminal_go_version.stdout ~ '\n' ~
+          remoteterminal_code_server_version ~ '\n' ~
+          remoteterminal_code_server_archive_checksum ~ '\n' ~
+          remoteterminal_go_release_fingerprint ~ '\n' ~
           remoteterminal_node_version.stdout ~ '\n' ~
           remoteterminal_npm_version.stdout ~ '\n' ~
           remoteterminal_build_tool_package_versions) | hash('sha256') }}
@@ -298,7 +300,7 @@
     - name: Run Go test suite with PAM cgo support
       ansible.builtin.command:
         argv:
-          - /usr/bin/go
+          - "{{ remoteterminal_go_binary }}"
           - test
           - -tags
           - pam
@@ -310,14 +312,19 @@
         CGO_ENABLED: "1"
         GOCACHE: "{{ remoteterminal_build_root }}/cache/go-build"
         GOMODCACHE: "{{ remoteterminal_build_root }}/cache/go-mod"
+        GOENV: "off"
+        GOROOT: "{{ remoteterminal_go_tool_dir }}"
+        GOTELEMETRY: "off"
         GOTOOLCHAIN: local
+        GOWORK: "off"
         HOME: "{{ remoteterminal_selected_home }}"
+        PATH: "{{ remoteterminal_go_tool_dir }}/bin:/usr/bin:/bin"
       changed_when: false
 
     - name: Compile Go service with PAM cgo support
       ansible.builtin.command:
         argv:
-          - /usr/bin/go
+          - "{{ remoteterminal_go_binary }}"
           - build
           - -tags
           - pam
@@ -333,8 +340,13 @@
         CGO_ENABLED: "1"
         GOCACHE: "{{ remoteterminal_build_root }}/cache/go-build"
         GOMODCACHE: "{{ remoteterminal_build_root }}/cache/go-mod"
+        GOENV: "off"
+        GOROOT: "{{ remoteterminal_go_tool_dir }}"
+        GOTELEMETRY: "off"
         GOTOOLCHAIN: local
+        GOWORK: "off"
         HOME: "{{ remoteterminal_selected_home }}"
+        PATH: "{{ remoteterminal_go_tool_dir }}/bin:/usr/bin:/bin"
       changed_when: true
 
     - name: Inspect application build outputs

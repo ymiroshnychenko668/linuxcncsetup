@@ -1,0 +1,814 @@
+---
+- name: Calculate pinned code-server archive identity
+  ansible.builtin.set_fact:
+    remoteterminal_code_server_archive_digest: >-
+      {{ remoteterminal_code_server_archive_checksum | regex_replace('^sha256:', '') }}
+    remoteterminal_code_server_install_fingerprint: >-
+      {{ (remoteterminal_code_server_version ~ '\n' ~
+          remoteterminal_code_server_archive_url ~ '\n' ~
+          remoteterminal_code_server_archive_checksum) | hash('sha256') }}
+
+- name: Record content-addressed code-server paths
+  ansible.builtin.set_fact:
+    remoteterminal_code_server_tool_dir: >-
+      {{ remoteterminal_install_root }}/tools/code-server-{{ remoteterminal_code_server_version }}-{{
+         remoteterminal_code_server_archive_digest[0:12] }}
+    remoteterminal_code_server_completion_prefix: |
+      version={{ remoteterminal_code_server_version }}
+      archive={{ remoteterminal_code_server_archive_checksum }}
+      install={{ remoteterminal_code_server_install_fingerprint }}
+
+- name: Inspect root-owned code-server tool hierarchy without following links
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+  loop:
+    - "{{ remoteterminal_install_root }}"
+    - "{{ remoteterminal_install_root }}/tools"
+    - "{{ remoteterminal_code_server_tool_dir }}"
+  register: remoteterminal_code_server_tool_path_stats
+
+- name: Reject unsafe code-server tool hierarchy
+  ansible.builtin.assert:
+    that:
+      - >-
+        not item.stat.exists or
+        (item.stat.isdir and not (item.stat.islnk | default(false)) and
+         item.stat.uid | int == 0 and
+         item.stat.mode is match('^0?[0-7][0145][0145]$'))
+    fail_msg: >-
+      Refusing the code-server install because {{ item.item }} is not absent or
+      a root-owned, non-symlink, non-writable-by-group/other directory.
+  loop: "{{ remoteterminal_code_server_tool_path_stats.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Create root-owned code-server tool parent
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  loop:
+    - "{{ remoteterminal_install_root }}"
+    - "{{ remoteterminal_install_root }}/tools"
+
+- name: Find stale inactive code-server candidates in validated tool parent
+  ansible.builtin.find:
+    paths: "{{ remoteterminal_install_root }}/tools"
+    patterns: ".code-server-*"
+    file_type: any
+    recurse: false
+    hidden: true
+  register: remoteterminal_code_server_stale_candidates
+
+- name: Reject unsafe stale code-server candidate entries
+  ansible.builtin.assert:
+    that:
+      - (item.path | dirname) == (remoteterminal_install_root ~ '/tools')
+      - (item.path | basename) is match('^\.code-server-[0-9a-f]{12}-[A-Za-z0-9_.-]+$')
+      - item.isdir
+      - not (item.islnk | default(false))
+      - item.uid | int == 0
+      - item.mode is match('^0?[0-7][0145][0145]$')
+    fail_msg: >-
+      Refusing to prune an unexpected inactive code-server candidate entry:
+      {{ item.path }}
+  loop: "{{ remoteterminal_code_server_stale_candidates.files }}"
+  loop_control:
+    label: "{{ item.path }}"
+
+- name: Defer validated inactive code-server cleanup until service health verification
+  ansible.builtin.set_fact:
+    remoteterminal_code_server_deferred_cleanup_paths: >-
+      {{ remoteterminal_code_server_stale_candidates.files |
+         map(attribute='path') | list }}
+
+- name: Inspect installed code-server completion artifacts without following links
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+    checksum_algorithm: sha256
+  loop:
+    - "{{ remoteterminal_code_server_tool_dir }}"
+    - "{{ remoteterminal_code_server_tool_dir }}/bin"
+    - "{{ remoteterminal_code_server_tool_dir }}/bin/code-server"
+    - "{{ remoteterminal_code_server_tool_dir }}/lib"
+    - "{{ remoteterminal_code_server_tool_dir }}/lib/node"
+    - "{{ remoteterminal_code_server_tool_dir }}/.complete"
+  register: remoteterminal_code_server_installed_artifacts
+
+- name: Read installed code-server completion marker
+  ansible.builtin.slurp:
+    src: "{{ remoteterminal_code_server_tool_dir }}/.complete"
+  register: remoteterminal_code_server_installed_marker
+  when:
+    - remoteterminal_code_server_installed_artifacts.results[5].stat.exists
+    - remoteterminal_code_server_installed_artifacts.results[5].stat.isreg | default(false)
+    - not (remoteterminal_code_server_installed_artifacts.results[5].stat.islnk | default(false))
+    - remoteterminal_code_server_installed_artifacts.results[5].stat.uid | int == 0
+
+- name: Probe installed code-server version as selected account
+  ansible.builtin.command:
+    argv:
+      - "{{ remoteterminal_code_server_tool_dir }}/bin/code-server"
+      - --config
+      - /dev/null
+      - --version
+  register: remoteterminal_code_server_installed_version_probe
+  changed_when: false
+  failed_when: false
+  become: true
+  become_user: "{{ remoteterminal_user }}"
+  environment:
+    HOME: "{{ remoteterminal_selected_home }}"
+  when:
+    - remoteterminal_code_server_installed_artifacts.results[2].stat.exists
+    - remoteterminal_code_server_installed_artifacts.results[2].stat.isreg | default(false)
+    - not (remoteterminal_code_server_installed_artifacts.results[2].stat.islnk | default(false))
+    - remoteterminal_code_server_installed_artifacts.results[4].stat.exists
+    - remoteterminal_code_server_installed_artifacts.results[4].stat.isreg | default(false)
+    - not (remoteterminal_code_server_installed_artifacts.results[4].stat.islnk | default(false))
+
+- name: Audit installed code-server tree and calculate deterministic digest
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/python3
+      - -c
+      - |
+        import hashlib
+        import os
+        import stat
+        import sys
+
+        root = os.path.realpath(sys.argv[1])
+        digest = hashlib.sha256()
+        for current, directories, files in os.walk(root, topdown=True, followlinks=False):
+            directories.sort()
+            files.sort()
+            for entry in directories + files:
+                path = os.path.join(current, entry)
+                relative = os.path.relpath(path, root)
+                if relative == ".complete":
+                    continue
+                details = os.lstat(path)
+                if details.st_uid != 0 or details.st_gid != 0:
+                    raise SystemExit(f"non-root-owned installed entry: {path}")
+                if stat.S_ISLNK(details.st_mode):
+                    target = os.path.realpath(path)
+                    if os.path.commonpath((root, target)) != root:
+                        raise SystemExit(f"link escapes installed root: {path}")
+                    kind = b"link"
+                    payload = os.fsencode(os.readlink(path))
+                elif stat.S_ISDIR(details.st_mode):
+                    kind = b"directory"
+                    payload = b""
+                elif stat.S_ISREG(details.st_mode):
+                    kind = b"file"
+                    payload = b""
+                else:
+                    raise SystemExit(f"unsupported installed entry: {path}")
+                if not stat.S_ISLNK(details.st_mode):
+                    if details.st_mode & (stat.S_ISUID | stat.S_ISGID | stat.S_ISVTX):
+                        raise SystemExit(f"special permission bits on installed entry: {path}")
+                    if details.st_mode & 0o022:
+                        raise SystemExit(f"group/other-writable installed entry: {path}")
+                    if stat.S_ISDIR(details.st_mode) and details.st_mode & 0o005 != 0o005:
+                        raise SystemExit(f"installed directory is not service-readable: {path}")
+                    if stat.S_ISREG(details.st_mode) and not details.st_mode & 0o004:
+                        raise SystemExit(f"installed file is not service-readable: {path}")
+                digest.update(kind + b"\0" + os.fsencode(relative) + b"\0")
+                digest.update(f"{stat.S_IMODE(details.st_mode):04o}".encode() + b"\0")
+                if stat.S_ISREG(details.st_mode):
+                    with open(path, "rb") as source:
+                        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                            digest.update(chunk)
+                else:
+                    digest.update(payload)
+                digest.update(b"\0")
+        print(digest.hexdigest())
+      - "{{ remoteterminal_code_server_tool_dir }}"
+  register: remoteterminal_code_server_installed_tree_audit
+  changed_when: false
+  failed_when: false
+  when:
+    - remoteterminal_code_server_installed_artifacts.results[0].stat.exists
+    - remoteterminal_code_server_installed_artifacts.results[0].stat.isdir | default(false)
+    - not (remoteterminal_code_server_installed_artifacts.results[0].stat.islnk | default(false))
+    - remoteterminal_code_server_installed_artifacts.results[0].stat.uid | int == 0
+
+- name: Determine whether installed code-server is complete and reusable
+  ansible.builtin.set_fact:
+    remoteterminal_code_server_installed_valid: >-
+      {{ remoteterminal_code_server_installed_artifacts.results[0].stat.exists and
+         (remoteterminal_code_server_installed_artifacts.results[0].stat.isdir | default(false)) and
+         not (remoteterminal_code_server_installed_artifacts.results[0].stat.islnk | default(false)) and
+         remoteterminal_code_server_installed_artifacts.results[0].stat.uid | int == 0 and
+         remoteterminal_code_server_installed_artifacts.results[0].stat.gid | int == 0 and
+         remoteterminal_code_server_installed_artifacts.results[0].stat.mode == '0755' and
+         remoteterminal_code_server_installed_artifacts.results[1].stat.exists and
+         (remoteterminal_code_server_installed_artifacts.results[1].stat.isdir | default(false)) and
+         not (remoteterminal_code_server_installed_artifacts.results[1].stat.islnk | default(false)) and
+         remoteterminal_code_server_installed_artifacts.results[1].stat.uid | int == 0 and
+         remoteterminal_code_server_installed_artifacts.results[1].stat.gid | int == 0 and
+         remoteterminal_code_server_installed_artifacts.results[1].stat.mode == '0755' and
+         remoteterminal_code_server_installed_artifacts.results[2].stat.exists and
+         (remoteterminal_code_server_installed_artifacts.results[2].stat.isreg | default(false)) and
+         not (remoteterminal_code_server_installed_artifacts.results[2].stat.islnk | default(false)) and
+         remoteterminal_code_server_installed_artifacts.results[2].stat.uid | int == 0 and
+         remoteterminal_code_server_installed_artifacts.results[2].stat.gid | int == 0 and
+         remoteterminal_code_server_installed_artifacts.results[2].stat.mode == '0755' and
+         (remoteterminal_code_server_installed_artifacts.results[2].stat.executable | default(false)) and
+         remoteterminal_code_server_installed_artifacts.results[3].stat.exists and
+         (remoteterminal_code_server_installed_artifacts.results[3].stat.isdir | default(false)) and
+         not (remoteterminal_code_server_installed_artifacts.results[3].stat.islnk | default(false)) and
+         remoteterminal_code_server_installed_artifacts.results[3].stat.uid | int == 0 and
+         remoteterminal_code_server_installed_artifacts.results[3].stat.gid | int == 0 and
+         remoteterminal_code_server_installed_artifacts.results[3].stat.mode == '0755' and
+         remoteterminal_code_server_installed_artifacts.results[4].stat.exists and
+         (remoteterminal_code_server_installed_artifacts.results[4].stat.isreg | default(false)) and
+         not (remoteterminal_code_server_installed_artifacts.results[4].stat.islnk | default(false)) and
+         remoteterminal_code_server_installed_artifacts.results[4].stat.uid | int == 0 and
+         remoteterminal_code_server_installed_artifacts.results[4].stat.gid | int == 0 and
+         remoteterminal_code_server_installed_artifacts.results[4].stat.mode == '0755' and
+         (remoteterminal_code_server_installed_artifacts.results[4].stat.executable | default(false)) and
+         remoteterminal_code_server_installed_artifacts.results[5].stat.exists and
+         (remoteterminal_code_server_installed_artifacts.results[5].stat.isreg | default(false)) and
+         not (remoteterminal_code_server_installed_artifacts.results[5].stat.islnk | default(false)) and
+         remoteterminal_code_server_installed_artifacts.results[5].stat.uid | int == 0 and
+         remoteterminal_code_server_installed_artifacts.results[5].stat.gid | int == 0 and
+         remoteterminal_code_server_installed_artifacts.results[5].stat.mode == '0644' and
+         (remoteterminal_code_server_installed_marker.content | default('') | b64decode).splitlines() ==
+         ((remoteterminal_code_server_completion_prefix | trim).splitlines() +
+          ['launcher_sha256=' ~
+           (remoteterminal_code_server_installed_artifacts.results[2].stat.checksum | default('')),
+           'node_sha256=' ~
+           (remoteterminal_code_server_installed_artifacts.results[4].stat.checksum | default('')),
+           'tree_sha256=' ~
+           (remoteterminal_code_server_installed_tree_audit.stdout | default('') | trim)]) and
+         (remoteterminal_code_server_installed_tree_audit.rc | default(1)) == 0 and
+         (remoteterminal_code_server_installed_tree_audit.stdout | default('') | trim) is
+         match('^[0-9a-f]{64}$') and
+         (remoteterminal_code_server_installed_version_probe.rc | default(1)) == 0 and
+         remoteterminal_code_server_version in
+         ((remoteterminal_code_server_installed_version_probe.stdout | default('')) ~
+          (remoteterminal_code_server_installed_version_probe.stderr | default(''))) }}
+
+- name: Record whether code-server must be replaced during this deployment
+  ansible.builtin.set_fact:
+    remoteterminal_code_server_tool_replaced: >-
+      {{ not (remoteterminal_code_server_installed_valid | bool) }}
+
+- name: Record whether code-server reconciliation requires a durable restart
+  ansible.builtin.set_fact:
+    remoteterminal_code_server_reconciliation_requires_restart: >-
+      {{ (remoteterminal_code_server_tool_replaced | bool) or
+         (remoteterminal_code_server_deferred_cleanup_paths | length > 0) }}
+
+- name: Create secure configuration directory before code-server mutation
+  ansible.builtin.file:
+    path: "{{ remoteterminal_config_dir }}"
+    state: directory
+    owner: root
+    group: "{{ remoteterminal_selected_group }}"
+    mode: "0750"
+  when: remoteterminal_code_server_reconciliation_requires_restart | bool
+
+- name: Inspect durable restart marker before code-server mutation
+  ansible.builtin.stat:
+    path: "{{ remoteterminal_restart_required_marker }}"
+    follow: false
+  register: remoteterminal_code_server_restart_marker
+  when: remoteterminal_code_server_reconciliation_requires_restart | bool
+
+- name: Reject unsafe durable restart marker before code-server mutation
+  ansible.builtin.assert:
+    that:
+      - >-
+        not remoteterminal_code_server_restart_marker.stat.exists or
+        ((remoteterminal_code_server_restart_marker.stat.isreg | default(false)) and
+         not (remoteterminal_code_server_restart_marker.stat.islnk | default(false)) and
+         remoteterminal_code_server_restart_marker.stat.uid | int == 0 and
+         remoteterminal_code_server_restart_marker.stat.gid | int == 0 and
+         remoteterminal_code_server_restart_marker.stat.mode == '0600')
+    fail_msg: >-
+      Refusing code-server reconciliation because the durable restart marker has
+      an unsafe type, owner, group, or mode.
+  when: remoteterminal_code_server_reconciliation_requires_restart | bool
+
+- name: Persist restart requirement before code-server mutation
+  ansible.builtin.copy:
+    content: "code-server-tool-reconciliation-required\n"
+    dest: "{{ remoteterminal_restart_required_marker }}"
+    owner: root
+    group: root
+    mode: "0600"
+  when: remoteterminal_code_server_reconciliation_requires_restart | bool
+
+- name: Install and atomically activate pinned code-server
+  when: not (remoteterminal_code_server_installed_valid | bool)
+  block:
+    - name: Inspect delegated code-server staging paths without following links
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        follow: false
+      loop:
+        - "{{ remoteterminal_build_root }}/downloads"
+        - "{{ remoteterminal_build_root }}/downloads/code-server-{{ remoteterminal_code_server_version }}-linux-amd64.tar.gz"
+        - "{{ remoteterminal_build_root }}/code-server-{{ remoteterminal_code_server_version }}-linux-amd64"
+      register: remoteterminal_code_server_staging_path_stats
+
+    - name: Reject unsafe delegated code-server staging paths
+      ansible.builtin.assert:
+        that:
+          - >-
+            not item.stat.exists or
+            ((item.item | basename).endswith('.tar.gz') and
+             (item.stat.isreg | default(false)) and
+             not (item.stat.islnk | default(false)) and
+             item.stat.uid | int == remoteterminal_selected_uid | int) or
+            (not (item.item | basename).endswith('.tar.gz') and
+             item.stat.isdir and
+             not (item.stat.islnk | default(false)) and
+             item.stat.uid | int == remoteterminal_selected_uid | int)
+        fail_msg: >-
+          Refusing the code-server install because delegated path
+          {{ item.item }} has an unsafe type or owner.
+      loop: "{{ remoteterminal_code_server_staging_path_stats.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: Remove stale delegated code-server extraction tree
+      ansible.builtin.file:
+        path: "{{ remoteterminal_build_root }}/code-server-{{ remoteterminal_code_server_version }}-linux-amd64"
+        state: absent
+
+    - name: Create clean user-owned code-server staging directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ remoteterminal_user }}"
+        group: "{{ remoteterminal_selected_group }}"
+        mode: "0750"
+      loop:
+        - "{{ remoteterminal_build_root }}/downloads"
+        - "{{ remoteterminal_build_root }}/code-server-{{ remoteterminal_code_server_version }}-linux-amd64"
+
+    - name: Download checksum-pinned official code-server standalone archive
+      ansible.builtin.get_url:
+        url: "{{ remoteterminal_code_server_archive_url }}"
+        dest: "{{ remoteterminal_build_root }}/downloads/code-server-{{ remoteterminal_code_server_version }}-linux-amd64.tar.gz"
+        checksum: "{{ remoteterminal_code_server_archive_checksum }}"
+        owner: "{{ remoteterminal_user }}"
+        group: "{{ remoteterminal_selected_group }}"
+        mode: "0640"
+        timeout: 120
+      become: true
+      become_user: "{{ remoteterminal_user }}"
+
+    - name: Validate code-server archive member paths and types before extraction
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/python3
+          - -c
+          - |
+            import posixpath
+            import sys
+            import tarfile
+
+            archive, prefix = sys.argv[1:]
+            with tarfile.open(archive, "r:gz") as bundle:
+                members = bundle.getmembers()
+                if not members:
+                    raise SystemExit("code-server archive is empty")
+                if len(members) > 20000:
+                    raise SystemExit("code-server archive contains too many entries")
+                if sum(member.size for member in members if member.isfile()) > 2 * 1024 * 1024 * 1024:
+                    raise SystemExit("code-server archive expands beyond the supported size")
+                seen = set()
+                for member in members:
+                    name = posixpath.normpath(member.name)
+                    if (member.name.startswith("/") or name in ("", ".", "..") or
+                            ".." in member.name.split("/")):
+                        raise SystemExit(f"unsafe archive path: {member.name!r}")
+                    if name != prefix and not name.startswith(prefix + "/"):
+                        raise SystemExit(f"archive path escapes expected root: {member.name!r}")
+                    if name in seen:
+                        raise SystemExit(f"duplicate archive path: {member.name!r}")
+                    seen.add(name)
+                    if member.issym():
+                        target = posixpath.normpath(posixpath.join(posixpath.dirname(name), member.linkname))
+                        if member.linkname.startswith("/") or (target != prefix and not target.startswith(prefix + "/")):
+                            raise SystemExit(f"unsafe symbolic link: {member.name!r}")
+                    elif member.islnk():
+                        target = posixpath.normpath(member.linkname)
+                        if member.linkname.startswith("/") or (target != prefix and not target.startswith(prefix + "/")):
+                            raise SystemExit(f"unsafe hard link: {member.name!r}")
+                    elif not (member.isfile() or member.isdir()):
+                        raise SystemExit(f"unsupported archive entry: {member.name!r}")
+            print(f"validated {len(members)} archive entries")
+          - "{{ remoteterminal_build_root }}/downloads/code-server-{{ remoteterminal_code_server_version }}-linux-amd64.tar.gz"
+          - "code-server-{{ remoteterminal_code_server_version }}-linux-amd64"
+      changed_when: false
+      become: true
+      become_user: "{{ remoteterminal_user }}"
+
+    - name: Extract verified code-server standalone archive
+      ansible.builtin.unarchive:
+        src: "{{ remoteterminal_build_root }}/downloads/code-server-{{ remoteterminal_code_server_version }}-linux-amd64.tar.gz"
+        dest: "{{ remoteterminal_build_root }}/code-server-{{ remoteterminal_code_server_version }}-linux-amd64"
+        remote_src: true
+        extra_opts:
+          - --strip-components=1
+          - --no-same-owner
+          - --no-same-permissions
+      become: true
+      become_user: "{{ remoteterminal_user }}"
+
+    - name: Validate extracted code-server tree ownership and link containment
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/python3
+          - -c
+          - |
+            import os
+            import stat
+            import sys
+
+            root = os.path.realpath(sys.argv[1])
+            expected_uid = os.getuid()
+            for current, directories, files in os.walk(root, followlinks=False):
+                for entry in directories + files:
+                    path = os.path.join(current, entry)
+                    details = os.lstat(path)
+                    if details.st_uid != expected_uid:
+                        raise SystemExit(f"unexpected owner: {path}")
+                    if stat.S_ISLNK(details.st_mode):
+                        target = os.path.realpath(path)
+                        if os.path.commonpath((root, target)) != root:
+                            raise SystemExit(f"link escapes extraction root: {path}")
+                    elif not (stat.S_ISREG(details.st_mode) or stat.S_ISDIR(details.st_mode)):
+                        raise SystemExit(f"unsupported extracted entry: {path}")
+                    elif details.st_mode & (stat.S_ISUID | stat.S_ISGID | stat.S_ISVTX):
+                        raise SystemExit(f"special permission bits on extracted entry: {path}")
+                    elif details.st_mode & 0o022:
+                        raise SystemExit(f"group/other-writable extracted entry: {path}")
+          - "{{ remoteterminal_build_root }}/code-server-{{ remoteterminal_code_server_version }}-linux-amd64"
+      changed_when: false
+      become: true
+      become_user: "{{ remoteterminal_user }}"
+
+    - name: Inspect extracted code-server launch artifacts without following links
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        follow: false
+      loop:
+        - "{{ remoteterminal_build_root }}/code-server-{{ remoteterminal_code_server_version }}-linux-amd64/bin/code-server"
+        - "{{ remoteterminal_build_root }}/code-server-{{ remoteterminal_code_server_version }}-linux-amd64/lib/node"
+      register: remoteterminal_code_server_extracted_artifacts
+      become: true
+      become_user: "{{ remoteterminal_user }}"
+
+    - name: Verify extracted code-server launch artifacts
+      ansible.builtin.assert:
+        that:
+          - item.stat.exists
+          - item.stat.isreg
+          - not (item.stat.islnk | default(false))
+          - item.stat.uid | int == remoteterminal_selected_uid | int
+          - item.stat.executable | default(false)
+          - item.stat.size | int > 0
+        fail_msg: "The code-server archive lacks a safe executable: {{ item.item }}"
+      loop: "{{ remoteterminal_code_server_extracted_artifacts.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: Verify extracted code-server version as selected account
+      ansible.builtin.command:
+        argv:
+          - "{{ remoteterminal_build_root }}/code-server-{{ remoteterminal_code_server_version }}-linux-amd64/bin/code-server"
+          - --config
+          - /dev/null
+          - --version
+      register: remoteterminal_code_server_extracted_version
+      changed_when: false
+      become: true
+      become_user: "{{ remoteterminal_user }}"
+      environment:
+        HOME: "{{ remoteterminal_selected_home }}"
+
+    - name: Assert extracted code-server reports pinned version
+      ansible.builtin.assert:
+        that:
+          - >-
+            remoteterminal_code_server_version in
+            (remoteterminal_code_server_extracted_version.stdout ~
+             remoteterminal_code_server_extracted_version.stderr)
+        fail_msg: >-
+          The checksum-verified code-server archive does not report the pinned
+          version {{ remoteterminal_code_server_version }}.
+
+    - name: Create inactive code-server tool candidate
+      ansible.builtin.tempfile:
+        state: directory
+        path: "{{ remoteterminal_install_root }}/tools"
+        prefix: ".code-server-{{ remoteterminal_code_server_archive_digest[0:12] }}-"
+      register: remoteterminal_code_server_candidate
+
+    - name: Copy verified code-server tree into inactive candidate
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/rsync
+          - --archive
+          - --delete
+          - --safe-links
+          - --chown=root:root
+          - "{{ remoteterminal_build_root }}/code-server-{{ remoteterminal_code_server_version }}-linux-amd64/"
+          - "{{ remoteterminal_code_server_candidate.path }}/"
+      changed_when: true
+
+    - name: Enforce inactive code-server launch path permissions
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: "{{ item.state }}"
+        owner: root
+        group: root
+        mode: "{{ item.mode }}"
+        follow: false
+      loop:
+        - { path: "{{ remoteterminal_code_server_candidate.path }}", state: directory, mode: "0755" }
+        - { path: "{{ remoteterminal_code_server_candidate.path }}/bin", state: directory, mode: "0755" }
+        - { path: "{{ remoteterminal_code_server_candidate.path }}/bin/code-server", state: file, mode: "0755" }
+        - { path: "{{ remoteterminal_code_server_candidate.path }}/lib", state: directory, mode: "0755" }
+        - { path: "{{ remoteterminal_code_server_candidate.path }}/lib/node", state: file, mode: "0755" }
+
+    - name: Validate inactive code-server tree ownership and link containment
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/python3
+          - -c
+          - |
+            import hashlib
+            import os
+            import stat
+            import sys
+
+            root = os.path.realpath(sys.argv[1])
+            digest = hashlib.sha256()
+            for current, directories, files in os.walk(root, topdown=True, followlinks=False):
+                directories.sort()
+                files.sort()
+                for entry in directories + files:
+                    path = os.path.join(current, entry)
+                    relative = os.path.relpath(path, root)
+                    details = os.lstat(path)
+                    if details.st_uid != 0 or details.st_gid != 0:
+                        raise SystemExit(f"non-root-owned candidate entry: {path}")
+                    if stat.S_ISLNK(details.st_mode):
+                        target = os.path.realpath(path)
+                        if os.path.commonpath((root, target)) != root:
+                            raise SystemExit(f"link escapes candidate root: {path}")
+                        kind = b"link"
+                        payload = os.fsencode(os.readlink(path))
+                    elif stat.S_ISDIR(details.st_mode):
+                        kind = b"directory"
+                        payload = b""
+                    elif stat.S_ISREG(details.st_mode):
+                        kind = b"file"
+                        payload = b""
+                    else:
+                        raise SystemExit(f"unsupported candidate entry: {path}")
+                    if not stat.S_ISLNK(details.st_mode):
+                        if details.st_mode & (stat.S_ISUID | stat.S_ISGID | stat.S_ISVTX):
+                            raise SystemExit(f"special permission bits on candidate entry: {path}")
+                        if details.st_mode & 0o022:
+                            raise SystemExit(f"group/other-writable candidate entry: {path}")
+                        if stat.S_ISDIR(details.st_mode) and details.st_mode & 0o005 != 0o005:
+                            raise SystemExit(f"candidate directory is not service-readable: {path}")
+                        if stat.S_ISREG(details.st_mode) and not details.st_mode & 0o004:
+                            raise SystemExit(f"candidate file is not service-readable: {path}")
+                    digest.update(kind + b"\0" + os.fsencode(relative) + b"\0")
+                    digest.update(f"{stat.S_IMODE(details.st_mode):04o}".encode() + b"\0")
+                    if stat.S_ISREG(details.st_mode):
+                        with open(path, "rb") as source:
+                            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                                digest.update(chunk)
+                    else:
+                        digest.update(payload)
+                    digest.update(b"\0")
+            print(digest.hexdigest())
+          - "{{ remoteterminal_code_server_candidate.path }}"
+      register: remoteterminal_code_server_candidate_tree_audit
+      changed_when: false
+
+    - name: Hash inactive code-server launch artifacts without following links
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        follow: false
+        checksum_algorithm: sha256
+      loop:
+        - "{{ remoteterminal_code_server_candidate.path }}/bin/code-server"
+        - "{{ remoteterminal_code_server_candidate.path }}/lib/node"
+      register: remoteterminal_code_server_candidate_artifacts
+
+    - name: Read inactive code-server candidate version as selected account
+      ansible.builtin.command:
+        argv:
+          - "{{ remoteterminal_code_server_candidate.path }}/bin/code-server"
+          - --config
+          - /dev/null
+          - --version
+      register: remoteterminal_code_server_candidate_version
+      changed_when: false
+      become: true
+      become_user: "{{ remoteterminal_user }}"
+      environment:
+        HOME: "{{ remoteterminal_selected_home }}"
+
+    - name: Validate inactive code-server candidate before promotion
+      ansible.builtin.assert:
+        that:
+          - item.stat.exists
+          - item.stat.isreg
+          - not (item.stat.islnk | default(false))
+          - item.stat.uid | int == 0
+          - item.stat.gid | int == 0
+          - item.stat.mode == '0755'
+          - item.stat.executable | default(false)
+          - (item.stat.checksum | default('') | length) == 64
+          - remoteterminal_code_server_candidate_tree_audit.rc == 0
+          - >-
+            (remoteterminal_code_server_candidate_tree_audit.stdout | trim) is
+            match('^[0-9a-f]{64}$')
+          - >-
+            remoteterminal_code_server_version in
+            (remoteterminal_code_server_candidate_version.stdout ~
+             remoteterminal_code_server_candidate_version.stderr)
+        fail_msg: >-
+          Refusing to install code-server because the inactive candidate has
+          an unsafe executable or reports the wrong version.
+      loop: "{{ remoteterminal_code_server_candidate_artifacts.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: Complete inactive code-server candidate with install fingerprint
+      ansible.builtin.copy:
+        content: |
+          {{ remoteterminal_code_server_completion_prefix | trim }}
+          launcher_sha256={{ remoteterminal_code_server_candidate_artifacts.results[0].stat.checksum }}
+          node_sha256={{ remoteterminal_code_server_candidate_artifacts.results[1].stat.checksum }}
+          tree_sha256={{ remoteterminal_code_server_candidate_tree_audit.stdout | trim }}
+        dest: "{{ remoteterminal_code_server_candidate.path }}/.complete"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Inspect private runtime directory before replacing an active code-server tool
+      ansible.builtin.stat:
+        path: "{{ remoteterminal_runtime_dir }}"
+        follow: false
+      register: remoteterminal_code_server_repair_runtime
+      when: remoteterminal_code_server_installed_artifacts.results[0].stat.exists
+
+    - name: Reject unsafe private runtime directory before code-server repair
+      ansible.builtin.assert:
+        that:
+          - >-
+            not remoteterminal_code_server_repair_runtime.stat.exists or
+            ((remoteterminal_code_server_repair_runtime.stat.isdir | default(false)) and
+             not (remoteterminal_code_server_repair_runtime.stat.islnk | default(false)) and
+             remoteterminal_code_server_repair_runtime.stat.uid | int == remoteterminal_selected_uid | int and
+             remoteterminal_code_server_repair_runtime.stat.gid | int == remoteterminal_selected_gid | int and
+             remoteterminal_code_server_repair_runtime.stat.mode == '0700')
+        fail_msg: >-
+          Refusing code-server repair because the private runtime directory has
+          an unsafe type, owner, group, or mode.
+      when: remoteterminal_code_server_installed_artifacts.results[0].stat.exists
+
+    - name: Inspect exact private code-server tmux socket before tool replacement
+      ansible.builtin.stat:
+        path: "{{ remoteterminal_runtime_dir }}/code-server.tmux.sock"
+        follow: false
+      register: remoteterminal_code_server_repair_tmux_socket
+      when:
+        - remoteterminal_code_server_installed_artifacts.results[0].stat.exists
+        - remoteterminal_code_server_repair_runtime.stat.exists
+
+    - name: Reject unsafe private code-server tmux socket before tool replacement
+      ansible.builtin.assert:
+        that:
+          - >-
+            not remoteterminal_code_server_repair_tmux_socket.stat.exists or
+            ((remoteterminal_code_server_repair_tmux_socket.stat.issock | default(false)) and
+             not (remoteterminal_code_server_repair_tmux_socket.stat.islnk | default(false)) and
+             remoteterminal_code_server_repair_tmux_socket.stat.uid | int == remoteterminal_selected_uid | int and
+             remoteterminal_code_server_repair_tmux_socket.stat.gid | int == remoteterminal_selected_gid | int and
+             remoteterminal_code_server_repair_tmux_socket.stat.mode == '0600' and
+             remoteterminal_code_server_repair_tmux_socket.stat.nlink | default(0) | int == 1)
+        fail_msg: >-
+          Refusing code-server repair because the exact private tmux socket has
+          an unsafe type, owner, group, or mode.
+      when:
+        - remoteterminal_code_server_installed_artifacts.results[0].stat.exists
+        - remoteterminal_code_server_repair_runtime.stat.exists
+
+    - name: Atomically exchange complete candidate with existing code-server tool
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/python3
+          - -c
+          - |
+            import ctypes
+            import os
+            import sys
+
+            libc = ctypes.CDLL(None, use_errno=True)
+            if libc.renameat2(-100, os.fsencode(sys.argv[1]), -100, os.fsencode(sys.argv[2]), 2) != 0:
+                error_number = ctypes.get_errno()
+                raise OSError(error_number, os.strerror(error_number))
+          - "{{ remoteterminal_code_server_candidate.path }}"
+          - "{{ remoteterminal_code_server_tool_dir }}"
+      changed_when: true
+      when: remoteterminal_code_server_installed_artifacts.results[0].stat.exists
+
+    - name: Atomically promote complete code-server candidate into an empty slot
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/mv
+          - -T
+          - "{{ remoteterminal_code_server_candidate.path }}"
+          - "{{ remoteterminal_code_server_tool_dir }}"
+      changed_when: true
+      when: not remoteterminal_code_server_installed_artifacts.results[0].stat.exists
+  rescue:
+    - name: Remove rejected inactive code-server candidate
+      ansible.builtin.file:
+        path: "{{ remoteterminal_code_server_candidate.path }}"
+        state: absent
+      when: remoteterminal_code_server_candidate.path | default('') | length > 0
+
+    - name: Abort after code-server staging or candidate validation failure
+      ansible.builtin.fail:
+        msg: >-
+          The pinned code-server download, safe extraction, or inactive
+          candidate validation failed. No incomplete code-server tool was
+          activated.
+
+- name: Verify final code-server version as selected account
+  ansible.builtin.command:
+    argv:
+      - "{{ remoteterminal_code_server_tool_dir }}/bin/code-server"
+      - --config
+      - /dev/null
+      - --version
+  register: remoteterminal_code_server_version_result
+  changed_when: false
+  become: true
+  become_user: "{{ remoteterminal_user }}"
+  environment:
+    HOME: "{{ remoteterminal_selected_home }}"
+
+- name: Assert final code-server version
+  ansible.builtin.assert:
+    that:
+      - >-
+        remoteterminal_code_server_version in
+        (remoteterminal_code_server_version_result.stdout ~
+         remoteterminal_code_server_version_result.stderr)
+    fail_msg: >-
+      The atomically installed code-server tool does not report the pinned
+      version {{ remoteterminal_code_server_version }}.
+
+- name: Retain displaced code-server tool until service health verification
+  ansible.builtin.set_fact:
+    remoteterminal_code_server_deferred_cleanup_paths: >-
+      {{ remoteterminal_code_server_deferred_cleanup_paths +
+         [remoteterminal_code_server_candidate.path] }}
+  when:
+    - remoteterminal_code_server_tool_replaced | bool
+    - remoteterminal_code_server_installed_artifacts.results[0].stat.exists
+    - remoteterminal_code_server_candidate.path | default('') | length > 0
+
+- name: Stop only the exact private code-server tmux server after tool replacement
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/tmux
+      - -S
+      - "{{ remoteterminal_runtime_dir }}/code-server.tmux.sock"
+      - kill-server
+  register: remoteterminal_code_server_repair_tmux_stop
+  become: true
+  become_user: "{{ remoteterminal_user }}"
+  environment:
+    HOME: "{{ remoteterminal_selected_home }}"
+  changed_when: remoteterminal_code_server_repair_tmux_stop.rc == 0
+  failed_when:
+    - remoteterminal_code_server_repair_tmux_stop.rc != 0
+    - "'no server running' not in (remoteterminal_code_server_repair_tmux_stop.stderr | lower)"
+    - "'no such file' not in (remoteterminal_code_server_repair_tmux_stop.stderr | lower)"
+  when:
+    - remoteterminal_code_server_tool_replaced | bool
+    - remoteterminal_code_server_installed_artifacts.results[0].stat.exists
+    - remoteterminal_code_server_repair_runtime.stat.exists | default(false)
+    - remoteterminal_code_server_repair_tmux_socket.stat.exists | default(false)

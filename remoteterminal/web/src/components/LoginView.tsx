@@ -8,12 +8,24 @@ interface LoginViewProps {
   message?: string
 }
 
+export function isRemotePlainHTTP(location: Pick<Location, 'protocol' | 'hostname'> = window.location) {
+  const hostname = location.hostname.toLowerCase()
+  const loopback = hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1' || hostname === '[::1]'
+  return location.protocol === 'http:' && !loopback
+}
+
+export function isPlainHTTP(location: Pick<Location, 'protocol'> = window.location) {
+  return location.protocol === 'http:'
+}
+
 export function LoginView({ machineName, onAuthenticated, message }: LoginViewProps) {
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
   const [error, setError] = useState<string | null>(null)
   const [submitting, setSubmitting] = useState(false)
   const passwordRef = useRef<HTMLInputElement>(null)
+  const plaintextTransport = isPlainHTTP()
+  const remoteInsecureOrigin = isRemotePlainHTTP()
 
   const submit = async (event: FormEvent) => {
     event.preventDefault()
@@ -69,7 +81,7 @@ export function LoginView({ machineName, onAuthenticated, message }: LoginViewPr
         </div>
         <div className="login-intro__security">
           <LockIcon />
-          <span>Encrypted connection · System account authentication</span>
+          <span>{plaintextTransport ? 'Plain HTTP · Trusted isolated machine LAN only' : 'Encrypted connection · System account authentication'}</span>
         </div>
       </section>
 
@@ -82,6 +94,14 @@ export function LoginView({ machineName, onAuthenticated, message }: LoginViewPr
           </div>
 
           {message ? <div className="notice notice--info" role="status">{message}</div> : null}
+          {plaintextTransport ? (
+            <div className="notice notice--warning" role="alert">
+              This connection is not encrypted. Your Linux account password and terminal traffic can be observed or changed on the network.
+              {remoteInsecureOrigin
+                ? ' Code Server webviews also require this origin to be explicitly treated as secure by the managed browser.'
+                : null}
+            </div>
+          ) : null}
           {error ? <div className="notice notice--error" role="alert">{error}</div> : null}
 
           <form className="login-form" onSubmit={submit}>
@@ -120,7 +140,9 @@ export function LoginView({ machineName, onAuthenticated, message }: LoginViewPr
           </form>
 
           <p className="login-card__footnote">
-            Credentials are sent once over HTTPS and are never stored in this browser.
+            {plaintextTransport
+              ? 'Credentials are sent once over plaintext HTTP and are never stored in this browser.'
+              : 'Credentials are sent once over HTTPS and are never stored in this browser.'}
           </p>
         </div>
       </section>

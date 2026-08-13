@@ -18,8 +18,16 @@
       ansible.builtin.include_tasks: prepare_build.yml
       when: not ansible_check_mode
 
+    - name: Install pinned Go build toolchain
+      ansible.builtin.include_tasks: install_go.yml
+      when: not ansible_check_mode
+
     - name: Build pinned ttyd dependency
       ansible.builtin.include_tasks: build_ttyd.yml
+      when: not ansible_check_mode
+
+    - name: Install pinned code-server dependency
+      ansible.builtin.include_tasks: install_code_server.yml
       when: not ansible_check_mode
 
     - name: Stage and build Remote Terminal
@@ -34,9 +42,10 @@
       ansible.builtin.debug:
         msg: >-
           Check mode validated preflight inputs and predicted Debian package
-          changes. Source compilation, deployment, service changes, and the
-          HTTPS health probe are intentionally skipped because their outputs do
-          not exist until the build commands run.
+          changes. Pinned dependency download/extraction, source compilation,
+          deployment, service changes, and the selected-transport health probe are
+          intentionally skipped because their outputs do not exist until the
+          corresponding commands run.
       when: ansible_check_mode
 
 - name: Run Remote Terminal uninstall

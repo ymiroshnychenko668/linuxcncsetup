@@ -126,7 +126,7 @@ var mainSections = []section{
 	},
 	{
 		title:       "Install Remote Terminal",
-		description: "Configure secure browser access to this machine's persistent terminal sessions.",
+		description: "Configure browser access to this machine's persistent terminal sessions.",
 		action:      actionOpenRemoteTerminal,
 	},
 	{
@@ -182,7 +182,7 @@ var mainSections = []section{
 var remoteTerminalSections = []section{
 	{
 		title:       "Remote Terminal settings",
-		description: "Name this machine and choose the local account, LAN address, and HTTPS port.",
+		description: "Name this machine and choose the local account, LAN address, transport, and port.",
 		action:      actionInstallRemoteTerminal,
 	},
 }
@@ -624,7 +624,7 @@ func (m Model) helpText(compact bool) string {
 		helpText = "↑/↓ select • Space/Enter toggle • Enter continue • Esc back"
 	}
 	if m.page == menuRemoteTerminal {
-		helpText = "Type to edit • ↑/↓/Tab field • Backspace erase • Enter review • Esc back"
+		helpText = "Type to edit • ↑/↓/Tab field • ←/→/Space transport • Enter review • Esc back"
 	}
 	if m.confirming {
 		helpText = "PgUp/PgDn details • y confirm • n/Esc cancel • q quit"
@@ -644,7 +644,7 @@ func (m Model) helpText(compact bool) string {
 		helpText = "↑/↓ • Pg keys • Enter • r • Esc"
 	}
 	if m.page == menuRemoteTerminal {
-		helpText = "Tab field • type • Enter • Esc"
+		helpText = "Tab field • ←/→ transport • type • Enter • Esc"
 	}
 	if m.confirming {
 		helpText = "Pg details • y yes • n no"
