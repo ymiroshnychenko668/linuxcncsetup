@@ -251,7 +251,7 @@ func TestManagerRealProcessLifecycle(t *testing.T) {
 	requireTmuxColorEnvironment(t, tmuxBinary, manager.tmuxSocket(), "-t", tmuxTarget(created.ID))
 	if output, err := exec.CommandContext(ctx, tmuxBinary, "-S", manager.tmuxSocket(),
 		"show-options", "-sv", tmuxClipboardOption).CombinedOutput(); err != nil || strings.TrimSpace(string(output)) != tmuxClipboardTerminalOverride {
-		t.Fatalf("Connect did not configure browser clipboard integration: %v (%s)", err, strings.TrimSpace(string(output)))
+		t.Fatalf("Connect did not remove the tmux terminal clipboard capability: %v (%s)", err, strings.TrimSpace(string(output)))
 	}
 	configuredTerminalOverrides := integrationCommand(t, tmuxBinary, "-S", manager.tmuxSocket(),
 		"show-options", "-s", "terminal-overrides")
@@ -263,7 +263,7 @@ func TestManagerRealProcessLifecycle(t *testing.T) {
 	}
 	if output, err := exec.CommandContext(ctx, tmuxBinary, "-S", manager.tmuxSocket(),
 		"show-options", "-sv", tmuxClipboardModeOption).CombinedOutput(); err != nil || strings.TrimSpace(string(output)) != tmuxClipboardMode {
-		t.Fatalf("Connect did not restrict browser clipboard integration: %v (%s)", err, strings.TrimSpace(string(output)))
+		t.Fatalf("Connect did not disable tmux clipboard integration: %v (%s)", err, strings.TrimSpace(string(output)))
 	}
 	for _, table := range []string{"copy-mode", "copy-mode-vi"} {
 		output, err := exec.CommandContext(ctx, tmuxBinary, "-S", manager.tmuxSocket(),
@@ -312,9 +312,6 @@ func TestManagerRealProcessLifecycle(t *testing.T) {
 		t.Fatalf("proxied ttyd index: status=%d bytes=%d contains-ttyd=%t",
 			response.StatusCode, len(body), bytes.Contains(bytes.ToLower(body), []byte("ttyd")))
 	}
-	if !bytes.Contains(body, []byte("navigator.clipboard.writeText")) {
-		t.Fatal("proxied ttyd frontend does not contain the OSC 52 browser clipboard provider")
-	}
 	t.Logf("Connect/Proxy: ttyd_pid=%d socket=%s HTTP=%d body_bytes=%d",
 		ttydPID, ttydSocket, response.StatusCode, len(body))
 
@@ -362,17 +359,29 @@ func TestManagerRealProcessLifecycle(t *testing.T) {
 		t.Fatalf("distinctive command output: %v; output=%q", err, firstOutput)
 	}
 	copyTmuxLineWithMouseBinding(t, ctx, tmuxBinary, manager.tmuxSocket(), tmuxTarget(created.ID), string(executedMarker))
-	clipboardText, err := manager.LatestSelection(ctx, created.ID)
+	clipboardText, err := manager.TakeLatestSelection(ctx, created.ID)
 	if err != nil {
 		t.Fatalf("read session-scoped mouse selection: %v", err)
 	}
 	if clipboardText != string(executedMarker) {
 		t.Fatalf("session-scoped mouse selection = %q, want %q", clipboardText, executedMarker)
 	}
-	clipboardSequence := []byte("\x1b]52;c;" + base64.StdEncoding.EncodeToString([]byte(clipboardText)) + "\a")
-	clipboardOutput, err := firstWS.readTTydOutputUntil(clipboardSequence, 8*time.Second)
-	if err != nil {
-		t.Fatalf("OSC 52 browser clipboard output: %v; output=%q", err, clipboardOutput)
+	if _, err := manager.TakeLatestSelection(ctx, created.ID); !errors.Is(err, ErrNoSelection) {
+		t.Fatalf("consumed first session selection remained available: %v", err)
+	}
+	copyTmuxLineWithMouseBinding(t, ctx, tmuxBinary, manager.tmuxSocket(), tmuxTarget(created.ID), string(executedMarker))
+	if err := manager.DiscardSelections(ctx, created.ID); err != nil {
+		t.Fatalf("discard stale session-scoped selection without reading it: %v", err)
+	}
+	if _, err := manager.TakeLatestSelection(ctx, created.ID); !errors.Is(err, ErrNoSelection) {
+		t.Fatalf("discarded session selection remained available: %v", err)
+	}
+	copyTmuxLineWithMouseBinding(t, ctx, tmuxBinary, manager.tmuxSocket(), tmuxTarget(created.ID), string(executedMarker))
+	if _, _, err := manager.Connect(ctx, created.ID); err != nil {
+		t.Fatalf("reconnect browser clipboard boundary: %v", err)
+	}
+	if _, err := manager.TakeLatestSelection(ctx, created.ID); !errors.Is(err, ErrNoSelection) {
+		t.Fatalf("Connect retained a selection from the previous browser view: %v", err)
 	}
 
 	other, err := manager.Create(ctx, "Other clipboard integration")
@@ -401,13 +410,12 @@ func TestManagerRealProcessLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 	copyTmuxLineWithMouseBinding(t, ctx, tmuxBinary, manager.tmuxSocket(), otherTarget, otherMarker)
-	otherClipboardText, err := manager.LatestSelection(ctx, other.ID)
+	otherClipboardText, err := manager.TakeLatestSelection(ctx, other.ID)
 	if err != nil || otherClipboardText != otherMarker {
 		t.Fatalf("second session selection = %q, %v; want %q", otherClipboardText, err, otherMarker)
 	}
-	firstClipboardText, err := manager.LatestSelection(ctx, created.ID)
-	if err != nil || firstClipboardText != clipboardText {
-		t.Fatalf("newer selection from another session replaced first selection: got %q, %v; want %q", firstClipboardText, err, clipboardText)
+	if _, err := manager.TakeLatestSelection(ctx, created.ID); !errors.Is(err, ErrNoSelection) {
+		t.Fatalf("selection from another session became visible in first session: %v", err)
 	}
 	t.Logf("WebSocket: HTTP=101 subprotocol=%s command_marker=%s", firstWS.subprotocol, executedMarker)
 	if err := firstWS.Close(); err != nil {

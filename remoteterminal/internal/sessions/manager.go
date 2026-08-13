@@ -48,9 +48,9 @@ const (
 	tmuxSelectionBufferPrefix     = "rtclip-"
 	tmuxSelectionBindingPrefix    = tmuxSelectionBufferPrefix + "#{session_name}-"
 	tmuxClipboardModeOption       = "set-clipboard"
-	tmuxClipboardMode             = "external"
+	tmuxClipboardMode             = "off"
 	tmuxClipboardOption           = "terminal-overrides[99]"
-	tmuxClipboardTerminalOverride = `xterm-256color:Tc:Ms=\E]52;c;%p2%s\007`
+	tmuxClipboardTerminalOverride = `xterm-256color:Tc`
 	tmuxStatusOption              = "status"
 	tmuxStatusMode                = "off"
 	tmuxHistoryLimitOption        = "history-limit"
@@ -64,6 +64,7 @@ const (
 	tmuxColorEnvironmentValue     = "truecolor"
 	tmuxNoColorEnvironment        = "NO_COLOR"
 	ttydRendererPreference        = "rendererType=canvas"
+	ttydMacSelectionPreference    = "macOptionClickForcesSelection=true"
 	ttydThemePreference           = `theme={"foreground":"` + terminalForegroundColor + `","background":"` + terminalBackgroundColor + `"}`
 )
 
@@ -219,8 +220,14 @@ func (m *Manager) Initialize(ctx context.Context) error {
 			return fmt.Errorf("remove stale ttyd state: %w", err)
 		}
 	}
+	if _, err := m.privateTmuxSocketAvailable(); err != nil {
+		return fmt.Errorf("clean stale terminal selections: %w", err)
+	}
 	if _, err := m.List(ctx); err != nil {
 		return fmt.Errorf("discover tmux sessions: %w", err)
+	}
+	if err := m.cleanupOwnedSelectionBuffers(ctx); err != nil {
+		return fmt.Errorf("clean stale terminal selections: %w", err)
 	}
 	return nil
 }
@@ -231,12 +238,14 @@ func (m *Manager) List(ctx context.Context) ([]Session, error) {
 	return m.listLocked(ctx)
 }
 
-// LatestSelection returns the newest paste buffer created by a mouse selection
-// in the requested session. tmux paste buffers are server-global, so Connect
-// gives drag selections a prefix derived from tmux's private, immutable session
-// name. This method only considers that prefix and reads the chosen buffer by
-// its exact name, preventing a selection from another session being returned.
-func (m *Manager) LatestSelection(ctx context.Context, id string) (string, error) {
+// TakeLatestSelection returns and consumes the newest paste buffer created by a
+// mouse selection in the requested session. tmux paste buffers are
+// server-global, so Connect gives drag selections a prefix derived from tmux's
+// private, immutable session name. This method only considers that prefix,
+// reads the chosen buffer by its exact name, and removes every matching buffer
+// before returning the text. A successful selection can therefore be returned
+// only once and a selection from another session is never read or removed.
+func (m *Manager) TakeLatestSelection(ctx context.Context, id string) (string, error) {
 	if !ValidID(id) {
 		return "", ErrInvalidID
 	}
@@ -254,18 +263,18 @@ func (m *Manager) LatestSelection(ctx context.Context, id string) (string, error
 	if err != nil {
 		return "", commandError("inspect terminal selections", bufferOutput, err)
 	}
-	bufferName, size, err := latestSelectionBuffer(bufferOutput, id)
-	if err != nil {
-		return "", err
-	}
+	bufferName, size, matchingBuffers, err := sessionSelectionBuffers(bufferOutput, id)
 	if bufferName == "" {
 		return "", ErrNoSelection
 	}
+	if err != nil {
+		return "", m.consumeSelectionErrorLocked(ctx, matchingBuffers, err)
+	}
 	if size == 0 {
-		return "", ErrNoSelection
+		return "", m.consumeSelectionErrorLocked(ctx, matchingBuffers, ErrNoSelection)
 	}
 	if size > maxSelectionBytes {
-		return "", ErrSelectionTooLarge
+		return "", m.consumeSelectionErrorLocked(ctx, matchingBuffers, ErrSelectionTooLarge)
 	}
 
 	selection, err := m.runner.Run(ctx, m.config.TmuxBinary,
@@ -277,35 +286,76 @@ func (m *Manager) LatestSelection(ctx context.Context, id string) (string, error
 		return "", fmt.Errorf("read terminal selection: %w", err)
 	}
 	if len(selection) == 0 {
-		return "", ErrNoSelection
+		return "", m.consumeSelectionErrorLocked(ctx, matchingBuffers, ErrNoSelection)
 	}
 	if len(selection) > maxSelectionBytes {
-		return "", ErrSelectionTooLarge
+		return "", m.consumeSelectionErrorLocked(ctx, matchingBuffers, ErrSelectionTooLarge)
 	}
 	if !utf8.Valid(selection) {
-		return "", ErrInvalidSelection
+		return "", m.consumeSelectionErrorLocked(ctx, matchingBuffers, ErrInvalidSelection)
+	}
+	if err := m.deleteSelectionBuffersLocked(ctx, matchingBuffers, false); err != nil {
+		return "", err
 	}
 	return string(selection), nil
 }
 
-// latestSelectionBuffer selects the first matching entry because tmux lists
-// buffers newest first. Automatic paste-buffer names end in a decimal counter;
-// requiring that suffix avoids accepting an unrelated manually named buffer
-// which only happens to share the prefix.
-func latestSelectionBuffer(output []byte, id string) (string, uint64, error) {
+// DiscardSelections removes every pending mouse-selection buffer for a
+// session without reading its contents. The browser uses this as a source
+// barrier after it captures an xterm-forced selection: while the copy dialog
+// blocks further terminal interaction, all older tmux selections are removed
+// so they cannot reappear on the next Copy selection action.
+func (m *Manager) DiscardSelections(ctx context.Context, id string) error {
+	if !ValidID(id) {
+		return ErrInvalidID
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.shuttingDown {
+		return ErrShuttingDown
+	}
+	if _, err := m.findLocked(ctx, id); err != nil {
+		return err
+	}
+	return m.deleteSessionSelectionBuffersLocked(ctx, id)
+}
+
+// sessionSelectionBuffers selects the first matching entry because tmux lists
+// buffers newest first and also returns every matching name for one-shot
+// cleanup. The binding's generated paste-buffer names end in a decimal
+// counter, so every accepted name must stay inside that exact reserved shape.
+// Processes running as the same service account already share the private tmux
+// trust boundary and could intentionally create an indistinguishable name.
+func sessionSelectionBuffers(output []byte, id string) (string, uint64, []string, error) {
 	prefix := tmuxSelectionPrefix(id)
+	var newestName string
+	var newestSize uint64
+	matching := make([]string, 0)
+	seen := make(map[string]struct{})
+	var sizeErr error
 	for _, line := range strings.Split(string(output), "\n") {
 		name, rawSize, ok := strings.Cut(line, "\t")
 		if !ok || !validSelectionBufferName(name, prefix) {
 			continue
 		}
+		if _, duplicate := seen[name]; duplicate {
+			continue
+		}
+		seen[name] = struct{}{}
+		matching = append(matching, name)
+		if newestName != "" {
+			continue
+		}
 		size, err := strconv.ParseUint(rawSize, 10, 64)
 		if err != nil {
-			return "", 0, fmt.Errorf("inspect terminal selection: invalid tmux buffer size %q", rawSize)
+			sizeErr = fmt.Errorf("inspect terminal selection: invalid tmux buffer size %q", rawSize)
+			newestName = name
+			continue
 		}
-		return name, size, nil
+		newestName = name
+		newestSize = size
 	}
-	return "", 0, nil
+	return newestName, newestSize, matching, sizeErr
 }
 
 func tmuxSelectionPrefix(id string) string {
@@ -322,6 +372,111 @@ func validSelectionBufferName(name, prefix string) bool {
 		}
 	}
 	return true
+}
+
+// validOwnedSelectionBufferName recognizes the exact namespace reserved for
+// this service's mouse binding. A matching-looking buffer with an invalid
+// session ID or a non-decimal counter is never removed at startup.
+func validOwnedSelectionBufferName(name string) bool {
+	const targetPrefix = tmuxSelectionBufferPrefix + "rt_"
+	if !strings.HasPrefix(name, targetPrefix) {
+		return false
+	}
+	id, counter, ok := strings.Cut(name[len(targetPrefix):], "-")
+	if !ok || !ValidID(id) || counter == "" {
+		return false
+	}
+	for _, character := range counter {
+		if character < '0' || character > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func (m *Manager) cleanupOwnedSelectionBuffers(ctx context.Context) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	available, err := m.privateTmuxSocketAvailable()
+	if err != nil {
+		return err
+	}
+	if !available {
+		return nil
+	}
+	output, err := m.runner.Run(ctx, m.config.TmuxBinary,
+		"-S", m.tmuxSocket(), "list-buffers", "-F", tmuxSelectionListFormat)
+	if err != nil {
+		return commandError("inspect stale terminal selections", output, err)
+	}
+	names := make([]string, 0)
+	seen := make(map[string]struct{})
+	for _, line := range strings.Split(string(output), "\n") {
+		name, _, ok := strings.Cut(line, "\t")
+		if !ok || !validOwnedSelectionBufferName(name) {
+			continue
+		}
+		if _, duplicate := seen[name]; duplicate {
+			continue
+		}
+		seen[name] = struct{}{}
+		names = append(names, name)
+	}
+	return m.deleteSelectionBuffersLocked(ctx, names, true)
+}
+
+func (m *Manager) privateTmuxSocketAvailable() (bool, error) {
+	info, err := os.Lstat(m.tmuxSocket())
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("inspect private tmux socket: %w", err)
+	}
+	// Lstat deliberately rejects an existing link at each check. The private
+	// runtime directory and tmux server share one service-account trust boundary;
+	// this guard is defense in depth, not isolation from that same UID.
+	if info.Mode()&os.ModeSocket == 0 {
+		return false, errors.New("private tmux socket path is not a Unix socket")
+	}
+	return true, nil
+}
+
+func (m *Manager) deleteSelectionBuffersLocked(ctx context.Context, names []string, verifyPrivateSocket bool) error {
+	// tmux lists buffers newest first. Delete the selected newest buffer last so
+	// a failure while removing stale predecessors leaves it available to retry.
+	for index := len(names) - 1; index >= 0; index-- {
+		name := names[index]
+		// Keep the final guard next to the destructive command even though both
+		// callers build the list with stricter, context-specific validators.
+		if !validOwnedSelectionBufferName(name) {
+			return errors.New("refusing to remove an unowned tmux buffer")
+		}
+		if verifyPrivateSocket {
+			available, err := m.privateTmuxSocketAvailable()
+			if err != nil {
+				return err
+			}
+			if !available {
+				return errors.New("private tmux socket disappeared during selection cleanup")
+			}
+		}
+		if _, err := m.runner.Run(ctx, m.config.TmuxBinary,
+			"-S", m.tmuxSocket(), "delete-buffer", "-b", name); err != nil {
+			// tmux command output is intentionally discarded: an implementation
+			// or test double may include clipboard contents in failing output.
+			return fmt.Errorf("remove terminal selection buffer %q: %w", name, err)
+		}
+	}
+	return nil
+}
+
+func (m *Manager) consumeSelectionErrorLocked(ctx context.Context, names []string, selectionErr error) error {
+	if err := m.deleteSelectionBuffersLocked(ctx, names, false); err != nil {
+		return err
+	}
+	return selectionErr
 }
 
 func parseTmuxWindowTargets(output []byte) ([]string, error) {
@@ -501,10 +656,28 @@ func (m *Manager) Delete(ctx context.Context, id string) error {
 		return err
 	}
 	m.stopProcessLocked(id, 2*time.Second)
+	if err := m.deleteSessionSelectionBuffersLocked(ctx, id); err != nil {
+		return err
+	}
 	output, err := m.runner.Run(ctx, m.config.TmuxBinary,
 		"-S", m.tmuxSocket(), "kill-session", "-t", tmuxTarget(id))
 	if err != nil {
 		return commandError("delete tmux session", output, err)
+	}
+	return nil
+}
+
+func (m *Manager) deleteSessionSelectionBuffersLocked(ctx context.Context, id string) error {
+	output, err := m.runner.Run(ctx, m.config.TmuxBinary,
+		"-S", m.tmuxSocket(), "list-buffers", "-F", tmuxSelectionListFormat)
+	if err != nil {
+		return commandError("inspect session selection buffers", output, err)
+	}
+	_, _, names, _ := sessionSelectionBuffers(output, id)
+	// Buffer names are sufficient for cleanup; malformed size metadata must not
+	// prevent a session-boundary or explicit privacy cleanup.
+	if err := m.deleteSelectionBuffersLocked(ctx, names, false); err != nil {
+		return err
 	}
 	return nil
 }
@@ -522,6 +695,14 @@ func (m *Manager) Connect(ctx context.Context, id string) (Session, string, erro
 	}
 	session, err := m.findLocked(ctx, id)
 	if err != nil {
+		return Session{}, "", err
+	}
+	// A browser mount/reload is a fresh clipboard-source boundary. Remove any
+	// selection buffers left by an older view before this terminal can become
+	// copy-enabled again. The frontend keeps Copy selection disabled until this
+	// Connect call has completed and the ttyd iframe has loaded, so an aborted
+	// xterm discard cannot resurface after reload, logout, or auth expiry.
+	if err := m.deleteSessionSelectionBuffersLocked(ctx, id); err != nil {
 		return Session{}, "", err
 	}
 	// Reapply the explicit default colours before even reusing an existing ttyd
@@ -551,21 +732,19 @@ func (m *Manager) Connect(ctx context.Context, id string) (Session, string, erro
 			}
 		}
 	}
-	// tmux normally emits OSC 52 with an empty clipboard selector, while ttyd's
-	// xterm clipboard addon accepts the explicit "c" system-clipboard selector.
-	// The private server always exposes ttyd as xterm-256color. Use a stable
-	// indexed override so repeated connects are idempotent without replacing the
-	// built-in terminal-overrides shipped by tmux 3.1. Tc preserves true colour
-	// and the explicit "c" OSC 52 selector is accepted by ttyd's clipboard
-	// addon. External mode lets tmux copy out but prevents pane applications
-	// from setting the browser clipboard through tmux.
+	// Keep clipboard transfer out of the terminal protocol: the authenticated,
+	// one-shot HTTP endpoint is the only clipboard source. The private server
+	// always exposes ttyd as xterm-256color. A stable indexed override makes
+	// repeated connects idempotent without replacing tmux's built-in overrides;
+	// Tc preserves true colour while deliberately omitting the Ms/OSC 52
+	// capability.
 	if output, err := m.runner.Run(ctx, m.config.TmuxBinary,
 		"-S", m.tmuxSocket(), "set-option", "-s", tmuxClipboardModeOption, tmuxClipboardMode); err != nil {
 		return Session{}, "", commandError("restrict tmux clipboard integration", output, err)
 	}
 	if output, err := m.runner.Run(ctx, m.config.TmuxBinary,
 		"-S", m.tmuxSocket(), "set-option", "-s", tmuxClipboardOption, tmuxClipboardTerminalOverride); err != nil {
-		return Session{}, "", commandError("enable browser clipboard integration", output, err)
+		return Session{}, "", commandError("restrict tmux terminal clipboard capability", output, err)
 	}
 	// Sanitize both scopes. The global environment covers future sessions and
 	// the target environment covers future panes in sessions recovered from an
@@ -589,12 +768,11 @@ func (m *Manager) Connect(ctx context.Context, id string) (Session, string, erro
 	}
 	// tmux paste buffers are shared by every session in a server. Copy the drag
 	// selection directly with a format-expanded prefix based on the private tmux
-	// session name. copy-selection-and-cancel creates the paste buffer and emits
-	// OSC 52 when set-clipboard is external; unlike copy-pipe-and-cancel, it does
-	// not require a command argument on tmux 3.1. The API can then retrieve this
-	// session's selection without exposing another terminal's most recent
-	// buffer. Configure both stock copy-mode key tables because the mode-keys
-	// option may select either one.
+	// session name. copy-selection-and-cancel creates the paste buffer without a
+	// shell command; with set-clipboard off it cannot emit OSC 52. The API can
+	// then consume this session's selection without exposing another terminal's
+	// most recent buffer. Configure both stock copy-mode key tables because the
+	// mode-keys option may select either one.
 	for _, table := range []string{"copy-mode", "copy-mode-vi"} {
 		if output, err := m.runner.Run(ctx, m.config.TmuxBinary,
 			"-S", m.tmuxSocket(), "bind-key", "-T", table, "MouseDragEnd1Pane",
@@ -805,6 +983,7 @@ func TtydArguments(tmuxBinary, tmuxSocket, ttydSocket, id string) []string {
 		"-W",
 		"-O",
 		"-t", ttydRendererPreference,
+		"-t", ttydMacSelectionPreference,
 		"-t", ttydThemePreference,
 		"-b", terminalBasePath(id),
 		"-i", ttydSocket,

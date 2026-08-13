@@ -68,12 +68,23 @@ remoteterminal_deployment_applied_marker: "{{ remoteterminal_config_dir }}/deplo
 # reported by Ansible facts at install time.
 remoteterminal_validate_listen_address_is_local: true
 
-# ttyd 1.7.7 plus upstream xterm clipboard support is pinned by both an
-# immutable commit URL and archive digest.
+# ttyd 1.7.7 is pinned by both an immutable commit URL and archive digest. Its
+# checked-in web header is not used as-is: the role applies the bundled patch,
+# verifies the complete patched html/ source manifest, and regenerates
+# src/html.h with the exact Corepack/Yarn toolchain below before C compilation.
 remoteterminal_ttyd_version: "1.7.7"
 remoteterminal_ttyd_commit: b1eaaee2ca70774c6cb045645914ebc27a70dedd
 remoteterminal_ttyd_archive_url: "https://github.com/tsl0922/ttyd/archive/b1eaaee2ca70774c6cb045645914ebc27a70dedd.tar.gz"
 remoteterminal_ttyd_archive_checksum: "sha256:0d7081e59aba7245782647f10e7a81cd7b0f63041c41a62dd81caf07e7d6db86"
+remoteterminal_ttyd_corepack_version: "0.29.4"
+remoteterminal_ttyd_corepack_package_url: "https://registry.npmjs.org/corepack/-/corepack-0.29.4.tgz"
+remoteterminal_ttyd_corepack_package_checksum: "sha256:ebd45f1694cb56bfc114fc05b9322ac6c60fb535e5c33af17dfb913a796668c4"
+remoteterminal_ttyd_yarn_version: "3.6.3"
+remoteterminal_ttyd_yarn_binary_checksum: "sha256:08ead1821a257416e6f217e89365425bf4b6d2430c3279318bedcec1a245fff5"
+remoteterminal_ttyd_web_patch_filename: ttyd-disable-browser-clipboard.patch
+# SHA-256 of the sorted `relative/path:sha256` manifest for every regular file
+# below html/ after the bundled patch has been applied to the pinned archive.
+remoteterminal_ttyd_web_inputs_digest: 93a1f8ef447a761164d2e5b86d00a5eb9e061aa10fc6fb25796d1e270289fd61
 
 # The backend is built with the official Go AMD64 distribution instead of the
 # distribution-packaged compiler, whose version is too old on supported releases.
@@ -120,6 +131,7 @@ remoteterminal_apt_packages:
   - nodejs
   - npm
   - openssl
+  - patch
   - pkg-config
   - pamtester
   - rsync

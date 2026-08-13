@@ -41,7 +41,8 @@ type SessionManager interface {
 	Create(context.Context, string) (sessions.Session, error)
 	Delete(context.Context, string) error
 	Connect(context.Context, string) (sessions.Session, string, error)
-	LatestSelection(context.Context, string) (string, error)
+	TakeLatestSelection(context.Context, string) (string, error)
+	DiscardSelections(context.Context, string) error
 	Proxy(context.Context, string) (http.Handler, error)
 	ActiveTerminals() int
 }
@@ -480,14 +481,34 @@ func (s *Server) sessionItem(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	if len(parts) == 2 && parts[1] == "clipboard" && r.Method == http.MethodGet {
-		selection, err := s.sessions.LatestSelection(r.Context(), id)
+	if len(parts) == 2 && parts[1] == "clipboard" && r.Method == http.MethodPost {
+		if !s.authorizeMutation(w, r, authSession) {
+			return
+		}
+		selection, err := s.sessions.TakeLatestSelection(r.Context(), id)
 		if err != nil {
 			s.sessionError(w, "read tmux selection", err)
 			return
 		}
 		w.Header().Set("Cache-Control", "no-store")
 		writeJSON(w, http.StatusOK, map[string]string{"text": selection})
+		return
+	}
+	if len(parts) == 2 && parts[1] == "clipboard" && r.Method == http.MethodDelete {
+		if !s.authorizeMutation(w, r, authSession) {
+			return
+		}
+		// Once authorized, finish this short idempotent privacy cleanup even if
+		// the browser closes or reloads while the source-barrier request is in
+		// flight. This prevents an older tmux buffer resurfacing after an xterm
+		// selection was already shown to the user.
+		discardContext, cancelDiscard := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancelDiscard()
+		if err := s.sessions.DiscardSelections(discardContext, id); err != nil {
+			s.sessionError(w, "discard stale tmux selections", err)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 	if len(parts) == 1 {
@@ -499,7 +520,7 @@ func (s *Server) sessionItem(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if len(parts) == 2 && parts[1] == "clipboard" {
-		methodNotAllowed(w, http.MethodGet)
+		methodNotAllowed(w, http.MethodPost, http.MethodDelete)
 		return
 	}
 	writeError(w, http.StatusNotFound, "not_found", "The requested resource was not found.")
@@ -531,6 +552,10 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) terminal(w http.ResponseWriter, r *http.Request) {
+	// The terminal client never owns the system clipboard. Explicitly narrow
+	// the route-level policy as defense in depth; code-server has its own proxy
+	// policy and is unaffected.
+	w.Header().Set("Permissions-Policy", "clipboard-read=(), clipboard-write=()")
 	if atomic.LoadUint32(&s.shuttingDown) != 0 {
 		writeError(w, http.StatusServiceUnavailable, "shutting_down", "The service is shutting down.")
 		return

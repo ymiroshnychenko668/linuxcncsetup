@@ -166,15 +166,30 @@ describe('api security contract', () => {
     await expect(api.connectSession('session-id')).rejects.toMatchObject({ code: 'invalid_response' })
   })
 
-  it('loads the latest tmux selection without placing it in browser storage', async () => {
+  it('takes or discards tmux selections with CSRF-protected one-shot mutations and does not store them', async () => {
     const fetchMock = vi.mocked(fetch)
-    fetchMock.mockResolvedValueOnce(jsonResponse({ text: 'selected text\nрядок' }))
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({
+        authenticated: true,
+        user: { username: 'operator' },
+        csrfToken: 'csrf-secret',
+      }))
+      .mockResolvedValueOnce(jsonResponse({ text: 'selected text\nрядок' }))
+      .mockResolvedValueOnce(new Response(null, { status: 204 }))
 
-    await expect(api.getLatestSelection('session/id')).resolves.toBe('selected text\nрядок')
-    expect(fetchMock).toHaveBeenCalledWith(
-      '/api/sessions/session%2Fid/clipboard',
-      expect.objectContaining({ cache: 'no-store', credentials: 'same-origin' }),
-    )
+    await api.login('operator', 'password')
+    await expect(api.takeLatestSelection('session/id')).resolves.toBe('selected text\nрядок')
+    await expect(api.discardSelections('session/id')).resolves.toBeUndefined()
+    expect(fetchMock.mock.calls[1][0]).toBe('/api/sessions/session%2Fid/clipboard')
+    expect(fetchMock.mock.calls[1][1]).toMatchObject({
+      method: 'POST',
+      cache: 'no-store',
+      credentials: 'same-origin',
+    })
+    expect(new Headers(fetchMock.mock.calls[1][1]?.headers).get('X-CSRF-Token')).toBe('csrf-secret')
+    expect(fetchMock.mock.calls[2][0]).toBe('/api/sessions/session%2Fid/clipboard')
+    expect(fetchMock.mock.calls[2][1]).toMatchObject({ method: 'DELETE', credentials: 'same-origin' })
+    expect(new Headers(fetchMock.mock.calls[2][1]?.headers).get('X-CSRF-Token')).toBe('csrf-secret')
     expect(localStorage.length).toBe(0)
   })
 

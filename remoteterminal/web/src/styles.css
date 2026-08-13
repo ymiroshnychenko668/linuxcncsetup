@@ -378,6 +378,7 @@ kbd { display: inline-grid; min-width: 24px; min-height: 23px; place-items: cent
 .modal-backdrop { position: fixed; z-index: 100; display: grid; inset: 0; place-items: center; padding: 24px; background: rgba(0,0,0,.72); backdrop-filter: blur(5px); animation: fade-in .14s ease-out; }
 .modal { display: flex; width: min(100%, 470px); max-height: calc(100dvh - 48px); overflow: hidden; flex-direction: column; border: 1px solid #33403e; border-radius: 13px; background: #101516; box-shadow: 0 28px 90px rgba(0,0,0,.55); animation: rise-in .16s ease-out; }
 .modal--folder-picker { width: min(100%, 680px); height: min(680px, calc(100dvh - 48px)); }
+.modal--copy-selection { width: min(100%, 760px); }
 .modal--folder-picker .modal__body { display: flex; flex: 1 1 auto; overflow-y: auto; }
 @keyframes fade-in { from { opacity: 0; } }
 @keyframes rise-in { from { opacity: 0; transform: translateY(8px) scale(.985); } }
@@ -398,6 +399,25 @@ kbd { display: inline-grid; min-width: 24px; min-height: 23px; place-items: cent
 .shortcut-grid > div { display: flex; min-height: 38px; align-items: center; gap: 5px; color: var(--faint); font-size: 10px; }
 .shortcut-grid > div > span:first-child { flex: 1; color: #c5cec9; font-size: 12px; }
 .shortcut-grid + .modal-note { margin-top: 20px; padding-top: 17px; border-top: 1px solid var(--line-soft); }
+.copy-selection-field { display: grid; gap: 8px; color: #c8d1cc; font-size: 12px; font-weight: 650; }
+.copy-selection-textarea {
+  display: block;
+  width: 100%;
+  min-height: 260px;
+  max-height: 55dvh;
+  resize: vertical;
+  padding: 12px;
+  overflow: auto;
+  border: 1px solid #3b4947;
+  border-radius: 8px;
+  outline: none;
+  color: #e4ece8;
+  background: #080c0d;
+  font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  white-space: pre;
+}
+.copy-selection-textarea:focus { border-color: var(--green); box-shadow: 0 0 0 2px rgba(83,190,96,.16); }
+.copy-selection-field + .modal-note { margin-top: 12px; }
 .folder-picker { display: grid; width: 100%; height: 100%; min-height: 300px; flex: 1 1 auto; grid-template-rows: auto 27px minmax(0, 1fr) auto; gap: 11px; }
 .folder-path-form { display: grid; gap: 7px; }
 .folder-path-form label { color: #c8d1cc; font-size: 12px; font-weight: 650; }
@@ -465,6 +485,7 @@ kbd { display: inline-grid; min-width: 24px; min-height: 23px; place-items: cent
   .modal-backdrop { align-items: end; padding: 0; }
   .modal { width: 100%; max-height: 100dvh; border-right: 0; border-bottom: 0; border-left: 0; border-radius: 15px 15px 0 0; }
   .modal--folder-picker { height: min(680px, 100dvh); }
+  .copy-selection-textarea { min-height: 42dvh; max-height: 56dvh; }
   .modal__footer { flex-wrap: wrap; }
   .modal__footer .button { flex: 1; }
   .workspace-empty { padding: 25px 19px; }

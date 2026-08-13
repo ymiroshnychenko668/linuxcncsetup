@@ -46,6 +46,7 @@ func TestMaterializeProvidesProductionInstallTreeOutsideCheckout(t *testing.T) {
 		"go.sum",
 		"ansible/install.yml",
 		"ansible/roles/remoteterminal/defaults/main.yml",
+		"ansible/roles/remoteterminal/files/ttyd-disable-browser-clipboard.patch",
 		"ansible/roles/remoteterminal/handlers/main.yml",
 		"ansible/roles/remoteterminal/tasks/main.yml",
 		"ansible/roles/remoteterminal/tasks/build_application.yml",
@@ -74,6 +75,7 @@ func TestMaterializeProvidesProductionInstallTreeOutsideCheckout(t *testing.T) {
 		"web/src/main.tsx",
 		"web/src/components/LoginView.tsx",
 		"web/src/components/CodeServerPanel.tsx",
+		"web/src/components/CopySelectionModal.tsx",
 		"web/src/components/LaunchCodeServerModal.tsx",
 		"web/src/components/ShutdownCodeServerModal.tsx",
 		"web/src/components/TerminalPanel.tsx",
@@ -427,6 +429,137 @@ func TestPinnedToolCompletionMarkersUseLineBasedComparisons(t *testing.T) {
 	}
 	if strings.Contains(string(codeServerTasks), "completion_prefix | trim) ~ '\\n'") {
 		t.Fatal("code-server reuse check still constructs a literal backslash-n marker")
+	}
+}
+
+func TestPinnedTtydWebBuildRegeneratesPatchedHeader(t *testing.T) {
+	read := func(relativePath string) string {
+		contents, err := os.ReadFile(filepath.Join("ansible", "roles", "remoteterminal", relativePath))
+		if err != nil {
+			t.Fatalf("read %s: %v", relativePath, err)
+		}
+		return string(contents)
+	}
+
+	defaults := read("defaults/main.yml")
+	for _, pin := range []string{
+		`remoteterminal_ttyd_commit: b1eaaee2ca70774c6cb045645914ebc27a70dedd`,
+		`remoteterminal_ttyd_corepack_version: "0.29.4"`,
+		`remoteterminal_ttyd_corepack_package_checksum: "sha256:ebd45f1694cb56bfc114fc05b9322ac6c60fb535e5c33af17dfb913a796668c4"`,
+		`remoteterminal_ttyd_yarn_version: "3.6.3"`,
+		`remoteterminal_ttyd_yarn_binary_checksum: "sha256:08ead1821a257416e6f217e89365425bf4b6d2430c3279318bedcec1a245fff5"`,
+		`remoteterminal_ttyd_web_patch_filename: ttyd-disable-browser-clipboard.patch`,
+		`remoteterminal_ttyd_web_inputs_digest: 93a1f8ef447a761164d2e5b86d00a5eb9e061aa10fc6fb25796d1e270289fd61`,
+		"  - patch\n",
+	} {
+		if !strings.Contains(defaults, pin) {
+			t.Fatalf("ttyd defaults are missing pinned web-build input %q", pin)
+		}
+	}
+
+	webPatch := read("files/ttyd-disable-browser-clipboard.patch")
+	for _, removal := range []string{
+		"-import { ClipboardAddon } from '@xterm/addon-clipboard';",
+		"-    private clipboardAddon = new ClipboardAddon();",
+		"-        terminal.loadAddon(clipboardAddon);",
+		"-            terminal.onSelectionChange(() => {",
+		"-                    document.execCommand('copy');",
+		"-                this.overlayAddon?.showOverlay('\\u2702', 200);",
+	} {
+		if !strings.Contains(webPatch, removal) {
+			t.Fatalf("bundled ttyd patch does not remove %q", removal)
+		}
+	}
+
+	build := read("tasks/build_ttyd.yml")
+	for _, contract := range []string{
+		"Hash bundled ttyd web patch as an immutable build input",
+		"rstrip=false) | hash('sha256')",
+		"remoteterminal_ttyd_web_patch_digest ~ '\\n'",
+		"remoteterminal_ttyd_web_inputs_digest ~ '\\n'",
+		"remoteterminal_ttyd_corepack_version ~ '\\n'",
+		"remoteterminal_ttyd_corepack_package_checksum ~ '\\n'",
+		"remoteterminal_ttyd_yarn_version ~ '\\n'",
+		"remoteterminal_ttyd_yarn_binary_checksum ~ '\\n'",
+		"Apply exact ttyd browser-clipboard patch without fuzzy matching",
+		"--fuzz=0",
+		"Inventory every patched ttyd web build input",
+		"Hash every patched ttyd web build input with SHA-256",
+		"remoteterminal_ttyd_web_input_stats.results",
+		"Verify every patched ttyd web input against the pinned manifest digest",
+		"Download checksum-pinned Corepack package for ttyd web build",
+		`- "{{ remoteterminal_ttyd_corepack_package_path }}"`,
+		`- "yarn@{{ remoteterminal_ttyd_yarn_version }}"`,
+		"Verify checksum-pinned ttyd Yarn executable before use",
+		"Install immutable ttyd web dependencies from pinned Yarn lock",
+		"Regenerate patched ttyd src/html.h from web sources",
+		"remoteterminal_ttyd_generated_web_artifacts.results[0].stat.checksum !=",
+		"navigator[.]clipboard|document[.]execCommand|ClipboardAddon",
+	} {
+		if !strings.Contains(build, contract) {
+			t.Fatalf("ttyd build is missing patched web-build contract %q", contract)
+		}
+	}
+	if strings.Contains(build, "ansible.builtin.find:\n") && strings.Contains(build, "file_type: file\n        hidden: true\n        recurse: true\n        get_checksum: true") {
+		t.Fatal("ttyd web manifest asks ansible-core 2.14 find for unsupported SHA-256 checksums")
+	}
+	patchIndex := strings.Index(build, "Apply exact ttyd browser-clipboard patch without fuzzy matching")
+	webBuildIndex := strings.Index(build, "Regenerate patched ttyd src/html.h from web sources")
+	cmakeIndex := strings.Index(build, "Configure pinned ttyd build")
+	if patchIndex < 0 || webBuildIndex < 0 || cmakeIndex < 0 || !(patchIndex < webBuildIndex && webBuildIndex < cmakeIndex) {
+		t.Fatal("ttyd must apply its web patch and regenerate src/html.h before CMake configures the binary")
+	}
+
+	preflight := read("tasks/preflight.yml")
+	for _, validation := range []string{
+		"remoteterminal_ttyd_commit is match('^[0-9a-f]{40}$')",
+		"remoteterminal_ttyd_corepack_version is match('^[0-9]+\\.[0-9]+\\.[0-9]+$')",
+		"remoteterminal_ttyd_corepack_package_checksum is match('^sha256:[0-9a-f]{64}$')",
+		"remoteterminal_ttyd_yarn_version is match('^[0-9]+\\.[0-9]+\\.[0-9]+$')",
+		"remoteterminal_ttyd_yarn_binary_checksum is match('^sha256:[0-9a-f]{64}$')",
+		"remoteterminal_ttyd_web_inputs_digest is match('^[0-9a-f]{64}$')",
+	} {
+		if !strings.Contains(preflight, validation) {
+			t.Fatalf("ttyd preflight is missing %q", validation)
+		}
+	}
+
+	applicationBuild := read("tasks/build_application.yml")
+	if !strings.Contains(applicationBuild, "remoteterminal_ttyd_build_fingerprint ~ '\\n'") {
+		t.Fatal("application release identity does not include the full patched ttyd build fingerprint")
+	}
+}
+
+func TestTtydRepairPersistsRestartIntentBeforeToolMutation(t *testing.T) {
+	build, err := os.ReadFile(filepath.Join("ansible", "roles", "remoteterminal", "tasks", "build_ttyd.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	buildText := string(build)
+	for _, contract := range []string{
+		"Record whether ttyd must be replaced during this deployment",
+		"remoteterminal_ttyd_tool_replaced",
+		"Inspect durable restart marker before ttyd mutation",
+		"Reject unsafe durable restart marker before ttyd mutation",
+		"Persist restart requirement before ttyd mutation",
+		"ttyd-tool-reconciliation-required",
+	} {
+		if !strings.Contains(buildText, contract) {
+			t.Fatalf("ttyd installer is missing durable repair contract %q", contract)
+		}
+	}
+	restartIndex := strings.Index(buildText, "Persist restart requirement before ttyd mutation")
+	exchangeIndex := strings.Index(buildText, "Atomically exchange complete candidate with existing ttyd tool")
+	if restartIndex < 0 || exchangeIndex < 0 || restartIndex >= exchangeIndex {
+		t.Fatal("ttyd repair must persist restart intent before exchanging the live tool")
+	}
+
+	deployment, err := os.ReadFile(filepath.Join("ansible", "roles", "remoteterminal", "tasks", "deploy.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(deployment), "(remoteterminal_ttyd_tool_replaced | bool)") {
+		t.Fatal("deployment restart condition does not include same-fingerprint ttyd replacement")
 	}
 }
 

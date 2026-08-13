@@ -72,6 +72,23 @@
         ('https://go.dev/dl/go' ~ remoteterminal_go_version ~
          '.linux-amd64.tar.gz')
       - remoteterminal_go_archive_checksum is match('^sha256:[0-9a-f]{64}$')
+      - remoteterminal_ttyd_version is match('^[0-9]+\.[0-9]+\.[0-9]+$')
+      - remoteterminal_ttyd_commit is match('^[0-9a-f]{40}$')
+      - >-
+        remoteterminal_ttyd_archive_url ==
+        ('https://github.com/tsl0922/ttyd/archive/' ~
+         remoteterminal_ttyd_commit ~ '.tar.gz')
+      - remoteterminal_ttyd_archive_checksum is match('^sha256:[0-9a-f]{64}$')
+      - remoteterminal_ttyd_corepack_version is match('^[0-9]+\.[0-9]+\.[0-9]+$')
+      - >-
+        remoteterminal_ttyd_corepack_package_url ==
+        ('https://registry.npmjs.org/corepack/-/corepack-' ~
+         remoteterminal_ttyd_corepack_version ~ '.tgz')
+      - remoteterminal_ttyd_corepack_package_checksum is match('^sha256:[0-9a-f]{64}$')
+      - remoteterminal_ttyd_yarn_version is match('^[0-9]+\.[0-9]+\.[0-9]+$')
+      - remoteterminal_ttyd_yarn_binary_checksum is match('^sha256:[0-9a-f]{64}$')
+      - remoteterminal_ttyd_web_patch_filename == 'ttyd-disable-browser-clipboard.patch'
+      - remoteterminal_ttyd_web_inputs_digest is match('^[0-9a-f]{64}$')
       - remoteterminal_code_server_version is match('^[0-9]+\.[0-9]+\.[0-9]+$')
       - remoteterminal_code_server_archive_url is match('^https://github\.com/coder/code-server/releases/download/v[0-9]+\.[0-9]+\.[0-9]+/code-server-[0-9]+\.[0-9]+\.[0-9]+-linux-amd64\.tar\.gz$')
       - >-
@@ -87,7 +104,7 @@
     fail_msg: >-
       Supply a non-root target user, a valid machine display name, and a
       specific non-loopback LAN IPv4 address. Port, session-limit, source-path,
-      Transport, TLS-pair, Go/code-server pin, health-check, or build settings are invalid.
+      Transport, TLS-pair, Go/ttyd/code-server pin, health-check, or build settings are invalid.
       Numeric settings must use canonical non-negative decimal integer syntax;
       certificate and key source paths must be supplied together.
 

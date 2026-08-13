@@ -1,4 +1,4 @@
-import { useEffect, useId, useRef, type ReactNode } from 'react'
+import { useEffect, useId, useRef, type ReactNode, type RefObject } from 'react'
 import { XIcon } from '../icons'
 
 interface ModalProps {
@@ -10,6 +10,8 @@ interface ModalProps {
   closeLabel?: string
   className?: string
   closeDisabled?: boolean
+  initialFocusRef?: RefObject<HTMLElement>
+  returnFocusRef?: RefObject<HTMLElement>
 }
 
 export function Modal({
@@ -21,6 +23,8 @@ export function Modal({
   closeLabel = 'Close dialog',
   className = '',
   closeDisabled = false,
+  initialFocusRef,
+  returnFocusRef,
 }: ModalProps) {
   const titleId = useId()
   const descriptionId = useId()
@@ -31,7 +35,7 @@ export function Modal({
   closeDisabledRef.current = closeDisabled
 
   useEffect(() => {
-    const previouslyFocused = document.activeElement as HTMLElement | null
+    const previouslyFocused = returnFocusRef?.current ?? (document.activeElement as HTMLElement | null)
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === 'Escape') {
         event.preventDefault()
@@ -66,9 +70,12 @@ export function Modal({
     window.addEventListener('keydown', onKeyDown)
 
     const dialog = dialogRef.current
-    const initialFocus = dialog?.querySelector<HTMLElement>(
-      '[autofocus], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
-    )
+    const requestedInitialFocus = initialFocusRef?.current
+    const initialFocus = requestedInitialFocus && dialog?.contains(requestedInitialFocus)
+      ? requestedInitialFocus
+      : dialog?.querySelector<HTMLElement>(
+          '[autofocus], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+        )
     if (initialFocus) initialFocus.focus()
     else dialog?.focus()
 
@@ -76,7 +83,7 @@ export function Modal({
       window.removeEventListener('keydown', onKeyDown)
       previouslyFocused?.focus()
     }
-  }, [])
+  }, [initialFocusRef, returnFocusRef])
 
   return (
     <div className="modal-backdrop" role="presentation" onMouseDown={(event) => {

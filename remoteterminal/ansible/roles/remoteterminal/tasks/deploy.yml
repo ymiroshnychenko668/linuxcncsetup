@@ -488,6 +488,7 @@
   when: >-
     not (remoteterminal_deployment_inputs_applied | bool) or
     not (remoteterminal_current_service_inputs_match | bool) or
+    (remoteterminal_ttyd_tool_replaced | bool) or
     (remoteterminal_code_server_tool_replaced | bool)
 
 - name: Render Remote Terminal environment file

@@ -61,11 +61,13 @@ type fakeSessionManager struct {
 	deleteErr      error
 	connectErr     error
 	selectionErr   error
+	discardErr     error
 	proxyErr       error
 	proxyCalled    int
 	deletedID      string
 	connectedID    string
 	selectionID    string
+	discardID      string
 	selectionText  string
 	active         int
 	proxiedRequest *http.Request
@@ -98,9 +100,13 @@ func (f *fakeSessionManager) Connect(_ context.Context, id string) (sessions.Ses
 	}
 	return sessions.Session{ID: id, Name: "Main", TerminalConnected: true}, "/terminal/" + id + "/", nil
 }
-func (f *fakeSessionManager) LatestSelection(_ context.Context, id string) (string, error) {
+func (f *fakeSessionManager) TakeLatestSelection(_ context.Context, id string) (string, error) {
 	f.selectionID = id
 	return f.selectionText, f.selectionErr
+}
+func (f *fakeSessionManager) DiscardSelections(_ context.Context, id string) error {
+	f.discardID = id
+	return f.discardErr
 }
 func (f *fakeSessionManager) Proxy(_ context.Context, _ string) (http.Handler, error) {
 	f.proxyCalled++
@@ -195,6 +201,7 @@ type harness struct {
 	auth        *fakeAuthenticator
 	manager     *fakeSessionManager
 	codeServers *fakeCodeServerManager
+	logs        *bytes.Buffer
 }
 
 func newHarness(t *testing.T) harness {
@@ -221,15 +228,16 @@ func newHarnessWithOptions(t *testing.T, idle, absolute time.Duration, insecureH
 	authenticator := &fakeAuthenticator{}
 	manager := &fakeSessionManager{}
 	codeServerManager := &fakeCodeServerManager{}
+	logs := &bytes.Buffer{}
 	server, err := New(Config{
 		AllowedUser: "operator", MachineName: "Workshop Mill", WebDir: web, AbsoluteTimeout: time.Hour, AuthConcurrency: 1,
 		InsecureHTTP: insecureHTTP,
 	}, authenticator, auth.NewStore(idle, absolute, 32), auth.NewThrottler(5, time.Minute), manager, codeServerManager,
-		log.New(io.Discard, "", 0))
+		log.New(logs, "", 0))
 	if err != nil {
 		t.Fatal(err)
 	}
-	return harness{server: server, auth: authenticator, manager: manager, codeServers: codeServerManager}
+	return harness{server: server, auth: authenticator, manager: manager, codeServers: codeServerManager, logs: logs}
 }
 
 func TestPublicConfigExposesMachineNameWithoutAuthentication(t *testing.T) {
@@ -755,19 +763,52 @@ func TestCodeServerAPIErrorsUseStablePublicStatuses(t *testing.T) {
 	}
 }
 
-func TestLatestSelectionRequiresAuthenticationAndReturnsNoStoreJSON(t *testing.T) {
+func TestTakeLatestSelectionRequiresAuthenticationAndCSRFAndReturnsNoStoreJSON(t *testing.T) {
 	h := newHarness(t)
 	h.manager.selectionText = "line one\nрядок два"
 
-	request := httptest.NewRequest(http.MethodGet, "http://example.test/api/sessions/"+testID+"/clipboard", nil)
+	request := httptest.NewRequest(http.MethodPost, "http://example.test/api/sessions/"+testID+"/clipboard", nil)
 	response := httptest.NewRecorder()
 	h.server.ServeHTTP(response, request)
 	if response.Code != http.StatusUnauthorized || h.manager.selectionID != "" {
 		t.Fatalf("unauthenticated clipboard response = %d, manager id = %q", response.Code, h.manager.selectionID)
 	}
+	request = httptest.NewRequest(http.MethodDelete, "http://example.test/api/sessions/"+testID+"/clipboard", nil)
+	response = httptest.NewRecorder()
+	h.server.ServeHTTP(response, request)
+	if response.Code != http.StatusUnauthorized || h.manager.discardID != "" {
+		t.Fatalf("unauthenticated discard response = %d, manager id = %q", response.Code, h.manager.discardID)
+	}
 
 	credentials := login(t, h.server, "operator", "secret")
-	request = authenticatedRequest(http.MethodGet, "/api/sessions/"+testID+"/clipboard", credentials.cookie, "", nil)
+	request = httptest.NewRequest(http.MethodPost, "http://example.test/api/sessions/"+testID+"/clipboard", nil)
+	request.AddCookie(credentials.cookie)
+	request.Header.Set(csrfHeader, credentials.csrf)
+	response = httptest.NewRecorder()
+	h.server.ServeHTTP(response, request)
+	if response.Code != http.StatusForbidden || h.manager.selectionID != "" ||
+		!strings.Contains(response.Body.String(), `"code":"origin_rejected"`) {
+		t.Fatalf("origin-less clipboard response = %d %s, manager id = %q", response.Code, response.Body.String(), h.manager.selectionID)
+	}
+	request = httptest.NewRequest(http.MethodDelete, "http://example.test/api/sessions/"+testID+"/clipboard", nil)
+	request.AddCookie(credentials.cookie)
+	request.Header.Set(csrfHeader, credentials.csrf)
+	response = httptest.NewRecorder()
+	h.server.ServeHTTP(response, request)
+	if response.Code != http.StatusForbidden || h.manager.discardID != "" ||
+		!strings.Contains(response.Body.String(), `"code":"origin_rejected"`) {
+		t.Fatalf("origin-less discard response = %d %s, manager id = %q", response.Code, response.Body.String(), h.manager.discardID)
+	}
+
+	request = authenticatedRequest(http.MethodPost, "/api/sessions/"+testID+"/clipboard", credentials.cookie, "", nil)
+	response = httptest.NewRecorder()
+	h.server.ServeHTTP(response, request)
+	if response.Code != http.StatusForbidden || h.manager.selectionID != "" ||
+		!strings.Contains(response.Body.String(), `"code":"csrf_rejected"`) {
+		t.Fatalf("CSRF-less clipboard response = %d %s, manager id = %q", response.Code, response.Body.String(), h.manager.selectionID)
+	}
+
+	request = authenticatedRequest(http.MethodPost, "/api/sessions/"+testID+"/clipboard", credentials.cookie, credentials.csrf, nil)
 	response = httptest.NewRecorder()
 	h.server.ServeHTTP(response, request)
 	if response.Code != http.StatusOK || h.manager.selectionID != testID ||
@@ -778,7 +819,35 @@ func TestLatestSelectionRequiresAuthenticationAndReturnsNoStoreJSON(t *testing.T
 		t.Fatalf("clipboard Cache-Control = %q", response.Header().Get("Cache-Control"))
 	}
 
+	request = authenticatedRequest(http.MethodDelete, "/api/sessions/"+testID+"/clipboard", credentials.cookie, "", nil)
+	response = httptest.NewRecorder()
+	h.server.ServeHTTP(response, request)
+	if response.Code != http.StatusForbidden || h.manager.discardID != "" {
+		t.Fatalf("CSRF-less discard response = %d %s, manager id = %q", response.Code, response.Body.String(), h.manager.discardID)
+	}
+
+	request = authenticatedRequest(http.MethodDelete, "/api/sessions/"+testID+"/clipboard", credentials.cookie, credentials.csrf, nil)
+	response = httptest.NewRecorder()
+	h.server.ServeHTTP(response, request)
+	if response.Code != http.StatusNoContent || h.manager.discardID != testID {
+		t.Fatalf("discard response = %d %s, manager id = %q", response.Code, response.Body.String(), h.manager.discardID)
+	}
+	if response.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("discard Cache-Control = %q", response.Header().Get("Cache-Control"))
+	}
+
+	h.manager.discardErr = errors.New("discard failed")
+	request = authenticatedRequest(http.MethodDelete, "/api/sessions/"+testID+"/clipboard", credentials.cookie, credentials.csrf, nil)
+	response = httptest.NewRecorder()
+	h.server.ServeHTTP(response, request)
+	if response.Code != http.StatusInternalServerError || !strings.Contains(response.Body.String(), `"code":"internal_error"`) ||
+		strings.Contains(response.Body.String(), h.manager.selectionText) || strings.Contains(h.logs.String(), h.manager.selectionText) {
+		t.Fatalf("discard failure response = %d %s log=%q", response.Code, response.Body.String(), h.logs.String())
+	}
+	h.manager.discardErr = nil
+
 	h.manager.selectionErr = sessions.ErrNoSelection
+	request = authenticatedRequest(http.MethodPost, "/api/sessions/"+testID+"/clipboard", credentials.cookie, credentials.csrf, nil)
 	response = httptest.NewRecorder()
 	h.server.ServeHTTP(response, request)
 	if response.Code != http.StatusConflict || !strings.Contains(response.Body.String(), `"code":"no_selection"`) {
@@ -786,17 +855,29 @@ func TestLatestSelectionRequiresAuthenticationAndReturnsNoStoreJSON(t *testing.T
 	}
 
 	h.manager.selectionErr = sessions.ErrInvalidSelection
+	request = authenticatedRequest(http.MethodPost, "/api/sessions/"+testID+"/clipboard", credentials.cookie, credentials.csrf, nil)
 	response = httptest.NewRecorder()
 	h.server.ServeHTTP(response, request)
 	if response.Code != http.StatusUnprocessableEntity || !strings.Contains(response.Body.String(), `"code":"selection_invalid"`) {
 		t.Fatalf("invalid-selection response = %d %s", response.Code, response.Body.String())
 	}
 
-	request = authenticatedRequest(http.MethodPost, "/api/sessions/"+testID+"/clipboard", credentials.cookie, "", nil)
+	h.manager.selectionErr = errors.New("remove terminal selection buffer: cleanup failed")
+	request = authenticatedRequest(http.MethodPost, "/api/sessions/"+testID+"/clipboard", credentials.cookie, credentials.csrf, nil)
 	response = httptest.NewRecorder()
 	h.server.ServeHTTP(response, request)
-	if response.Code != http.StatusMethodNotAllowed || response.Header().Get("Allow") != http.MethodGet {
-		t.Fatalf("clipboard POST response = %d Allow=%q", response.Code, response.Header().Get("Allow"))
+	if response.Code != http.StatusInternalServerError || !strings.Contains(response.Body.String(), `"code":"internal_error"`) {
+		t.Fatalf("cleanup-failure response = %d %s", response.Code, response.Body.String())
+	}
+	if strings.Contains(response.Body.String(), h.manager.selectionText) || strings.Contains(h.logs.String(), h.manager.selectionText) {
+		t.Fatalf("cleanup failure exposed selection text: body=%q log=%q", response.Body.String(), h.logs.String())
+	}
+
+	request = authenticatedRequest(http.MethodGet, "/api/sessions/"+testID+"/clipboard", credentials.cookie, "", nil)
+	response = httptest.NewRecorder()
+	h.server.ServeHTTP(response, request)
+	if response.Code != http.StatusMethodNotAllowed || response.Header().Get("Allow") != http.MethodPost+", "+http.MethodDelete {
+		t.Fatalf("clipboard GET response = %d Allow=%q", response.Code, response.Header().Get("Allow"))
 	}
 }
 
@@ -807,6 +888,9 @@ func TestTerminalProxyRequiresAuthenticationAndWebSocketOrigin(t *testing.T) {
 	h.server.ServeHTTP(response, request)
 	if response.Code != http.StatusUnauthorized || h.manager.proxyCalled != 0 {
 		t.Fatalf("unauthenticated proxy response = %d, calls %d", response.Code, h.manager.proxyCalled)
+	}
+	if got := response.Header().Get("Permissions-Policy"); got != "clipboard-read=(), clipboard-write=()" {
+		t.Fatalf("terminal Permissions-Policy = %q", got)
 	}
 	credentials := login(t, h.server, "operator", "secret")
 	request = authenticatedRequest(http.MethodGet, "/terminal/"+testID+"/ws", credentials.cookie, "", nil)
@@ -825,6 +909,9 @@ func TestTerminalProxyRequiresAuthenticationAndWebSocketOrigin(t *testing.T) {
 	h.server.ServeHTTP(response, request)
 	if response.Code != http.StatusNoContent || h.manager.proxyCalled != 1 || h.manager.proxiedRequest.URL.Path != "/terminal/"+testID+"/ws" {
 		t.Fatalf("valid WebSocket response = %d, calls %d", response.Code, h.manager.proxyCalled)
+	}
+	if got := response.Header().Get("Permissions-Policy"); got != "clipboard-read=(), clipboard-write=()" {
+		t.Fatalf("proxied terminal Permissions-Policy = %q", got)
 	}
 }
 

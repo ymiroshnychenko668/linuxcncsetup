@@ -49,6 +49,9 @@ type fakeRunner struct {
 	selectionListOutput        []byte
 	selectionInspectError      error
 	selectionReadError         error
+	selectionDeleteOutput      []byte
+	selectionDeleteError       error
+	deletedSelectionBuffers    []string
 	selectionBindings          map[string]string
 	globalEnvironment          map[string]string
 	globalWindowStyle          string
@@ -151,6 +154,22 @@ func (f *fakeRunner) Run(_ context.Context, binary string, args ...string) ([]by
 				return append([]byte(nil), buffer.data...), f.selectionReadError
 			}
 			return append([]byte(nil), buffer.data...), nil
+		}
+		return []byte("no buffer " + commandArgs[4]), errors.New("exit status 1")
+	case "delete-buffer":
+		if len(commandArgs) != 5 || commandArgs[3] != "-b" || !validOwnedSelectionBufferName(commandArgs[4]) {
+			return nil, fmt.Errorf("unsafe delete-buffer args: %v", call)
+		}
+		if f.selectionDeleteError != nil {
+			return append([]byte(nil), f.selectionDeleteOutput...), f.selectionDeleteError
+		}
+		for index, buffer := range f.selectionBuffers {
+			if buffer.name != commandArgs[4] {
+				continue
+			}
+			f.selectionBuffers = append(f.selectionBuffers[:index], f.selectionBuffers[index+1:]...)
+			f.deletedSelectionBuffers = append(f.deletedSelectionBuffers, commandArgs[4])
+			return nil, nil
 		}
 		return []byte("no buffer " + commandArgs[4]), errors.New("exit status 1")
 	case "bind-key":
@@ -490,7 +509,8 @@ func TestTtydArgumentsAreFixedAndShellFree(t *testing.T) {
 	id := "0123456789abcdef0123456789abcdef"
 	got := TtydArguments("/usr/bin/tmux", "/run/rt/tmux.sock", "/run/rt/ttyd/id.sock", id)
 	want := []string{
-		"-W", "-O", "-t", ttydRendererPreference, "-t", ttydThemePreference, "-b", "/terminal/" + id,
+		"-W", "-O", "-t", ttydRendererPreference, "-t", ttydMacSelectionPreference,
+		"-t", ttydThemePreference, "-b", "/terminal/" + id,
 		"-i", "/run/rt/ttyd/id.sock", "--", "/usr/bin/tmux", "-S", "/run/rt/tmux.sock",
 		"attach-session", "-t", "rt_" + id,
 	}
@@ -545,6 +565,12 @@ func TestCreateListConnectDeleteLifecycle(t *testing.T) {
 	if err != nil || len(listed) != 1 || listed[0].ID != created.ID {
 		t.Fatalf("List() = %+v, %v", listed, err)
 	}
+	runner.mu.Lock()
+	runner.selectionBuffers = []fakeTmuxBuffer{
+		{name: tmuxSelectionPrefix(created.ID) + "1", data: []byte("stale before browser mount")},
+		{name: "buffer2", data: []byte("foreign")},
+	}
+	runner.mu.Unlock()
 	connected, terminalURL, err := manager.Connect(context.Background(), created.ID)
 	if err != nil {
 		t.Fatal(err)
@@ -556,6 +582,10 @@ func TestCreateListConnectDeleteLifecycle(t *testing.T) {
 		t.Fatalf("ttyd starts = %d, want 1", len(starter.calls))
 	}
 	runner.mu.Lock()
+	if len(runner.selectionBuffers) != 1 || runner.selectionBuffers[0].name != "buffer2" {
+		runner.mu.Unlock()
+		t.Fatalf("Connect retained stale session selection or removed foreign buffer: %#v", runner.selectionBuffers)
+	}
 	configuredTmux := runner.sessions[tmuxTarget(created.ID)]
 	mouseEnabled := configuredTmux.mouse
 	status := configuredTmux.status
@@ -674,6 +704,12 @@ func TestCreateListConnectDeleteLifecycle(t *testing.T) {
 			t.Fatalf("repeated Connect() did not restore %s selection binding", table)
 		}
 	}
+	runner.mu.Lock()
+	runner.selectionBuffers = []fakeTmuxBuffer{
+		{name: tmuxSelectionPrefix(created.ID) + "2", data: []byte("selected secret")},
+		{name: "buffer3", data: []byte("foreign")},
+	}
+	runner.mu.Unlock()
 	if err := manager.Delete(context.Background(), created.ID); err != nil {
 		t.Fatal(err)
 	}
@@ -682,9 +718,13 @@ func TestCreateListConnectDeleteLifecycle(t *testing.T) {
 	}
 	runner.mu.Lock()
 	remaining := len(runner.sessions)
+	remainingBuffers := append([]fakeTmuxBuffer(nil), runner.selectionBuffers...)
 	runner.mu.Unlock()
 	if remaining != 0 {
 		t.Fatal("delete left tmux session running")
+	}
+	if len(remainingBuffers) != 1 || remainingBuffers[0].name != "buffer3" {
+		t.Fatalf("delete retained session selection or removed foreign buffer: %#v", remainingBuffers)
 	}
 }
 
@@ -727,7 +767,26 @@ func TestCreateCleansHiddenSessionWhenNewSessionReturnsErrorAfterSideEffect(t *t
 	}
 }
 
-func TestLatestSelectionReturnsNewestBufferForRequestedSession(t *testing.T) {
+func TestConnectFailsClosedBeforeStartingTtydWhenSelectionBoundaryFails(t *testing.T) {
+	manager, runner, starter := testManager(t, 1)
+	created, err := manager.Create(context.Background(), "Boundary failure")
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner.mu.Lock()
+	runner.selectionListOutput = []byte("buffer metadata only")
+	runner.selectionInspectError = context.DeadlineExceeded
+	runner.mu.Unlock()
+
+	if _, _, err := manager.Connect(context.Background(), created.ID); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Connect() error = %v, want selection cleanup failure", err)
+	}
+	if len(starter.calls) != 0 || manager.ActiveTerminals() != 0 {
+		t.Fatalf("failed clipboard boundary exposed ttyd: starts=%d active=%d", len(starter.calls), manager.ActiveTerminals())
+	}
+}
+
+func TestTakeLatestSelectionConsumesAllBuffersForRequestedSession(t *testing.T) {
 	manager, runner, _ := testManager(t, 2)
 	created, err := manager.Create(context.Background(), "Clipboard")
 	if err != nil {
@@ -752,46 +811,120 @@ func TestLatestSelectionReturnsNewestBufferForRequestedSession(t *testing.T) {
 	}
 	runner.mu.Unlock()
 
-	got, err := manager.LatestSelection(context.Background(), created.ID)
+	got, err := manager.TakeLatestSelection(context.Background(), created.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got != want {
-		t.Fatalf("LatestSelection() = %q, want %q", got, want)
+		t.Fatalf("TakeLatestSelection() = %q, want %q", got, want)
 	}
-	otherGot, err := manager.LatestSelection(context.Background(), other.ID)
+	if _, err := manager.TakeLatestSelection(context.Background(), created.ID); !errors.Is(err, ErrNoSelection) {
+		t.Fatalf("repeated TakeLatestSelection() error = %v, want ErrNoSelection", err)
+	}
+	otherGot, err := manager.TakeLatestSelection(context.Background(), other.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if otherGot != "other terminal secret" {
-		t.Fatalf("LatestSelection(other) = %q, want session-scoped buffer", otherGot)
+		t.Fatalf("TakeLatestSelection(other) = %q, want session-scoped buffer", otherGot)
 	}
 
 	runner.mu.Lock()
 	calls := append([][]string(nil), runner.calls...)
+	remainingBuffers := append([]fakeTmuxBuffer(nil), runner.selectionBuffers...)
+	deletedBuffers := append([]string(nil), runner.deletedSelectionBuffers...)
 	runner.mu.Unlock()
 	wantListCall := []string{"tmux", "-S", manager.tmuxSocket(), "list-buffers", "-F", tmuxSelectionListFormat}
 	wantReadCall := []string{"tmux", "-S", manager.tmuxSocket(), "show-buffer", "-b", wantName}
 	wantOtherReadCall := []string{"tmux", "-S", manager.tmuxSocket(), "show-buffer", "-b", otherName}
 	if !containsCommand(calls, wantListCall) || !containsCommand(calls, wantReadCall) || !containsCommand(calls, wantOtherReadCall) {
-		t.Fatalf("LatestSelection() calls = %#v", calls)
+		t.Fatalf("TakeLatestSelection() calls = %#v", calls)
+	}
+	wantDeleted := []string{tmuxSelectionPrefix(created.ID) + "7", wantName, otherName}
+	if strings.Join(deletedBuffers, "\x00") != strings.Join(wantDeleted, "\x00") {
+		t.Fatalf("deleted selection buffers = %#v, want oldest-first per session %#v", deletedBuffers, wantDeleted)
+	}
+	for _, buffer := range remainingBuffers {
+		if validSelectionBufferName(buffer.name, tmuxSelectionPrefix(created.ID)) ||
+			validSelectionBufferName(buffer.name, tmuxSelectionPrefix(other.ID)) {
+			t.Fatalf("successful take left session buffer %q", buffer.name)
+		}
 	}
 }
 
-func TestLatestSelectionValidatesSessionAndBufferState(t *testing.T) {
+func TestDiscardSelectionsRemovesOnlyRequestedSessionWithoutReadingText(t *testing.T) {
+	manager, runner, _ := testManager(t, 2)
+	created, err := manager.Create(context.Background(), "Clipboard barrier")
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := manager.Create(context.Background(), "Other terminal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	newestName := tmuxSelectionPrefix(created.ID) + "12"
+	olderName := tmuxSelectionPrefix(created.ID) + "7"
+	otherName := tmuxSelectionPrefix(other.ID) + "13"
+	runner.mu.Lock()
+	runner.selectionBuffers = []fakeTmuxBuffer{
+		{name: otherName, data: []byte("other terminal secret")},
+		{name: newestName, data: []byte("newest secret"), sizeOutput: "not-a-size"},
+		{name: olderName, data: []byte("older secret")},
+		{name: "buffer14", data: []byte("foreign")},
+	}
+	runner.mu.Unlock()
+
+	if err := manager.DiscardSelections(context.Background(), created.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.DiscardSelections(context.Background(), created.ID); err != nil {
+		t.Fatalf("repeated empty DiscardSelections() = %v, want idempotent success", err)
+	}
+
+	runner.mu.Lock()
+	calls := append([][]string(nil), runner.calls...)
+	remaining := append([]fakeTmuxBuffer(nil), runner.selectionBuffers...)
+	deleted := append([]string(nil), runner.deletedSelectionBuffers...)
+	runner.mu.Unlock()
+	if strings.Join(deleted, "\x00") != strings.Join([]string{olderName, newestName}, "\x00") {
+		t.Fatalf("discarded buffers = %#v, want requested session oldest-first", deleted)
+	}
+	for _, call := range calls {
+		for _, argument := range call {
+			if argument == "show-buffer" {
+				t.Fatalf("DiscardSelections read selected text: %#v", call)
+			}
+		}
+	}
+	if len(remaining) != 2 || remaining[0].name != otherName || remaining[1].name != "buffer14" {
+		t.Fatalf("DiscardSelections changed foreign buffers: %#v", remaining)
+	}
+	if err := manager.DiscardSelections(context.Background(), "invalid"); !errors.Is(err, ErrInvalidID) {
+		t.Fatalf("invalid ID error = %v, want ErrInvalidID", err)
+	}
+	if err := manager.DiscardSelections(context.Background(), "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("missing session error = %v, want ErrNotFound", err)
+	}
+	manager.shuttingDown = true
+	if err := manager.DiscardSelections(context.Background(), created.ID); !errors.Is(err, ErrShuttingDown) {
+		t.Fatalf("shutdown error = %v, want ErrShuttingDown", err)
+	}
+}
+
+func TestTakeLatestSelectionValidatesSessionAndBufferState(t *testing.T) {
 	manager, runner, _ := testManager(t, 1)
 	created, err := manager.Create(context.Background(), "Clipboard")
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if _, err := manager.LatestSelection(context.Background(), "invalid"); !errors.Is(err, ErrInvalidID) {
+	if _, err := manager.TakeLatestSelection(context.Background(), "invalid"); !errors.Is(err, ErrInvalidID) {
 		t.Fatalf("invalid ID error = %v, want ErrInvalidID", err)
 	}
-	if _, err := manager.LatestSelection(context.Background(), "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"); !errors.Is(err, ErrNotFound) {
+	if _, err := manager.TakeLatestSelection(context.Background(), "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("missing session error = %v, want ErrNotFound", err)
 	}
-	if _, err := manager.LatestSelection(context.Background(), created.ID); !errors.Is(err, ErrNoSelection) {
+	if _, err := manager.TakeLatestSelection(context.Background(), created.ID); !errors.Is(err, ErrNoSelection) {
 		t.Fatalf("no-buffer error = %v, want ErrNoSelection", err)
 	}
 
@@ -800,12 +933,15 @@ func TestLatestSelectionValidatesSessionAndBufferState(t *testing.T) {
 		name: tmuxSelectionPrefix(created.ID) + "0", sizeOutput: "0",
 	}}
 	runner.mu.Unlock()
-	if _, err := manager.LatestSelection(context.Background(), created.ID); !errors.Is(err, ErrNoSelection) {
+	if _, err := manager.TakeLatestSelection(context.Background(), created.ID); !errors.Is(err, ErrNoSelection) {
 		t.Fatalf("empty-buffer error = %v, want ErrNoSelection", err)
+	}
+	if _, err := manager.TakeLatestSelection(context.Background(), created.ID); !errors.Is(err, ErrNoSelection) {
+		t.Fatalf("empty buffer was not consumed: %v", err)
 	}
 }
 
-func TestLatestSelectionBoundsAndValidatesTmuxOutput(t *testing.T) {
+func TestTakeLatestSelectionBoundsAndValidatesTmuxOutput(t *testing.T) {
 	manager, runner, _ := testManager(t, 1)
 	created, err := manager.Create(context.Background(), "Clipboard")
 	if err != nil {
@@ -818,7 +954,7 @@ func TestLatestSelectionBoundsAndValidatesTmuxOutput(t *testing.T) {
 		name: bufferName, data: []byte("small"), sizeOutput: strconv.Itoa(maxSelectionBytes + 1),
 	}}
 	runner.mu.Unlock()
-	if _, err := manager.LatestSelection(context.Background(), created.ID); !errors.Is(err, ErrSelectionTooLarge) {
+	if _, err := manager.TakeLatestSelection(context.Background(), created.ID); !errors.Is(err, ErrSelectionTooLarge) {
 		t.Fatalf("preflight size error = %v, want ErrSelectionTooLarge", err)
 	}
 
@@ -827,7 +963,7 @@ func TestLatestSelectionBoundsAndValidatesTmuxOutput(t *testing.T) {
 		name: bufferName, data: bytes.Repeat([]byte{'x'}, maxSelectionBytes+1), sizeOutput: "1",
 	}}
 	runner.mu.Unlock()
-	if _, err := manager.LatestSelection(context.Background(), created.ID); !errors.Is(err, ErrSelectionTooLarge) {
+	if _, err := manager.TakeLatestSelection(context.Background(), created.ID); !errors.Is(err, ErrSelectionTooLarge) {
 		t.Fatalf("post-read size error = %v, want ErrSelectionTooLarge", err)
 	}
 
@@ -836,12 +972,15 @@ func TestLatestSelectionBoundsAndValidatesTmuxOutput(t *testing.T) {
 		name: bufferName, data: []byte{0xff}, sizeOutput: "1",
 	}}
 	runner.mu.Unlock()
-	if _, err := manager.LatestSelection(context.Background(), created.ID); !errors.Is(err, ErrInvalidSelection) {
+	if _, err := manager.TakeLatestSelection(context.Background(), created.ID); !errors.Is(err, ErrInvalidSelection) {
 		t.Fatalf("invalid UTF-8 error = %v, want ErrInvalidSelection", err)
+	}
+	if _, err := manager.TakeLatestSelection(context.Background(), created.ID); !errors.Is(err, ErrNoSelection) {
+		t.Fatalf("invalid selection was not consumed: %v", err)
 	}
 }
 
-func TestLatestSelectionRejectsMalformedSizeAndWrapsTmuxFailures(t *testing.T) {
+func TestTakeLatestSelectionRejectsMalformedSizeAndWrapsTmuxFailures(t *testing.T) {
 	manager, runner, _ := testManager(t, 1)
 	created, err := manager.Create(context.Background(), "Clipboard")
 	if err != nil {
@@ -854,7 +993,7 @@ func TestLatestSelectionRejectsMalformedSizeAndWrapsTmuxFailures(t *testing.T) {
 		name: bufferName, data: []byte("small"), sizeOutput: "not-a-size",
 	}}
 	runner.mu.Unlock()
-	if _, err := manager.LatestSelection(context.Background(), created.ID); err == nil || !strings.Contains(err.Error(), "invalid tmux buffer size") {
+	if _, err := manager.TakeLatestSelection(context.Background(), created.ID); err == nil || !strings.Contains(err.Error(), "invalid tmux buffer size") {
 		t.Fatalf("malformed size error = %v", err)
 	}
 
@@ -862,7 +1001,7 @@ func TestLatestSelectionRejectsMalformedSizeAndWrapsTmuxFailures(t *testing.T) {
 	runner.selectionListOutput = []byte("tmux inspect failed")
 	runner.selectionInspectError = context.DeadlineExceeded
 	runner.mu.Unlock()
-	if _, err := manager.LatestSelection(context.Background(), created.ID); !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "tmux inspect failed") {
+	if _, err := manager.TakeLatestSelection(context.Background(), created.ID); !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "tmux inspect failed") {
 		t.Fatalf("inspect error = %v", err)
 	}
 
@@ -875,8 +1014,43 @@ func TestLatestSelectionRejectsMalformedSizeAndWrapsTmuxFailures(t *testing.T) {
 	}}
 	runner.selectionReadError = context.Canceled
 	runner.mu.Unlock()
-	if _, err := manager.LatestSelection(context.Background(), created.ID); !errors.Is(err, context.Canceled) || strings.Contains(err.Error(), secretSelection) {
+	if _, err := manager.TakeLatestSelection(context.Background(), created.ID); !errors.Is(err, context.Canceled) || strings.Contains(err.Error(), secretSelection) {
 		t.Fatalf("read error = %v", err)
+	}
+}
+
+func TestTakeLatestSelectionKeepsNewestBufferWhenCleanupFails(t *testing.T) {
+	manager, runner, _ := testManager(t, 1)
+	created, err := manager.Create(context.Background(), "Clipboard")
+	if err != nil {
+		t.Fatal(err)
+	}
+	newestName := tmuxSelectionPrefix(created.ID) + "9"
+	olderName := tmuxSelectionPrefix(created.ID) + "8"
+	secretSelection := "SECRET_SELECTION_MUST_NOT_REACH_CLEANUP_ERRORS"
+	runner.mu.Lock()
+	runner.selectionBuffers = []fakeTmuxBuffer{
+		{name: newestName, data: []byte(secretSelection)},
+		{name: olderName, data: []byte("older")},
+	}
+	runner.selectionDeleteOutput = []byte(secretSelection)
+	runner.selectionDeleteError = context.DeadlineExceeded
+	runner.mu.Unlock()
+
+	if _, err := manager.TakeLatestSelection(context.Background(), created.ID); err == nil ||
+		!errors.Is(err, context.DeadlineExceeded) || strings.Contains(err.Error(), secretSelection) {
+		t.Fatalf("cleanup error = %v", err)
+	}
+	runner.mu.Lock()
+	remaining := append([]fakeTmuxBuffer(nil), runner.selectionBuffers...)
+	calls := append([][]string(nil), runner.calls...)
+	runner.mu.Unlock()
+	if len(remaining) != 2 || remaining[0].name != newestName {
+		t.Fatalf("failed cleanup lost newest buffer: %#v", remaining)
+	}
+	wantFirstDelete := []string{"tmux", "-S", manager.tmuxSocket(), "delete-buffer", "-b", olderName}
+	if len(calls) == 0 || strings.Join(calls[len(calls)-1], "\x00") != strings.Join(wantFirstDelete, "\x00") {
+		t.Fatalf("first cleanup did not target oldest buffer: last call %#v, want %#v", calls[len(calls)-1], wantFirstDelete)
 	}
 }
 
@@ -887,6 +1061,19 @@ func containsCommand(calls [][]string, want []string) bool {
 		}
 	}
 	return false
+}
+
+func replaceFakeTmuxMarkerWithSocket(t *testing.T, manager *Manager) net.Listener {
+	t.Helper()
+	if err := os.Remove(manager.tmuxSocket()); err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.Listen("unix", manager.tmuxSocket())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	return listener
 }
 
 func fakeSessionStylesMatch(session *fakeTmuxSession, want string) bool {
@@ -1116,5 +1303,153 @@ func TestInitializeCleansStaleTtydFiles(t *testing.T) {
 		if info.Mode().Perm() != 0700 {
 			t.Fatalf("%s mode = %o, want 0700", path, info.Mode().Perm())
 		}
+	}
+}
+
+func TestInitializeCleansOnlyStrictlyOwnedSelectionBuffers(t *testing.T) {
+	manager, runner, _ := testManager(t, 1)
+	created, err := manager.Create(context.Background(), "Clipboard")
+	if err != nil {
+		t.Fatal(err)
+	}
+	orphanID := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	ownedNames := []string{
+		tmuxSelectionPrefix(created.ID) + "12",
+		tmuxSelectionPrefix(orphanID) + "4",
+	}
+	foreignNames := []string{
+		"buffer15",
+		tmuxSelectionPrefix(created.ID) + "manual",
+		tmuxSelectionPrefix(created.ID) + "1-extra",
+		"rtclip-rt_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA-1",
+		"rtclip-rt_short-1",
+		"rtclip-unrelated-2",
+	}
+	runner.mu.Lock()
+	for _, name := range append(append([]string(nil), ownedNames...), foreignNames...) {
+		runner.selectionBuffers = append(runner.selectionBuffers, fakeTmuxBuffer{name: name, data: []byte("stale")})
+	}
+	runner.mu.Unlock()
+	replaceFakeTmuxMarkerWithSocket(t, manager)
+
+	if err := manager.Initialize(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	runner.mu.Lock()
+	remaining := append([]fakeTmuxBuffer(nil), runner.selectionBuffers...)
+	deleted := append([]string(nil), runner.deletedSelectionBuffers...)
+	runner.mu.Unlock()
+	if len(deleted) != len(ownedNames) {
+		t.Fatalf("startup deleted buffers = %#v, want exactly %#v", deleted, ownedNames)
+	}
+	remainingNames := make(map[string]bool, len(remaining))
+	for _, buffer := range remaining {
+		remainingNames[buffer.name] = true
+	}
+	for _, name := range ownedNames {
+		if remainingNames[name] {
+			t.Errorf("startup left owned selection buffer %q", name)
+		}
+	}
+	for _, name := range foreignNames {
+		if !remainingNames[name] {
+			t.Errorf("startup removed foreign selection buffer %q", name)
+		}
+	}
+}
+
+func TestInitializeSelectionCleanupErrorDoesNotExposeBufferOutput(t *testing.T) {
+	manager, runner, _ := testManager(t, 1)
+	created, err := manager.Create(context.Background(), "Clipboard")
+	if err != nil {
+		t.Fatal(err)
+	}
+	secretSelection := "SECRET_SELECTION_MUST_NOT_REACH_STARTUP_ERRORS"
+	runner.mu.Lock()
+	runner.selectionBuffers = []fakeTmuxBuffer{{
+		name: tmuxSelectionPrefix(created.ID) + "1", data: []byte(secretSelection),
+	}}
+	runner.selectionDeleteOutput = []byte(secretSelection)
+	runner.selectionDeleteError = context.Canceled
+	runner.mu.Unlock()
+	replaceFakeTmuxMarkerWithSocket(t, manager)
+
+	err = manager.Initialize(context.Background())
+	if err == nil || !errors.Is(err, context.Canceled) || strings.Contains(err.Error(), secretSelection) {
+		t.Fatalf("Initialize() cleanup error = %v", err)
+	}
+}
+
+func TestInitializeSelectionCleanupRejectsNonSocketPathsWithoutDeleting(t *testing.T) {
+	tests := []struct {
+		name      string
+		setupPath func(*testing.T, string)
+		wantError bool
+	}{
+		{name: "missing"},
+		{
+			name: "regular",
+			setupPath: func(t *testing.T, path string) {
+				if err := os.WriteFile(path, []byte("not a socket"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			},
+			wantError: true,
+		},
+		{
+			name: "symlink to socket",
+			setupPath: func(t *testing.T, path string) {
+				target := filepath.Join(filepath.Dir(path), "foreign.sock")
+				listener, err := net.Listen("unix", target)
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = listener.Close() })
+				if err := os.Symlink(target, path); err != nil {
+					t.Fatal(err)
+				}
+			},
+			wantError: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			runtime, err := os.MkdirTemp("/tmp", "rt-sock-")
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = os.RemoveAll(runtime) })
+			runner := newFakeRunner()
+			runner.selectionBuffers = []fakeTmuxBuffer{{
+				name: "rtclip-rt_0123456789abcdef0123456789abcdef-1", data: []byte("must remain"),
+			}}
+			manager := newManager(Config{
+				TmuxBinary: "tmux", TtydBinary: "ttyd", RuntimeDir: runtime,
+				MaxSessions: 1, StartTimeout: time.Second,
+			}, runner, &fakeStarter{})
+			if test.setupPath != nil {
+				test.setupPath(t, manager.tmuxSocket())
+			}
+
+			err = manager.Initialize(context.Background())
+			if test.wantError && (err == nil || !strings.Contains(err.Error(), "not a Unix socket")) {
+				t.Fatalf("Initialize() error = %v, want non-socket rejection", err)
+			}
+			if !test.wantError && err != nil {
+				t.Fatalf("Initialize() missing socket error = %v", err)
+			}
+			runner.mu.Lock()
+			calls := append([][]string(nil), runner.calls...)
+			remaining := append([]fakeTmuxBuffer(nil), runner.selectionBuffers...)
+			runner.mu.Unlock()
+			for _, call := range calls {
+				if len(call) > 3 && (call[3] == "list-buffers" || call[3] == "delete-buffer") {
+					t.Fatalf("Initialize() accessed buffers through %s path: %#v", test.name, call)
+				}
+			}
+			if len(remaining) != 1 || string(remaining[0].data) != "must remain" {
+				t.Fatalf("Initialize() changed buffers through %s path: %#v", test.name, remaining)
+			}
+		})
 	}
 }

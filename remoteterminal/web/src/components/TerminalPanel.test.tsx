@@ -1,7 +1,8 @@
+import { createRef } from 'react'
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { TerminalSession } from '../api'
-import { TerminalPanel } from './TerminalPanel'
+import { TerminalPanel, type TerminalPanelHandle } from './TerminalPanel'
 
 const session: TerminalSession = {
   id: 'session-alpha',
@@ -24,6 +25,8 @@ interface MockTerminal {
   fit: ReturnType<typeof vi.fn>
   focus: ReturnType<typeof vi.fn>
   focusTextarea: () => void
+  clearSelection: ReturnType<typeof vi.fn>
+  getSelection: ReturnType<typeof vi.fn>
   refresh: ReturnType<typeof vi.fn>
   rows: number
   textarea: HTMLTextAreaElement
@@ -75,6 +78,8 @@ function installTerminal(frame: HTMLIFrameElement): MockTerminal {
       focusTextarea()
     }),
     focusTextarea,
+    clearSelection: vi.fn(),
+    getSelection: vi.fn(() => ''),
     refresh: vi.fn(),
     rows: 24,
     textarea,
@@ -334,5 +339,40 @@ describe('TerminalPanel', () => {
     } finally {
       vi.useRealTimers()
     }
+  })
+
+  it('takes and clears the exact same-origin xterm selection and safely returns empty while unavailable or navigating', async () => {
+    const ref = createRef<TerminalPanelHandle>()
+    render(
+      <TerminalPanel
+        ref={ref}
+        session={session}
+        active
+        focusRequestKey={0}
+        reconnectKey={0}
+        onStateChange={vi.fn()}
+        onSessionChange={vi.fn()}
+      />,
+    )
+
+    const frame = await screen.findByTitle('alpha terminal') as HTMLIFrameElement
+    expect(frame).toHaveAttribute('allow', "clipboard-read 'none'; clipboard-write 'none'")
+    expect(ref.current?.takeSelection()).toBe('')
+
+    const terminal = installTerminal(frame)
+    const exactText = '  first\nКиїв\t😀\n'
+    terminal.getSelection.mockReturnValue(exactText)
+    expect(ref.current?.takeSelection()).toBe(exactText)
+    expect(terminal.clearSelection).toHaveBeenCalledTimes(1)
+
+    terminal.clearSelection.mockImplementationOnce(() => {
+      throw new DOMException('navigating', 'SecurityError')
+    })
+    expect(ref.current?.takeSelection()).toBe(exactText)
+
+    terminal.getSelection.mockImplementation(() => {
+      throw new DOMException('navigating', 'SecurityError')
+    })
+    expect(ref.current?.takeSelection()).toBe('')
   })
 })

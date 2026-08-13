@@ -35,7 +35,7 @@ Use the LinuxCNC Setup TUI application and choose **Install Remote Terminal**. T
 
 The repository-root `setup.sh` shell menu is deprecated. It remains functional for compatibility but should not be used for new installations or updates.
 
-The installer builds the React application, Go service, and a pinned ttyd revision from source. It downloads the official Go 1.26.5 Linux AMD64 toolchain and code-server 4.132.0 AMD64 standalone archives, verifies both with fixed SHA-256 checksums, validates their contents, and promotes root-owned tools atomically beneath `/opt/remoteterminal/tools`. Debian's Go package and code-server's upstream systemd service are not installed. Network access is initially required for Debian packages, the pinned archives, and source dependencies.
+The installer builds the React application, Go service, and a pinned ttyd revision from source. ttyd's bundled browser client is patched to remove its competing ClipboardAddon and copy-on-selection behavior, then `src/html.h` is regenerated with checksum-pinned Corepack 0.29.4 and Yarn 3.6.3 before the C build. The patch, complete patched `html/` manifest, web toolchain, compiler packages, archive, and commit all participate in the content-addressed ttyd build identity. The installer downloads the official Go 1.26.5 Linux AMD64 toolchain and code-server 4.132.0 AMD64 standalone archives, verifies both with fixed SHA-256 checksums, validates their contents, and promotes root-owned tools atomically beneath `/opt/remoteterminal/tools`. Debian's Go package and code-server's upstream systemd service are not installed. Network access is initially required for Debian packages, the pinned archives, and source dependencies.
 
 The default transport is HTTP and the default port is `8443`. After installation, open:
 
@@ -157,7 +157,15 @@ The code-server port-forwarding proxy is intentionally disabled. Its **Ports** v
 
 ### Copy and paste
 
-Because tmux handles mouse scrolling, a normal drag creates a yellow tmux copy-mode selection. Release the mouse, then click **Copy selection** in the terminal header. The first click may load the selection and change the button to **Copy now**; click that button to perform the browser-authorized clipboard write. Press `Esc` to clear a yellow selection. As a browser-native fallback, hold `Shift` while dragging and then press `Ctrl+C`. Use `Ctrl+V` to paste, with `Shift+Insert` as an alternative.
+For ordinary shell output and scrollback, drag across the text normally, release the mouse, and click **Copy selection** in the terminal header. Remote Terminal opens a dialog containing the exact captured text instead of attempting a silent browser clipboard write. In that dialog use `Ctrl+C` on Linux/Windows, `Cmd+C` on macOS, or the browser/desktop context-menu **Copy** action. This dialog remains usable when the asynchronous Clipboard API is unavailable or denied.
+
+Full-screen and mouse-aware terminal programs can consume a normal drag themselves. Hold `Shift` while dragging on Linux/Windows, or `Option` while dragging on macOS, to force an xterm browser selection; then click **Copy selection** and copy from the dialog in the same way. The deployed ttyd explicitly enables Option-for-selection behavior on macOS. `Ctrl+C` in the terminal remains the normal interrupt key when no copy dialog is open.
+
+For a forced xterm selection, **Close** unlocks after Remote Terminal has discarded older tmux selection buffers. If that cleanup cannot be confirmed, the dialog keeps the exact text copyable and the next **Copy selection** action resets uncertain tmux state without exposing an older selection; make a fresh drag after that reset message.
+
+On a browser reload, sign-out/sign-in cycle, or reconnect, **Copy selection** stays disabled until the terminal connection has cleared selection buffers left by the previous browser view. Selected text is never persisted in browser storage.
+
+To paste into the terminal, use `Ctrl+Shift+V` on Linux/Windows, `Shift+Insert` as the keyboard alternative, or `Cmd+V` on macOS. Browser security or managed workstation policy can still disable clipboard reads; in that case use the browser's context menu if it offers **Paste**.
 
 ## Local development
 
@@ -250,10 +258,10 @@ For example, add `--extra-vars 'remoteterminal_uninstall_preserve_config=true'` 
 
 These checks are intentionally unchecked and must be performed on a clean AMD64 Debian/LinuxCNC target; they have not been inferred from local automated tests.
 
-- [ ] Install from the setup TUI on a clean target; verify the selected transport and endpoint, certificate fingerprint in HTTPS mode, selected non-root service identity, selected-address listener, private ttyd/code-server sockets, and exact pinned Go/code-server versions.
+- [ ] Install from the setup TUI on a clean target; verify the selected transport and endpoint, certificate fingerprint in HTTPS mode, selected non-root service identity, selected-address listener, private ttyd/code-server sockets, and exact pinned Go/ttyd/code-server versions.
 - [ ] Run the same install a second time with unchanged inputs and confirm an idempotent Ansible recap and no unnecessary service restart.
 - [ ] Reboot, confirm the enabled service becomes healthy, and confirm that pre-reboot tmux sessions are not presented as guaranteed persistent state.
-- [ ] In supported Chrome/Chromium and Firefox, create and reconnect sessions; verify copy/paste of plain text, multiline text, Unicode, and Ukrainian text and keyboard input using the documented shortcuts.
+- [ ] In supported Chrome/Chromium and Firefox, create and reconnect sessions; verify normal-drag and Shift/Option-drag copy through the explicit dialog, its Ctrl/Cmd+C and context-menu paths, and Ctrl+Shift+V/Shift+Insert/Cmd+V paste for plain text, multiline text, Unicode, and Ukrainian text.
 - [ ] Trust the deployment certificate on supported clients; launch two different folders, verify editor webviews/workers and extensions, confirm same-folder aliases deduplicate, and confirm the configured active-instance limit.
 - [ ] Install with the default HTTP appliance profile; confirm the plaintext warning and non-`Secure` host-only session cookie, exact HTTP Origin/CSRF/WebSocket checks, failure of unconfigured remote-origin webviews, and successful webviews only after the exact origin is added to a disposable managed-browser insecure-origin policy.
 - [ ] Close and reopen an editor tab and log out/in to verify the instance remains active; then use **Shutdown** and verify it disappears without affecting terminal or unrelated tmux sessions.

@@ -83,7 +83,7 @@
                 ('^(binutils|build-essential|cmake|gcc|libc6-dev|' ~
                  'libjson-c-dev|libpam0g-dev|libssl-dev|libuv1-dev|' ~
                  'libwebsockets-dev|make|nodejs|npm|pkg-config|pkgconf|' ~
-                 'zlib1g-dev)[^=]*=')) |
+                 'patch|zlib1g-dev)[^=]*=')) |
          sort | join('\n') }}
   when: not ansible_check_mode
 

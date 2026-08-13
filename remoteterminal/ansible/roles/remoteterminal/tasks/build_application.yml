@@ -162,7 +162,7 @@
   ansible.builtin.set_fact:
     remoteterminal_release_digest: >-
       {{ (remoteterminal_source_manifest | join('\n') ~ '\n' ~
-          remoteterminal_ttyd_commit ~ '\n' ~
+          remoteterminal_ttyd_build_fingerprint ~ '\n' ~
           remoteterminal_code_server_version ~ '\n' ~
           remoteterminal_code_server_archive_checksum ~ '\n' ~
           remoteterminal_go_release_fingerprint ~ '\n' ~

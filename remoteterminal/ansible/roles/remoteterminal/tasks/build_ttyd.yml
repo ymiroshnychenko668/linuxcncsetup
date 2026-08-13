@@ -1,10 +1,26 @@
 ---
+- name: Hash bundled ttyd web patch as an immutable build input
+  ansible.builtin.set_fact:
+    remoteterminal_ttyd_web_patch_digest: >-
+      {{ lookup('ansible.builtin.file',
+                role_path ~ '/files/' ~ remoteterminal_ttyd_web_patch_filename,
+                rstrip=false) | hash('sha256') }}
+
 - name: Calculate pinned ttyd build identity
   ansible.builtin.set_fact:
     remoteterminal_ttyd_build_fingerprint: >-
       {{ (remoteterminal_ttyd_version ~ '\n' ~
           remoteterminal_ttyd_commit ~ '\n' ~
           remoteterminal_ttyd_archive_checksum ~ '\n' ~
+          remoteterminal_ttyd_web_patch_filename ~ '\n' ~
+          remoteterminal_ttyd_web_patch_digest ~ '\n' ~
+          remoteterminal_ttyd_web_inputs_digest ~ '\n' ~
+          remoteterminal_ttyd_corepack_version ~ '\n' ~
+          remoteterminal_ttyd_corepack_package_url ~ '\n' ~
+          remoteterminal_ttyd_corepack_package_checksum ~ '\n' ~
+          remoteterminal_ttyd_yarn_version ~ '\n' ~
+          remoteterminal_ttyd_yarn_binary_checksum ~ '\n' ~
+          remoteterminal_node_version.stdout ~ '\n' ~
           remoteterminal_build_tool_package_versions) | hash('sha256') }}
 
 - name: Record content-addressed ttyd paths
@@ -14,6 +30,22 @@
          remoteterminal_ttyd_commit[0:12] }}-{{ remoteterminal_ttyd_build_fingerprint[0:12] }}
     remoteterminal_ttyd_completion_prefix: >-
       build={{ remoteterminal_ttyd_build_fingerprint }}
+    remoteterminal_ttyd_source_dir: >-
+      {{ remoteterminal_build_root }}/ttyd-{{ remoteterminal_ttyd_commit }}
+    remoteterminal_ttyd_build_dir: >-
+      {{ remoteterminal_build_root }}/ttyd-{{ remoteterminal_ttyd_commit }}-build
+    remoteterminal_ttyd_corepack_dir: >-
+      {{ remoteterminal_build_root }}/ttyd-corepack-{{ remoteterminal_ttyd_corepack_version }}
+    remoteterminal_ttyd_corepack_cache_dir: >-
+      {{ remoteterminal_build_root }}/ttyd-corepack-cache-{{
+         remoteterminal_ttyd_build_fingerprint[0:12] }}
+    remoteterminal_ttyd_web_patch_stage_path: >-
+      {{ remoteterminal_build_root }}/downloads/ttyd-{{
+         remoteterminal_ttyd_commit }}-{{ remoteterminal_ttyd_web_patch_digest[0:12] }}.patch
+    remoteterminal_ttyd_corepack_package_path: >-
+      {{ remoteterminal_build_root }}/downloads/corepack-{{
+         remoteterminal_ttyd_corepack_version }}-{{
+         remoteterminal_ttyd_corepack_package_checksum.split(':')[1][0:12] }}.tgz
 
 - name: Inspect root-owned ttyd tool hierarchy without following links
   ansible.builtin.stat:
@@ -178,6 +210,51 @@
          (remoteterminal_ttyd_installed_ldd_probe.rc | default(1)) == 0 and
          'not found' not in (remoteterminal_ttyd_installed_ldd_probe.stdout | default('')) }}
 
+- name: Record whether ttyd must be replaced during this deployment
+  ansible.builtin.set_fact:
+    remoteterminal_ttyd_tool_replaced: >-
+      {{ not (remoteterminal_ttyd_installed_valid | bool) }}
+
+- name: Create secure configuration directory before ttyd mutation
+  ansible.builtin.file:
+    path: "{{ remoteterminal_config_dir }}"
+    state: directory
+    owner: root
+    group: "{{ remoteterminal_selected_group }}"
+    mode: "0750"
+  when: remoteterminal_ttyd_tool_replaced | bool
+
+- name: Inspect durable restart marker before ttyd mutation
+  ansible.builtin.stat:
+    path: "{{ remoteterminal_restart_required_marker }}"
+    follow: false
+  register: remoteterminal_ttyd_restart_marker
+  when: remoteterminal_ttyd_tool_replaced | bool
+
+- name: Reject unsafe durable restart marker before ttyd mutation
+  ansible.builtin.assert:
+    that:
+      - >-
+        not remoteterminal_ttyd_restart_marker.stat.exists or
+        ((remoteterminal_ttyd_restart_marker.stat.isreg | default(false)) and
+         not (remoteterminal_ttyd_restart_marker.stat.islnk | default(false)) and
+         remoteterminal_ttyd_restart_marker.stat.uid | int == 0 and
+         remoteterminal_ttyd_restart_marker.stat.gid | int == 0 and
+         remoteterminal_ttyd_restart_marker.stat.mode == '0600')
+    fail_msg: >-
+      Refusing ttyd reconciliation because the durable restart marker has an
+      unsafe type, owner, group, or mode.
+  when: remoteterminal_ttyd_tool_replaced | bool
+
+- name: Persist restart requirement before ttyd mutation
+  ansible.builtin.copy:
+    content: "ttyd-tool-reconciliation-required\n"
+    dest: "{{ remoteterminal_restart_required_marker }}"
+    owner: root
+    group: root
+    mode: "0600"
+  when: remoteterminal_ttyd_tool_replaced | bool
+
 - name: Rebuild and atomically install pinned ttyd
   when: not (remoteterminal_ttyd_installed_valid | bool)
   block:
@@ -187,8 +264,10 @@
         follow: false
       loop:
         - "{{ remoteterminal_build_root }}/downloads"
-        - "{{ remoteterminal_build_root }}/ttyd-{{ remoteterminal_ttyd_commit }}"
-        - "{{ remoteterminal_build_root }}/ttyd-{{ remoteterminal_ttyd_commit }}-build"
+        - "{{ remoteterminal_ttyd_source_dir }}"
+        - "{{ remoteterminal_ttyd_build_dir }}"
+        - "{{ remoteterminal_ttyd_corepack_dir }}"
+        - "{{ remoteterminal_ttyd_corepack_cache_dir }}"
       register: remoteterminal_ttyd_build_path_stats
 
     - name: Reject unsafe delegated ttyd build directories
@@ -210,8 +289,10 @@
         path: "{{ item }}"
         state: absent
       loop:
-        - "{{ remoteterminal_build_root }}/ttyd-{{ remoteterminal_ttyd_commit }}"
-        - "{{ remoteterminal_build_root }}/ttyd-{{ remoteterminal_ttyd_commit }}-build"
+        - "{{ remoteterminal_ttyd_source_dir }}"
+        - "{{ remoteterminal_ttyd_build_dir }}"
+        - "{{ remoteterminal_ttyd_corepack_dir }}"
+        - "{{ remoteterminal_ttyd_corepack_cache_dir }}"
 
     - name: Create clean user-owned ttyd build directories
       ansible.builtin.file:
@@ -222,8 +303,10 @@
         mode: "0750"
       loop:
         - "{{ remoteterminal_build_root }}/downloads"
-        - "{{ remoteterminal_build_root }}/ttyd-{{ remoteterminal_ttyd_commit }}"
-        - "{{ remoteterminal_build_root }}/ttyd-{{ remoteterminal_ttyd_commit }}-build"
+        - "{{ remoteterminal_ttyd_source_dir }}"
+        - "{{ remoteterminal_ttyd_build_dir }}"
+        - "{{ remoteterminal_ttyd_corepack_dir }}"
+        - "{{ remoteterminal_ttyd_corepack_cache_dir }}"
 
     - name: Download checksum-pinned ttyd source archive
       ansible.builtin.get_url:
@@ -237,19 +320,369 @@
       become: true
       become_user: "{{ remoteterminal_user }}"
 
+    - name: Download checksum-pinned Corepack package for ttyd web build
+      ansible.builtin.get_url:
+        url: "{{ remoteterminal_ttyd_corepack_package_url }}"
+        dest: "{{ remoteterminal_ttyd_corepack_package_path }}"
+        checksum: "{{ remoteterminal_ttyd_corepack_package_checksum }}"
+        owner: "{{ remoteterminal_user }}"
+        group: "{{ remoteterminal_selected_group }}"
+        mode: "0640"
+        timeout: 60
+      become: true
+      become_user: "{{ remoteterminal_user }}"
+
     - name: Extract verified ttyd source archive
       ansible.builtin.unarchive:
         src: "{{ remoteterminal_build_root }}/downloads/ttyd-{{ remoteterminal_ttyd_commit }}.tar.gz"
-        dest: "{{ remoteterminal_build_root }}/ttyd-{{ remoteterminal_ttyd_commit }}"
+        dest: "{{ remoteterminal_ttyd_source_dir }}"
         remote_src: true
         extra_opts:
           - --strip-components=1
       become: true
       become_user: "{{ remoteterminal_user }}"
 
+    - name: Stage bundled ttyd web patch beside verified downloads
+      ansible.builtin.copy:
+        src: "{{ role_path }}/files/{{ remoteterminal_ttyd_web_patch_filename }}"
+        dest: "{{ remoteterminal_ttyd_web_patch_stage_path }}"
+        owner: "{{ remoteterminal_user }}"
+        group: "{{ remoteterminal_selected_group }}"
+        mode: "0640"
+      become: true
+      become_user: "{{ remoteterminal_user }}"
+
+    - name: Hash staged ttyd web patch and checked-in web header
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        follow: false
+        get_checksum: true
+        checksum_algorithm: sha256
+      loop:
+        - "{{ remoteterminal_ttyd_web_patch_stage_path }}"
+        - "{{ remoteterminal_ttyd_source_dir }}/src/html.h"
+      register: remoteterminal_ttyd_pre_web_build_artifacts
+      become: true
+      become_user: "{{ remoteterminal_user }}"
+
+    - name: Verify staged ttyd patch and original generated header
+      ansible.builtin.assert:
+        that:
+          - remoteterminal_ttyd_pre_web_build_artifacts.results[0].stat.exists
+          - remoteterminal_ttyd_pre_web_build_artifacts.results[0].stat.isreg
+          - not (remoteterminal_ttyd_pre_web_build_artifacts.results[0].stat.islnk | default(false))
+          - >-
+            remoteterminal_ttyd_pre_web_build_artifacts.results[0].stat.checksum ==
+            remoteterminal_ttyd_web_patch_digest
+          - remoteterminal_ttyd_pre_web_build_artifacts.results[1].stat.exists
+          - remoteterminal_ttyd_pre_web_build_artifacts.results[1].stat.isreg
+          - not (remoteterminal_ttyd_pre_web_build_artifacts.results[1].stat.islnk | default(false))
+          - (remoteterminal_ttyd_pre_web_build_artifacts.results[1].stat.checksum | length) == 64
+        fail_msg: >-
+          The bundled ttyd web patch or the archive's checked-in src/html.h is
+          missing, unsafe, or does not match its content-addressed build input.
+
+    - name: Apply exact ttyd browser-clipboard patch without fuzzy matching
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/patch
+          - --batch
+          - --forward
+          - --fuzz=0
+          - --no-backup-if-mismatch
+          - --strip=1
+          - "--input={{ remoteterminal_ttyd_web_patch_stage_path }}"
+        chdir: "{{ remoteterminal_ttyd_source_dir }}"
+      become: true
+      become_user: "{{ remoteterminal_user }}"
+      changed_when: true
+
+    - name: Inventory every patched ttyd web build input
+      ansible.builtin.find:
+        paths:
+          - "{{ remoteterminal_ttyd_source_dir }}/html"
+        file_type: file
+        hidden: true
+        recurse: true
+      register: remoteterminal_ttyd_web_input_files
+      become: true
+      become_user: "{{ remoteterminal_user }}"
+
+    - name: Verify patched ttyd web input inventory is not empty
+      ansible.builtin.assert:
+        that:
+          - remoteterminal_ttyd_web_input_files.matched | int > 0
+        fail_msg: "The pinned ttyd archive contains no regular html/ build inputs."
+
+    - name: Hash every patched ttyd web build input with SHA-256
+      ansible.builtin.stat:
+        path: "{{ item.path }}"
+        follow: false
+        get_checksum: true
+        checksum_algorithm: sha256
+      # Jinja's default sort is case-insensitive, while the pinned manifest is
+      # defined in bytewise path order (so README.md sorts before gulpfile.js).
+      loop: "{{ remoteterminal_ttyd_web_input_files.files | sort(case_sensitive=true, attribute='path') }}"
+      loop_control:
+        label: "{{ item.path }}"
+      register: remoteterminal_ttyd_web_input_stats
+      become: true
+      become_user: "{{ remoteterminal_user }}"
+
+    - name: Verify every inventoried ttyd web input remains a safe regular file
+      ansible.builtin.assert:
+        that:
+          - item.stat.exists
+          - item.stat.isreg
+          - not (item.stat.islnk | default(false))
+          - item.stat.uid | int == remoteterminal_selected_uid | int
+          - (item.stat.checksum | default('') | length) == 64
+        fail_msg: >-
+          Patched ttyd web input {{ item.item.path }} changed type, owner, or
+          disappeared while its content-addressed manifest was being built.
+      loop: "{{ remoteterminal_ttyd_web_input_stats.results }}"
+      loop_control:
+        label: "{{ item.item.path }}"
+
+    - name: Initialize deterministic ttyd web input manifest
+      ansible.builtin.set_fact:
+        remoteterminal_ttyd_web_input_manifest: []
+
+    - name: Assemble deterministic ttyd web input manifest
+      ansible.builtin.set_fact:
+        remoteterminal_ttyd_web_input_manifest: >-
+          {{ remoteterminal_ttyd_web_input_manifest +
+             [(item.item.path |
+               regex_replace('^' ~ (remoteterminal_ttyd_source_dir | regex_escape) ~ '/', '')) ~
+              ':' ~ item.stat.checksum] }}
+      loop: "{{ remoteterminal_ttyd_web_input_stats.results }}"
+      loop_control:
+        label: "{{ item.item.path }}"
+
+    - name: Calculate actual patched ttyd web input digest
+      ansible.builtin.set_fact:
+        # Keep this as a YAML double-quoted scalar: YAML turns \n into the
+        # newline separator used by the pinned manifest. In a block scalar,
+        # Ansible 2.14 passes a literal backslash+n to Jinja instead.
+        remoteterminal_ttyd_actual_web_inputs_digest: "{{ (remoteterminal_ttyd_web_input_manifest | join('\n')) | hash('sha256') }}"
+
+    - name: Verify every patched ttyd web input against the pinned manifest digest
+      ansible.builtin.assert:
+        that:
+          - remoteterminal_ttyd_actual_web_inputs_digest == remoteterminal_ttyd_web_inputs_digest
+        fail_msg: >-
+          The patched ttyd html/ input digest is
+          {{ remoteterminal_ttyd_actual_web_inputs_digest }}, expected
+          {{ remoteterminal_ttyd_web_inputs_digest }}. Refusing an unreviewed
+          frontend dependency or source change.
+
+    - name: Read patched ttyd xterm source
+      ansible.builtin.slurp:
+        src: "{{ remoteterminal_ttyd_source_dir }}/html/src/components/terminal/xterm/index.ts"
+      register: remoteterminal_ttyd_patched_xterm_source
+      become: true
+      become_user: "{{ remoteterminal_user }}"
+
+    - name: Verify ttyd no longer owns browser clipboard writes
+      ansible.builtin.assert:
+        that:
+          - "'ClipboardAddon' not in (remoteterminal_ttyd_patched_xterm_source.content | b64decode)"
+          - "'document.execCommand' not in (remoteterminal_ttyd_patched_xterm_source.content | b64decode)"
+          - "'terminal.onSelectionChange' not in (remoteterminal_ttyd_patched_xterm_source.content | b64decode)"
+        fail_msg: >-
+          The ttyd web patch left an internal ClipboardAddon provider or
+          copy-on-selection path in the xterm client.
+
+    - name: Install exact application-owned Corepack for ttyd web build
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/npm
+          - install
+          - --prefix
+          - "{{ remoteterminal_ttyd_corepack_dir }}"
+          - --no-save
+          - --package-lock=false
+          - --ignore-scripts
+          - --no-audit
+          - --no-fund
+          - "{{ remoteterminal_ttyd_corepack_package_path }}"
+      become: true
+      become_user: "{{ remoteterminal_user }}"
+      environment:
+        HOME: "{{ remoteterminal_selected_home }}"
+        NPM_CONFIG_CACHE: "{{ remoteterminal_ttyd_corepack_dir }}/npm-cache"
+        NPM_CONFIG_UPDATE_NOTIFIER: "false"
+      changed_when: true
+
+    - name: Read installed ttyd Corepack version
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/node
+          - "{{ remoteterminal_ttyd_corepack_dir }}/node_modules/corepack/dist/corepack.js"
+          - --version
+      register: remoteterminal_ttyd_corepack_version_result
+      become: true
+      become_user: "{{ remoteterminal_user }}"
+      changed_when: false
+
+    - name: Verify exact ttyd Corepack version
+      ansible.builtin.assert:
+        that:
+          - remoteterminal_ttyd_corepack_version_result.stdout | trim == remoteterminal_ttyd_corepack_version
+        fail_msg: >-
+          The ttyd web build installed Corepack
+          {{ remoteterminal_ttyd_corepack_version_result.stdout | trim }},
+          expected {{ remoteterminal_ttyd_corepack_version }}.
+
+    - name: Prepare exact Yarn release in application-owned Corepack cache
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/node
+          - "{{ remoteterminal_ttyd_corepack_dir }}/node_modules/corepack/dist/corepack.js"
+          - prepare
+          - "yarn@{{ remoteterminal_ttyd_yarn_version }}"
+          - --activate
+      become: true
+      become_user: "{{ remoteterminal_user }}"
+      environment:
+        HOME: "{{ remoteterminal_selected_home }}"
+        COREPACK_HOME: "{{ remoteterminal_ttyd_corepack_cache_dir }}"
+        COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+      changed_when: true
+
+    - name: Hash prepared ttyd Yarn executable
+      ansible.builtin.stat:
+        path: "{{ remoteterminal_ttyd_corepack_cache_dir }}/v1/yarn/{{ remoteterminal_ttyd_yarn_version }}/yarn.js"
+        follow: false
+        get_checksum: true
+        checksum_algorithm: sha256
+      register: remoteterminal_ttyd_yarn_binary
+      become: true
+      become_user: "{{ remoteterminal_user }}"
+
+    - name: Verify checksum-pinned ttyd Yarn executable before use
+      ansible.builtin.assert:
+        that:
+          - remoteterminal_ttyd_yarn_binary.stat.exists
+          - remoteterminal_ttyd_yarn_binary.stat.isreg
+          - not (remoteterminal_ttyd_yarn_binary.stat.islnk | default(false))
+          - remoteterminal_ttyd_yarn_binary.stat.uid | int == remoteterminal_selected_uid | int
+          - >-
+            remoteterminal_ttyd_yarn_binary.stat.checksum ==
+            remoteterminal_ttyd_yarn_binary_checksum.split(':')[1]
+        fail_msg: >-
+          Corepack prepared a Yarn {{ remoteterminal_ttyd_yarn_version }}
+          executable which does not match the pinned SHA-256 digest.
+
+    - name: Read prepared ttyd Yarn version
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/node
+          - "{{ remoteterminal_ttyd_corepack_dir }}/node_modules/corepack/dist/corepack.js"
+          - yarn
+          - --version
+      register: remoteterminal_ttyd_yarn_version_result
+      become: true
+      become_user: "{{ remoteterminal_user }}"
+      environment:
+        HOME: "{{ remoteterminal_selected_home }}"
+        COREPACK_HOME: "{{ remoteterminal_ttyd_corepack_cache_dir }}"
+        COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+      changed_when: false
+
+    - name: Verify exact ttyd Yarn version
+      ansible.builtin.assert:
+        that:
+          - remoteterminal_ttyd_yarn_version_result.stdout | trim == remoteterminal_ttyd_yarn_version
+        fail_msg: >-
+          The ttyd web build prepared Yarn
+          {{ remoteterminal_ttyd_yarn_version_result.stdout | trim }},
+          expected {{ remoteterminal_ttyd_yarn_version }}.
+
+    - name: Install immutable ttyd web dependencies from pinned Yarn lock
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/node
+          - "{{ remoteterminal_ttyd_corepack_dir }}/node_modules/corepack/dist/corepack.js"
+          - yarn
+          - install
+          - --immutable
+        chdir: "{{ remoteterminal_ttyd_source_dir }}/html"
+      become: true
+      become_user: "{{ remoteterminal_user }}"
+      environment:
+        HOME: "{{ remoteterminal_selected_home }}"
+        COREPACK_HOME: "{{ remoteterminal_ttyd_corepack_cache_dir }}"
+        COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+        YARN_ENABLE_TELEMETRY: "0"
+      changed_when: true
+
+    - name: Regenerate patched ttyd src/html.h from web sources
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/node
+          - "{{ remoteterminal_ttyd_corepack_dir }}/node_modules/corepack/dist/corepack.js"
+          - yarn
+          - run
+          - build
+        chdir: "{{ remoteterminal_ttyd_source_dir }}/html"
+      become: true
+      become_user: "{{ remoteterminal_user }}"
+      environment:
+        HOME: "{{ remoteterminal_selected_home }}"
+        COREPACK_HOME: "{{ remoteterminal_ttyd_corepack_cache_dir }}"
+        COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+        YARN_ENABLE_TELEMETRY: "0"
+      changed_when: true
+
+    - name: Inspect regenerated ttyd web artifacts
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        follow: false
+        get_checksum: true
+        checksum_algorithm: sha256
+      loop:
+        - "{{ remoteterminal_ttyd_source_dir }}/src/html.h"
+        - "{{ remoteterminal_ttyd_source_dir }}/html/dist/inline.html"
+      register: remoteterminal_ttyd_generated_web_artifacts
+      become: true
+      become_user: "{{ remoteterminal_user }}"
+
+    - name: Scan generated ttyd browser bundle for forbidden clipboard ownership
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/grep
+          - -E
+          - 'navigator[.]clipboard|document[.]execCommand|ClipboardAddon'
+          - "{{ remoteterminal_ttyd_source_dir }}/html/dist/inline.html"
+      register: remoteterminal_ttyd_generated_clipboard_scan
+      become: true
+      become_user: "{{ remoteterminal_user }}"
+      changed_when: false
+      failed_when: remoteterminal_ttyd_generated_clipboard_scan.rc not in [0, 1]
+
+    - name: Verify ttyd used the regenerated clipboard-neutral web header
+      ansible.builtin.assert:
+        that:
+          - remoteterminal_ttyd_generated_web_artifacts.results[0].stat.exists
+          - remoteterminal_ttyd_generated_web_artifacts.results[0].stat.isreg
+          - not (remoteterminal_ttyd_generated_web_artifacts.results[0].stat.islnk | default(false))
+          - remoteterminal_ttyd_generated_web_artifacts.results[0].stat.size | int > 0
+          - >-
+            remoteterminal_ttyd_generated_web_artifacts.results[0].stat.checksum !=
+            remoteterminal_ttyd_pre_web_build_artifacts.results[1].stat.checksum
+          - remoteterminal_ttyd_generated_web_artifacts.results[1].stat.exists
+          - remoteterminal_ttyd_generated_web_artifacts.results[1].stat.isreg
+          - not (remoteterminal_ttyd_generated_web_artifacts.results[1].stat.islnk | default(false))
+          - remoteterminal_ttyd_generated_web_artifacts.results[1].stat.size | int > 0
+          - remoteterminal_ttyd_generated_clipboard_scan.rc == 1
+        fail_msg: >-
+          ttyd did not regenerate src/html.h from the patched sources, or its
+          generated browser bundle still contains an internal clipboard-write path.
+
     - name: Read verified ttyd build manifest
       ansible.builtin.slurp:
-        src: "{{ remoteterminal_build_root }}/ttyd-{{ remoteterminal_ttyd_commit }}/CMakeLists.txt"
+        src: "{{ remoteterminal_ttyd_source_dir }}/CMakeLists.txt"
       register: remoteterminal_ttyd_cmake_manifest
       become: true
       become_user: "{{ remoteterminal_user }}"
@@ -269,9 +702,9 @@
         argv:
           - /usr/bin/cmake
           - -S
-          - "{{ remoteterminal_build_root }}/ttyd-{{ remoteterminal_ttyd_commit }}"
+          - "{{ remoteterminal_ttyd_source_dir }}"
           - -B
-          - "{{ remoteterminal_build_root }}/ttyd-{{ remoteterminal_ttyd_commit }}-build"
+          - "{{ remoteterminal_ttyd_build_dir }}"
           - -DCMAKE_BUILD_TYPE=Release
       become: true
       become_user: "{{ remoteterminal_user }}"
@@ -284,7 +717,7 @@
         argv:
           - /usr/bin/cmake
           - --build
-          - "{{ remoteterminal_build_root }}/ttyd-{{ remoteterminal_ttyd_commit }}-build"
+          - "{{ remoteterminal_ttyd_build_dir }}"
           - --clean-first
           - --parallel
           - "{{ remoteterminal_build_jobs | string }}"
@@ -296,7 +729,7 @@
 
     - name: Inspect compiled ttyd binary without following links
       ansible.builtin.stat:
-        path: "{{ remoteterminal_build_root }}/ttyd-{{ remoteterminal_ttyd_commit }}-build/ttyd"
+        path: "{{ remoteterminal_ttyd_build_dir }}/ttyd"
         follow: false
       register: remoteterminal_ttyd_build_result
       become: true
@@ -331,7 +764,7 @@
       ansible.builtin.command:
         argv:
           - /usr/bin/dd
-          - if={{ remoteterminal_build_root }}/ttyd-{{ remoteterminal_ttyd_commit }}-build/ttyd
+          - if={{ remoteterminal_ttyd_build_dir }}/ttyd
           - of={{ remoteterminal_ttyd_candidate.path }}/bin/ttyd
           - iflag=nofollow
           - conv=fsync

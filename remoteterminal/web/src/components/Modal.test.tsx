@@ -1,3 +1,4 @@
+import { createRef } from 'react'
 import { fireEvent, render, screen } from '@testing-library/react'
 import { describe, expect, it, vi } from 'vitest'
 import { Modal } from './Modal'
@@ -54,5 +55,17 @@ describe('Modal', () => {
     )
     fireEvent.keyDown(window, { key: 'Escape' })
     expect(onClose).toHaveBeenCalledTimes(1)
+  })
+
+  it('prefers an explicit initial focus target inside the dialog', () => {
+    const initialFocusRef = createRef<HTMLInputElement>()
+    render(
+      <Modal title="Targeted dialog" initialFocusRef={initialFocusRef} onClose={vi.fn()}>
+        <button type="button">First in DOM</button>
+        <input ref={initialFocusRef} aria-label="Preferred target" />
+      </Modal>,
+    )
+
+    expect(screen.getByRole('textbox', { name: 'Preferred target' })).toHaveFocus()
   })
 })

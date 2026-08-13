@@ -25,7 +25,7 @@ import (
 //go:embed internal/sessions/manager.go
 //go:embed web/index.html web/package.json web/package-lock.json web/tsconfig.json web/tsconfig.app.json web/tsconfig.node.json web/vite.config.ts
 //go:embed web/src/App.tsx web/src/api.ts web/src/icons.tsx web/src/main.tsx web/src/styles.css web/src/vite-env.d.ts
-//go:embed web/src/components/CodeServerPanel.tsx web/src/components/CreateSessionModal.tsx web/src/components/DeleteSessionModal.tsx web/src/components/LaunchCodeServerModal.tsx web/src/components/LoginView.tsx web/src/components/Modal.tsx web/src/components/ShutdownCodeServerModal.tsx web/src/components/TerminalPanel.tsx web/src/components/Workspace.tsx
+//go:embed web/src/components/CodeServerPanel.tsx web/src/components/CopySelectionModal.tsx web/src/components/CreateSessionModal.tsx web/src/components/DeleteSessionModal.tsx web/src/components/LaunchCodeServerModal.tsx web/src/components/LoginView.tsx web/src/components/Modal.tsx web/src/components/ShutdownCodeServerModal.tsx web/src/components/TerminalPanel.tsx web/src/components/Workspace.tsx
 var sourceFiles embed.FS
 
 // Materialize writes the embedded Remote Terminal source tree to a temporary

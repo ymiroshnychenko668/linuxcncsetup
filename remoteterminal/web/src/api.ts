@@ -393,16 +393,24 @@ export const api = {
       return { session, terminalUrl: normalizeTerminalUrl(response.terminalUrl) }
     }),
 
-  getLatestSelection: (id: string, signal?: AbortSignal) =>
+  takeLatestSelection: (id: string, signal?: AbortSignal) =>
     request<ClipboardResponse>(
       `/api/sessions/${encodeURIComponent(id)}/clipboard`,
-      { signal, cache: 'no-store' },
+      { method: 'POST', signal, cache: 'no-store' },
+      { csrf: true },
     ).then((response) => {
       if (typeof response.text !== 'string' || response.text.length === 0) {
         throw new ApiError('The service returned an invalid terminal selection.', 0, 'invalid_response')
       }
       return response.text
     }),
+
+  discardSelections: (id: string, signal?: AbortSignal) =>
+    request<void>(
+      `/api/sessions/${encodeURIComponent(id)}/clipboard`,
+      { method: 'DELETE', signal },
+      { csrf: true },
+    ),
 
   deleteSession: (id: string) =>
     request<void>(`/api/sessions/${encodeURIComponent(id)}`, { method: 'DELETE' }, { csrf: true }),

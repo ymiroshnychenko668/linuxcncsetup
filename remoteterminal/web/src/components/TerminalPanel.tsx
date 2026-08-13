@@ -1,12 +1,14 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { forwardRef, useCallback, useEffect, useImperativeHandle, useLayoutEffect, useRef, useState } from 'react'
 import { ApiError, api, type TerminalSession } from '../api'
 import { AlertIcon, RefreshIcon, TerminalIcon } from '../icons'
 
 export type TerminalState = 'connecting' | 'connected' | 'error'
 
 interface TtydTerminal {
+  clearSelection?: () => void
   fit?: () => void
   focus?: () => void
+  getSelection?: () => string
   refresh?: (start: number, end: number) => void
   rows?: number
   textarea?: HTMLTextAreaElement
@@ -25,7 +27,18 @@ interface TerminalPanelProps {
   onSessionChange: (session: TerminalSession) => void
 }
 
-export function TerminalPanel({ session, active, focusRequestKey, reconnectKey, onStateChange, onSessionChange }: TerminalPanelProps) {
+export interface TerminalPanelHandle {
+  takeSelection: () => string
+}
+
+export const TerminalPanel = forwardRef<TerminalPanelHandle, TerminalPanelProps>(function TerminalPanel({
+  session,
+  active,
+  focusRequestKey,
+  reconnectKey,
+  onStateChange,
+  onSessionChange,
+}, ref) {
   const [state, setState] = useState<TerminalState>('connecting')
   const [terminalUrl, setTerminalUrl] = useState<string | null>(null)
   const [frameKey, setFrameKey] = useState(0)
@@ -144,6 +157,27 @@ export function TerminalPanel({ session, active, focusRequestKey, reconnectKey, 
     return false
   }, [])
 
+  const takeSelection = useCallback(() => {
+    try {
+      const terminal = (frameRef.current?.contentWindow as TtydWindow | null)?.term
+      if (typeof terminal?.getSelection !== 'function') return ''
+      const selection = terminal.getSelection()
+      if (typeof selection !== 'string' || selection === '') return ''
+      try {
+        terminal.clearSelection?.()
+      } catch {
+        // The captured text is still exact and usable if xterm is navigating
+        // between getSelection and the best-effort stale-selection cleanup.
+      }
+      return selection
+    } catch {
+      // Access can fail while the same-origin terminal iframe is navigating.
+      return ''
+    }
+  }, [])
+
+  useImperativeHandle(ref, () => ({ takeSelection }), [takeSelection])
+
   const scheduleTerminalFocus = useCallback(function scheduleTerminalFocus(attempt = 0) {
     const request = focusRequestRef.current
     if (!activeRef.current || request <= focusedRequestRef.current) return
@@ -252,7 +286,7 @@ export function TerminalPanel({ session, active, focusRequestKey, reconnectKey, 
           className="terminal-frame"
           src={terminalUrl}
           title={`${session.name} terminal`}
-          allow="clipboard-read; clipboard-write"
+          allow="clipboard-read 'none'; clipboard-write 'none'"
           onLoad={() => {
             updateState('connected')
             scheduleTerminalRefit()
@@ -285,4 +319,4 @@ export function TerminalPanel({ session, active, focusRequestKey, reconnectKey, 
       ) : null}
     </section>
   )
-}
+})
