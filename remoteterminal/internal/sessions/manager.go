@@ -39,8 +39,11 @@ var (
 )
 
 const (
+	minimumTmuxMajor              = 3
+	minimumTmuxMinor              = 2
 	maxSelectionBytes             = 1 << 20
 	tmuxListFormat                = "#{session_name}\t#{@remoteterminal-id}\t#{@remoteterminal-name}\t#{session_attached}\t#{session_windows}\t#{session_created}"
+	tmuxWindowListFormat          = "#{window_id}"
 	tmuxSelectionListFormat       = "#{buffer_name}\t#{buffer_size}"
 	tmuxSelectionBufferPrefix     = "rtclip-"
 	tmuxSelectionBindingPrefix    = tmuxSelectionBufferPrefix + "#{session_name}-"
@@ -52,10 +55,16 @@ const (
 	tmuxStatusMode                = "off"
 	tmuxHistoryLimitOption        = "history-limit"
 	tmuxHistoryLimit              = "50000"
+	terminalForegroundColor       = "#d2d2d2"
+	terminalBackgroundColor       = "#2b2b2b"
+	tmuxWindowStyleOption         = "window-style"
+	tmuxWindowActiveStyleOption   = "window-active-style"
+	tmuxWindowStyle               = "fg=" + terminalForegroundColor + ",bg=" + terminalBackgroundColor
 	tmuxColorEnvironment          = "COLORTERM"
 	tmuxColorEnvironmentValue     = "truecolor"
 	tmuxNoColorEnvironment        = "NO_COLOR"
 	ttydRendererPreference        = "rendererType=canvas"
+	ttydThemePreference           = `theme={"foreground":"` + terminalForegroundColor + `","background":"` + terminalBackgroundColor + `"}`
 )
 
 // Session is the public description returned by the API. ID is an opaque,
@@ -179,7 +188,11 @@ func (m *Manager) Initialize(ctx context.Context) error {
 	if len(filepath.Join(m.ttydDir(), strings.Repeat("a", 32)+".sock")) >= 104 {
 		return errors.New("runtime directory path is too long for ttyd Unix sockets")
 	}
-	if _, err := m.runner.Run(ctx, m.config.TmuxBinary, "-V"); err != nil {
+	tmuxVersion, err := m.runner.Run(ctx, m.config.TmuxBinary, "-V")
+	if err != nil {
+		return fmt.Errorf("tmux dependency check failed: %w", err)
+	}
+	if err := validateTmuxVersion(tmuxVersion); err != nil {
 		return fmt.Errorf("tmux dependency check failed: %w", err)
 	}
 	if _, err := m.runner.Run(ctx, m.config.TtydBinary, "--version"); err != nil {
@@ -311,6 +324,27 @@ func validSelectionBufferName(name, prefix string) bool {
 	return true
 }
 
+func parseTmuxWindowTargets(output []byte) ([]string, error) {
+	trimmed := strings.TrimSpace(string(output))
+	if trimmed == "" {
+		return nil, errors.New("list tmux session windows: session has no windows")
+	}
+	lines := strings.Split(trimmed, "\n")
+	targets := make([]string, 0, len(lines))
+	for _, target := range lines {
+		if len(target) < 2 || target[0] != '@' {
+			return nil, fmt.Errorf("list tmux session windows: invalid window target %q", target)
+		}
+		for _, character := range target[1:] {
+			if character < '0' || character > '9' {
+				return nil, fmt.Errorf("list tmux session windows: invalid window target %q", target)
+			}
+		}
+		targets = append(targets, target)
+	}
+	return targets, nil
+}
+
 func (m *Manager) listLocked(ctx context.Context) ([]Session, error) {
 	if _, err := os.Stat(m.tmuxSocket()); errors.Is(err, os.ErrNotExist) {
 		m.reconcileProcessesLocked(nil)
@@ -431,6 +465,12 @@ func (m *Manager) Create(ctx context.Context, name string) (Session, error) {
 		"set-environment", "-gu", tmuxNoColorEnvironment, ";",
 		"set-option", "-g", tmuxStatusOption, tmuxStatusMode, ";",
 		"set-option", "-g", tmuxHistoryLimitOption, tmuxHistoryLimit, ";",
+		// Codex discovers the terminal's default colours with OSC 10/11 at
+		// startup and only renders its subtle block backgrounds when tmux can
+		// answer those queries. Explicit styles make tmux's tty defaults match
+		// the ttyd theme before the first pane (and Codex) can start.
+		"set-option", "-g", tmuxWindowStyleOption, tmuxWindowStyle, ";",
+		"set-option", "-g", tmuxWindowActiveStyleOption, tmuxWindowStyle, ";",
 		"new-session", "-d", "-s", target); err != nil {
 		cleanup()
 		return Session{}, commandError("create tmux session", output, err)
@@ -483,6 +523,33 @@ func (m *Manager) Connect(ctx context.Context, id string) (Session, string, erro
 	session, err := m.findLocked(ctx, id)
 	if err != nil {
 		return Session{}, "", err
+	}
+	// Reapply the explicit default colours before even reusing an existing ttyd
+	// process. Besides keeping recovered private servers consistent with the
+	// current browser theme, this lets programs receive deterministic OSC 10/11
+	// replies from tmux. The global window options cover future windows; apply
+	// the same values explicitly to every existing window in the recovered
+	// session so an old local value cannot mask the terminal colour contract.
+	windowOutput, err := m.runner.Run(ctx, m.config.TmuxBinary,
+		"-S", m.tmuxSocket(), "list-windows", "-t", tmuxTarget(id), "-F", tmuxWindowListFormat)
+	if err != nil {
+		return Session{}, "", commandError("list tmux session windows", windowOutput, err)
+	}
+	windowTargets, err := parseTmuxWindowTargets(windowOutput)
+	if err != nil {
+		return Session{}, "", err
+	}
+	for _, option := range []string{tmuxWindowStyleOption, tmuxWindowActiveStyleOption} {
+		if output, err := m.runner.Run(ctx, m.config.TmuxBinary,
+			"-S", m.tmuxSocket(), "set-option", "-g", option, tmuxWindowStyle); err != nil {
+			return Session{}, "", commandError("configure tmux default terminal colors", output, err)
+		}
+		for _, windowTarget := range windowTargets {
+			if output, err := m.runner.Run(ctx, m.config.TmuxBinary,
+				"-S", m.tmuxSocket(), "set-window-option", "-t", windowTarget, option, tmuxWindowStyle); err != nil {
+				return Session{}, "", commandError("configure tmux terminal colors", output, err)
+			}
+		}
 	}
 	// tmux normally emits OSC 52 with an empty clipboard selector, while ttyd's
 	// xterm clipboard addon accepts the explicit "c" system-clipboard selector.
@@ -738,11 +805,48 @@ func TtydArguments(tmuxBinary, tmuxSocket, ttydSocket, id string) []string {
 		"-W",
 		"-O",
 		"-t", ttydRendererPreference,
+		"-t", ttydThemePreference,
 		"-b", terminalBasePath(id),
 		"-i", ttydSocket,
 		"--",
 		tmuxBinary, "-S", tmuxSocket, "attach-session", "-t", tmuxTarget(id),
 	}
+}
+
+// validateTmuxVersion enforces the first tmux release which answers OSC 10/11
+// default-colour queries. Suffixes used by stable releases (for example 3.3a)
+// do not affect this capability check.
+func validateTmuxVersion(output []byte) error {
+	fields := strings.Fields(string(output))
+	if len(fields) < 2 || fields[0] != "tmux" {
+		return fmt.Errorf("could not parse tmux version from %q; tmux %d.%d or newer is required",
+			strings.TrimSpace(string(output)), minimumTmuxMajor, minimumTmuxMinor)
+	}
+	version := strings.TrimPrefix(fields[1], "next-")
+	dot := strings.IndexByte(version, '.')
+	if dot < 1 || dot == len(version)-1 {
+		return fmt.Errorf("could not parse tmux version from %q; tmux %d.%d or newer is required",
+			strings.TrimSpace(string(output)), minimumTmuxMajor, minimumTmuxMinor)
+	}
+	minorEnd := dot + 1
+	for minorEnd < len(version) && version[minorEnd] >= '0' && version[minorEnd] <= '9' {
+		minorEnd++
+	}
+	if minorEnd == dot+1 {
+		return fmt.Errorf("could not parse tmux version from %q; tmux %d.%d or newer is required",
+			strings.TrimSpace(string(output)), minimumTmuxMajor, minimumTmuxMinor)
+	}
+	major, majorErr := strconv.Atoi(version[:dot])
+	minor, minorErr := strconv.Atoi(version[dot+1 : minorEnd])
+	if majorErr != nil || minorErr != nil {
+		return fmt.Errorf("could not parse tmux version from %q; tmux %d.%d or newer is required",
+			strings.TrimSpace(string(output)), minimumTmuxMajor, minimumTmuxMinor)
+	}
+	if major < minimumTmuxMajor || major == minimumTmuxMajor && minor < minimumTmuxMinor {
+		return fmt.Errorf("tmux %d.%d or newer is required for terminal default-color queries (found %q)",
+			minimumTmuxMajor, minimumTmuxMinor, strings.TrimSpace(string(output)))
+	}
+	return nil
 }
 
 func ValidateName(name string) error {

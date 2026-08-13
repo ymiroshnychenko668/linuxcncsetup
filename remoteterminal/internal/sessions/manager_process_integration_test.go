@@ -184,6 +184,33 @@ func TestManagerRealProcessLifecycle(t *testing.T) {
 		"show-options", "-gv", tmuxHistoryLimitOption); strings.TrimSpace(output) != tmuxHistoryLimit {
 		t.Fatalf("Create global history-limit = %q, want %q", strings.TrimSpace(output), tmuxHistoryLimit)
 	}
+	for _, option := range []string{tmuxWindowStyleOption, tmuxWindowActiveStyleOption} {
+		if output := integrationCommand(t, tmuxBinary, "-S", manager.tmuxSocket(),
+			"show-options", "-gv", option); strings.TrimSpace(output) != tmuxWindowStyle {
+			t.Fatalf("Create global %s = %q, want %q", option, strings.TrimSpace(output), tmuxWindowStyle)
+		}
+	}
+	requireTmuxDefaultColorResponses(t, ctx, tmuxBinary, manager.tmuxSocket(), tmuxTarget(created.ID), root)
+	requireTmuxBackgroundRendering(t, ctx, tmuxBinary, manager.tmuxSocket(), tmuxTarget(created.ID))
+	if output, err := exec.CommandContext(ctx, tmuxBinary, "-S", manager.tmuxSocket(),
+		"new-window", "-d", "-t", tmuxTarget(created.ID)+":", "-n", "recovered").CombinedOutput(); err != nil {
+		t.Fatalf("create recovered-window fixture: %v (%s)", err, strings.TrimSpace(string(output)))
+	}
+	windowTargets := integrationTmuxWindowTargets(t, ctx, tmuxBinary, manager.tmuxSocket(), tmuxTarget(created.ID))
+	if len(windowTargets) != 2 {
+		t.Fatalf("recovered-window fixture has %d windows, want 2", len(windowTargets))
+	}
+	for _, windowTarget := range windowTargets {
+		for option, value := range map[string]string{
+			tmuxWindowStyleOption:       "fg=red,bg=blue",
+			tmuxWindowActiveStyleOption: "fg=green,bg=yellow",
+		} {
+			if output, err := exec.CommandContext(ctx, tmuxBinary, "-S", manager.tmuxSocket(),
+				"set-window-option", "-t", windowTarget, option, value).CombinedOutput(); err != nil {
+				t.Fatalf("poison recovered %s on %s: %v (%s)", option, windowTarget, err, strings.TrimSpace(string(output)))
+			}
+		}
+	}
 	initialTerminalOverrides := integrationCommand(t, tmuxBinary, "-S", manager.tmuxSocket(),
 		"show-options", "-s", "terminal-overrides")
 	t.Logf("Initialize/Create: runtime=%s id=%s target=%s", managedRuntime, created.ID, tmuxTarget(created.ID))
@@ -206,6 +233,19 @@ func TestManagerRealProcessLifecycle(t *testing.T) {
 	if output, err := exec.CommandContext(ctx, tmuxBinary, "-S", manager.tmuxSocket(),
 		"show-options", "-v", "-t", tmuxTarget(created.ID), tmuxHistoryLimitOption).CombinedOutput(); err != nil || strings.TrimSpace(string(output)) != tmuxHistoryLimit {
 		t.Fatalf("Connect did not configure tmux scrollback: %v (%s)", err, strings.TrimSpace(string(output)))
+	}
+	for _, option := range []string{tmuxWindowStyleOption, tmuxWindowActiveStyleOption} {
+		if output, err := exec.CommandContext(ctx, tmuxBinary, "-S", manager.tmuxSocket(),
+			"show-options", "-gv", option).CombinedOutput(); err != nil || strings.TrimSpace(string(output)) != tmuxWindowStyle {
+			t.Fatalf("Connect did not restore global tmux %s: %v (%s)", option, err, strings.TrimSpace(string(output)))
+		}
+		for _, windowTarget := range windowTargets {
+			if output, err := exec.CommandContext(ctx, tmuxBinary, "-S", manager.tmuxSocket(),
+				"show-options", "-wv", "-t", windowTarget, option).CombinedOutput(); err != nil || strings.TrimSpace(string(output)) != tmuxWindowStyle {
+				t.Fatalf("Connect did not configure tmux %s on %s: %v (%s)",
+					option, windowTarget, err, strings.TrimSpace(string(output)))
+			}
+		}
 	}
 	requireTmuxColorEnvironment(t, tmuxBinary, manager.tmuxSocket(), "-g")
 	requireTmuxColorEnvironment(t, tmuxBinary, manager.tmuxSocket(), "-t", tmuxTarget(created.ID))
@@ -305,6 +345,11 @@ func TestManagerRealProcessLifecycle(t *testing.T) {
 	}
 	if renderer, _ := preferences["rendererType"].(string); renderer != "canvas" {
 		t.Fatalf("ttyd rendererType = %#v, want canvas", preferences["rendererType"])
+	}
+	theme, ok := preferences["theme"].(map[string]interface{})
+	if !ok || theme["foreground"] != terminalForegroundColor || theme["background"] != terminalBackgroundColor {
+		t.Fatalf("ttyd theme = %#v, want foreground=%s background=%s",
+			preferences["theme"], terminalForegroundColor, terminalBackgroundColor)
 	}
 	if output, err := firstWS.readTTydOutputUntil([]byte(promptMarker), 5*time.Second); err != nil {
 		t.Fatalf("initial tmux attach did not render the existing shell prompt: %v; output=%q", err, output)
@@ -592,6 +637,20 @@ func requireTmuxSession(t *testing.T, binary, socket, target string) {
 	}
 }
 
+func integrationTmuxWindowTargets(t *testing.T, ctx context.Context, binary, socket, target string) []string {
+	t.Helper()
+	output, err := exec.CommandContext(ctx, binary, "-S", socket,
+		"list-windows", "-t", target, "-F", tmuxWindowListFormat).CombinedOutput()
+	if err != nil {
+		t.Fatalf("list tmux windows for %s: %v (%s)", target, err, strings.TrimSpace(string(output)))
+	}
+	targets, err := parseTmuxWindowTargets(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return targets
+}
+
 func requireTmuxColorEnvironment(t *testing.T, binary, socket string, scope ...string) {
 	t.Helper()
 	arguments := []string{"-S", socket, "show-environment"}
@@ -645,6 +704,59 @@ func requireInitialPaneColorEnvironment(t *testing.T, binary, socket, target str
 	}
 	if color != tmuxColorEnvironmentValue || noColor {
 		t.Fatalf("first pane environment = COLORTERM=%q NO_COLOR-present=%t", color, noColor)
+	}
+}
+
+func requireTmuxDefaultColorResponses(t *testing.T, ctx context.Context, binary, socket, target, directory string) {
+	t.Helper()
+	want := []byte("\x1b]10;rgb:d2d2/d2d2/d2d2\a\x1b]11;rgb:2b2b/2b2b/2b2b\a")
+	replyPath := filepath.Join(directory, "tmux-default-color-replies")
+	// Run the same startup probe used by terminal applications such as Codex.
+	// The private integration path contains no shell metacharacters; tmux types
+	// this fixed test command into the pane's shell exactly as one command line.
+	probeCommand := "stty raw -echo min 0 time 20; printf '\\033]10;?\\007\\033]11;?\\007'; " +
+		"dd bs=1 count=" + strconv.Itoa(len(want)) + " status=none > '" + replyPath + "'; stty sane"
+	if output, err := exec.CommandContext(ctx, binary, "-S", socket,
+		"send-keys", "-t", target, probeCommand, "Enter").CombinedOutput(); err != nil {
+		t.Fatalf("send OSC 10/11 default-color probe: %v (%s)", err, strings.TrimSpace(string(output)))
+	}
+	if err := integrationEventually(4*time.Second, func() error {
+		got, err := os.ReadFile(replyPath)
+		if err != nil {
+			return err
+		}
+		if !bytes.Equal(got, want) {
+			return fmt.Errorf("OSC 10/11 replies = %q, want %q", got, want)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func requireTmuxBackgroundRendering(t *testing.T, ctx context.Context, binary, socket, target string) {
+	t.Helper()
+	const (
+		backgroundSequence = "\x1b[48;2;48;48;48m"
+		marker             = "__REMOTE_TERMINAL_BACKGROUND_FILL__"
+	)
+	command := "printf '\\033[48;2;48;48;48m" + marker + "\\033[0m\\n'"
+	if output, err := exec.CommandContext(ctx, binary, "-S", socket,
+		"send-keys", "-t", target, command, "Enter").CombinedOutput(); err != nil {
+		t.Fatalf("emit true-color terminal background: %v (%s)", err, strings.TrimSpace(string(output)))
+	}
+	if err := integrationEventually(3*time.Second, func() error {
+		capture, err := exec.CommandContext(ctx, binary, "-S", socket,
+			"capture-pane", "-p", "-e", "-t", target, "-S", "-20").CombinedOutput()
+		if err != nil {
+			return err
+		}
+		if !bytes.Contains(capture, []byte(backgroundSequence+marker)) {
+			return fmt.Errorf("tmux capture does not retain the true-color background for %s", marker)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
 	}
 }
 
