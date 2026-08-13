@@ -17,9 +17,13 @@ import (
 )
 
 const (
-	defaultWidth  = 80
-	defaultHeight = 24
-	sidebarWidth  = 28
+	defaultWidth              = 80
+	defaultHeight             = 24
+	sidebarWidth              = 28
+	minimumDesktopDetailWidth = 40
+	layoutGap                 = 1
+	compactHelpContentWidth   = 48
+	maximumHelpHeight         = 2
 )
 
 type sectionAction int
@@ -338,6 +342,9 @@ var (
 			BorderForeground(lipgloss.Color("#707880")).
 			Padding(1, 2)
 
+	compactPanelStyle = panelStyle.
+				Padding(0, 1)
+
 	helpStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#707880"))
 
@@ -356,6 +363,7 @@ type Model struct {
 	page                     menuPage
 	selected                 int
 	confirming               bool
+	detailPage               int
 	status                   string
 	remoteTerminal           remoteTerminalDraft
 	linuxCNCSections         []section
@@ -492,6 +500,7 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 
 	case actionFinishedMsg:
 		m.confirming = false
+		m.detailPage = 0
 		if message.err != nil {
 			m.status = fmt.Sprintf("%s failed: %v", actionName(message.action), message.err)
 		} else {
@@ -521,12 +530,24 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			case "n", "esc":
 				action := m.currentSection().action
 				m.confirming = false
+				m.detailPage = 0
 				m.status = actionCancelledMessage(action)
 			case "y":
 				current := m.currentSection()
 				m.confirming = false
+				m.detailPage = 0
 				m.status = actionRunningMessage(current.action)
 				return m, m.executeAction(current.action, current.value)
+			case "pgup":
+				if m.detailPage <= 1 {
+					m.detailPage = 0
+				} else {
+					m.detailPage--
+				}
+			case "pgdown":
+				if maximum := m.maximumDetailPage(); maximum > 0 {
+					m.detailPage = min(max(m.detailPage+1, 1), maximum)
+				}
 			}
 			return m, nil
 		}
@@ -568,24 +589,27 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// View implements tea.Model.
-func (m Model) View() tea.View {
-	contentWidth := max(m.width-appStyle.GetHorizontalFrameSize(), 1)
-	contentHeight := max(m.height-appStyle.GetVerticalFrameSize(), 1)
-	bodyHeight := max(contentHeight-3, 1)
-	detailWidth := max(contentWidth-sidebarWidth-1, 20)
+type viewLayout struct {
+	contentWidth  int
+	contentHeight int
+	bodyHeight    int
+	help          string
+	helpGap       int
+	stacked       bool
+	sidebarWidth  int
+	sidebarHeight int
+	detailWidth   int
+	detailHeight  int
+}
 
-	sidebar := panelStyle.
-		Width(sidebarWidth).
-		Height(bodyHeight).
-		Render(m.renderSidebar())
+type panelOverflowMode uint8
 
-	detail := panelStyle.
-		Width(detailWidth).
-		Height(bodyHeight).
-		Render(m.renderDetail())
+const (
+	panelOverflowTop panelOverflowMode = iota
+	panelOverflowEnds
+)
 
-	body := lipgloss.JoinHorizontal(lipgloss.Top, sidebar, detail)
+func (m Model) helpText(compact bool) string {
 	helpText := "↑/k up • ↓/j down • Enter select • q quit"
 	if m.page != menuMain {
 		helpText = "↑/k up • ↓/j down • Enter select • Esc back • q quit"
@@ -603,10 +627,217 @@ func (m Model) View() tea.View {
 		helpText = "Type to edit • ↑/↓/Tab field • Backspace erase • Enter review • Esc back"
 	}
 	if m.confirming {
-		helpText = "y confirm • n/Esc cancel • q quit"
+		helpText = "PgUp/PgDn details • y confirm • n/Esc cancel • q quit"
 	}
-	help := helpStyle.Render(helpText)
-	content := appStyle.Render(lipgloss.JoinVertical(lipgloss.Left, body, help))
+	if !compact {
+		return helpText
+	}
+
+	helpText = "↑/↓ move • Enter select • q quit"
+	if m.page != menuMain {
+		helpText = "↑/↓ move • Enter • Esc back • q quit"
+	}
+	if m.page == menuIRQCPUs || m.page == menuIRQDeviceCPUs {
+		helpText = "↑/↓ • Space toggle • Enter • Esc"
+	}
+	if m.page == menuIRQDevices {
+		helpText = "↑/↓ • Pg keys • Enter • r • Esc"
+	}
+	if m.page == menuRemoteTerminal {
+		helpText = "Tab field • type • Enter • Esc"
+	}
+	if m.confirming {
+		helpText = "Pg details • y yes • n no"
+	}
+	return helpText
+}
+
+func (m Model) calculateViewLayout() viewLayout {
+	layout := viewLayout{
+		contentWidth:  max(m.width-appStyle.GetHorizontalFrameSize(), 1),
+		contentHeight: max(m.height-appStyle.GetVerticalFrameSize(), 1),
+	}
+
+	helpHeightLimit := min(maximumHelpHeight, layout.contentHeight)
+	helpText := m.helpText(layout.contentWidth < compactHelpContentWidth)
+	layout.help = helpStyle.
+		Width(layout.contentWidth).
+		MaxWidth(layout.contentWidth).
+		MaxHeight(helpHeightLimit).
+		Render(helpText)
+	helpHeight := lipgloss.Height(layout.help)
+	if layout.contentHeight-helpHeight > 1 {
+		layout.helpGap = layoutGap
+	}
+	layout.bodyHeight = max(layout.contentHeight-helpHeight-layout.helpGap, 1)
+
+	layout.stacked = layout.contentWidth < sidebarWidth+minimumDesktopDetailWidth+layoutGap
+	if !layout.stacked {
+		layout.sidebarWidth = sidebarWidth
+		layout.sidebarHeight = layout.bodyHeight
+		layout.detailWidth = layout.contentWidth - sidebarWidth - layoutGap
+		layout.detailHeight = layout.bodyHeight
+		return layout
+	}
+
+	layout.sidebarWidth = layout.contentWidth
+	layout.detailWidth = layout.contentWidth
+	compactHeaderHeight := compactPanelStyle.GetVerticalFrameSize() + 1
+	layout.sidebarHeight = min(compactHeaderHeight, layout.bodyHeight)
+	remainingHeight := layout.bodyHeight - layout.sidebarHeight
+	layout.detailHeight = max(remainingHeight, 0)
+	return layout
+}
+
+func renderPanelWithStyle(
+	style lipgloss.Style,
+	content string,
+	width, height int,
+	overflow panelOverflowMode,
+	page int,
+) string {
+	width = max(width, 1)
+	height = max(height, 1)
+	innerWidth := width - style.GetHorizontalFrameSize()
+	innerHeight := height - style.GetVerticalFrameSize()
+	if innerWidth < 1 || innerHeight < 1 {
+		return lipgloss.NewStyle().
+			Width(width).
+			Height(height).
+			MaxWidth(width).
+			MaxHeight(height).
+			Render(content)
+	}
+
+	content = lipgloss.NewStyle().
+		Width(innerWidth).
+		MaxWidth(innerWidth).
+		Render(content)
+	lines := strings.Split(content, "\n")
+	if len(lines) > innerHeight {
+		if overflow != panelOverflowEnds || innerHeight < 3 {
+			lines = lines[:innerHeight]
+		} else if page > 0 {
+			pageSize := max(innerHeight-2, 1)
+			start := (page - 1) * pageSize
+			start = min(start, max(len(lines)-pageSize, 0))
+			end := min(start+pageSize, len(lines))
+			paged := make([]string, 0, innerHeight)
+			if start > 0 {
+				paged = append(paged, helpStyle.Render("↑"))
+			}
+			paged = append(paged, lines[start:end]...)
+			if end < len(lines) {
+				paged = append(paged, helpStyle.Render("↓"))
+			}
+			lines = paged
+		} else {
+			headCount := max((innerHeight-1)/3, 1)
+			tailCount := innerHeight - headCount - 1
+			cropped := make([]string, 0, innerHeight)
+			cropped = append(cropped, lines[:headCount]...)
+			cropped = append(cropped, helpStyle.Render("⋯"))
+			cropped = append(cropped, lines[len(lines)-tailCount:]...)
+			lines = cropped
+		}
+		content = strings.Join(lines, "\n")
+	}
+	return style.
+		Width(width).
+		Height(height).
+		MaxWidth(width).
+		MaxHeight(height).
+		Render(content)
+}
+
+func panelPageCount(style lipgloss.Style, content string, width, height int) int {
+	innerWidth := width - style.GetHorizontalFrameSize()
+	innerHeight := height - style.GetVerticalFrameSize()
+	if innerWidth < 1 || innerHeight < 3 {
+		return 0
+	}
+	content = lipgloss.NewStyle().
+		Width(innerWidth).
+		MaxWidth(innerWidth).
+		Render(content)
+	lineCount := len(strings.Split(content, "\n"))
+	if lineCount <= innerHeight {
+		return 0
+	}
+	pageSize := max(innerHeight-2, 1)
+	return (lineCount + pageSize - 1) / pageSize
+}
+
+func renderPanel(content string, width, height int) string {
+	return renderPanelWithStyle(panelStyle, content, width, height, panelOverflowTop, 0)
+}
+
+// View implements tea.Model.
+func (m Model) View() tea.View {
+	layout := m.calculateViewLayout()
+
+	var body string
+	if layout.stacked {
+		sidebarInnerWidth := max(
+			layout.sidebarWidth-compactPanelStyle.GetHorizontalFrameSize(),
+			1,
+		)
+		sidebar := renderPanelWithStyle(
+			compactPanelStyle,
+			m.renderCompactSidebar(sidebarInnerWidth),
+			layout.sidebarWidth,
+			layout.sidebarHeight,
+			panelOverflowTop,
+			0,
+		)
+		parts := []string{sidebar}
+		if layout.detailHeight > 0 {
+			detailContent := m.renderDetailWithHeading(false)
+			if m.confirming {
+				// Compact confirmations reserve every available row for the
+				// warning and safety text. Decorative blank lines look good on a
+				// large terminal but can otherwise hide material disclosures.
+				detailContent = compactVerticalWhitespace(detailContent)
+			}
+			parts = append(parts, renderPanelWithStyle(
+				compactPanelStyle,
+				detailContent,
+				layout.detailWidth,
+				layout.detailHeight,
+				panelOverflowModeForDetail(m),
+				m.detailPage,
+			))
+		}
+		body = lipgloss.JoinVertical(lipgloss.Left, parts...)
+	} else {
+		sidebarInnerWidth := max(layout.sidebarWidth-panelStyle.GetHorizontalFrameSize(), 1)
+		sidebarInnerHeight := max(layout.sidebarHeight-panelStyle.GetVerticalFrameSize(), 1)
+		sidebar := renderPanel(
+			m.renderSidebar(sidebarInnerWidth, sidebarInnerHeight),
+			layout.sidebarWidth,
+			layout.sidebarHeight,
+		)
+		detail := renderPanelWithStyle(
+			panelStyle,
+			m.renderDetail(),
+			layout.detailWidth,
+			layout.detailHeight,
+			panelOverflowModeForDetail(m),
+			m.detailPage,
+		)
+		body = lipgloss.JoinHorizontal(lipgloss.Top, sidebar, " ", detail)
+	}
+
+	parts := []string{body}
+	if layout.helpGap > 0 {
+		parts = append(parts, "")
+	}
+	parts = append(parts, layout.help)
+	content := appStyle.Render(lipgloss.JoinVertical(lipgloss.Left, parts...))
+	content = lipgloss.NewStyle().
+		MaxWidth(max(m.width, 1)).
+		MaxHeight(max(m.height, 1)).
+		Render(content)
 
 	view := tea.NewView(content)
 	view.AltScreen = true
@@ -614,23 +845,81 @@ func (m Model) View() tea.View {
 	return view
 }
 
-func (m Model) renderSidebar() string {
-	var builder strings.Builder
-	builder.WriteString(titleStyle.Render(m.pageTitle()))
-	builder.WriteString("\n\n")
+func panelOverflowModeForDetail(m Model) panelOverflowMode {
+	if m.confirming || m.status != "" {
+		return panelOverflowEnds
+	}
+	return panelOverflowTop
+}
+
+func (m Model) maximumDetailPage() int {
+	layout := m.calculateViewLayout()
+	style := panelStyle
+	content := m.renderDetail()
+	if layout.stacked {
+		style = compactPanelStyle
+		content = m.renderDetailWithHeading(false)
+		if m.confirming {
+			content = compactVerticalWhitespace(content)
+		}
+	}
+	return panelPageCount(style, content, layout.detailWidth, layout.detailHeight)
+}
+
+func compactVerticalWhitespace(content string) string {
+	lines := strings.Split(content, "\n")
+	compacted := lines[:0]
+	for _, line := range lines {
+		if strings.TrimSpace(line) != "" {
+			compacted = append(compacted, line)
+		}
+	}
+	return strings.Join(compacted, "\n")
+}
+
+func (m Model) renderCompactSidebar(width int) string {
+	sections := m.visibleSections()
+	if len(sections) == 0 {
+		return titleStyle.MaxWidth(max(width, 1)).Render(m.pageTitle())
+	}
+	selected := min(max(m.selected, 0), len(sections)-1)
+	return selectedStyle.
+		MaxWidth(max(width, 1)).
+		Render("› " + sections[selected].title)
+}
+
+func (m Model) renderSidebar(width, height int) string {
+	width = max(width, 1)
+	height = max(height, 1)
+	lines := []string{titleStyle.Inline(true).MaxWidth(width).Render(m.pageTitle())}
+	if height == 1 {
+		return lines[0]
+	}
+	lines = append(lines, "")
+	menuHeight := height - len(lines)
+	if menuHeight < 1 {
+		return strings.Join(lines[:height], "\n")
+	}
 
 	sections := m.visibleSections()
-	maxVisible := max(m.height-10, 3)
-	start := 0
-	if len(sections) > maxVisible {
-		start = m.selected - maxVisible/2
-		start = max(start, 0)
-		start = min(start, len(sections)-maxVisible)
+	if len(sections) == 0 {
+		return strings.Join(lines, "\n")
 	}
-	end := min(start+maxVisible, len(sections))
-	if start > 0 {
-		builder.WriteString(helpStyle.Render("  ↑ more"))
-		builder.WriteString("\n")
+	selected := min(max(m.selected, 0), len(sections)-1)
+	visibleCount := min(len(sections), menuHeight)
+	if menuHeight >= 3 && len(sections) > menuHeight {
+		visibleCount = menuHeight - 2
+	}
+	start := min(max(selected-visibleCount/2, 0), len(sections)-visibleCount)
+	end := start + visibleCount
+	showAbove := start > 0 && len(lines)+visibleCount < height
+	usedLines := len(lines) + visibleCount
+	if showAbove {
+		usedLines++
+	}
+	showBelow := end < len(sections) && usedLines < height
+	if showAbove {
+		lines = append(lines, helpStyle.MaxWidth(width).Render("  ↑ more"))
 	}
 
 	for index := start; index < end; index++ {
@@ -641,19 +930,19 @@ func (m Model) renderSidebar() string {
 			style = selectedStyle
 			prefix = "› "
 		}
-
-		builder.WriteString(style.Render(prefix + section.title))
-		builder.WriteString("\n")
+		lines = append(lines, style.MaxWidth(width).Render(prefix+section.title))
 	}
-	if end < len(sections) {
-		builder.WriteString(helpStyle.Render("  ↓ more"))
-		builder.WriteString("\n")
+	if showBelow {
+		lines = append(lines, helpStyle.MaxWidth(width).Render("  ↓ more"))
 	}
-
-	return builder.String()
+	return strings.Join(lines[:min(len(lines), height)], "\n")
 }
 
 func (m Model) renderDetail() string {
+	return m.renderDetailWithHeading(true)
+}
+
+func (m Model) renderDetailWithHeading(showHeading bool) string {
 	current := m.currentSection()
 	var lines []string
 	switch current.action {
@@ -663,11 +952,13 @@ func (m Model) renderDetail() string {
 		// These views provide their own full identity and use the remaining
 		// panel height as a scrollable /proc/interrupts viewport.
 	default:
-		lines = []string{
-			titleStyle.Render(current.title),
-			"",
-			current.description,
-			"",
+		if showHeading && !m.confirming {
+			lines = []string{
+				titleStyle.Render(current.title),
+				"",
+				current.description,
+				"",
+			}
 		}
 	}
 
@@ -692,7 +983,16 @@ func (m Model) renderDetail() string {
 			"authenticated browser access on the local network.",
 		)
 	case actionInstallRemoteTerminal:
-		lines = append(lines, m.renderRemoteTerminalForm(m.confirming)...)
+		var formLines []string
+		if m.confirming {
+			formLines = renderCompactRemoteTerminalConfirmation(m.remoteTerminal)
+		} else {
+			formLines = m.renderRemoteTerminalForm(m.confirming)
+			if !showHeading && len(formLines) >= 3 {
+				formLines = formLines[3:]
+			}
+		}
+		lines = append(lines, formLines...)
 	case actionOpenGitSetup:
 		lines = append(lines, "Press Enter to install Git tools or sign in to GitHub.")
 	case actionInstallGitTools, actionGitHubLogin:
@@ -1032,7 +1332,12 @@ func (m Model) renderDetail() string {
 		lines = append(lines, "", statusStyle.Render(m.status))
 	}
 
-	lines = append(lines, "", fmt.Sprintf("Terminal: %d×%d", m.width, m.height))
+	// Confirmation disclosures and action errors are more important than the
+	// diagnostic dimensions when the detail viewport is short. Omitting this
+	// footer also keeps the complete confirmation tail visible at 40 rows/cols.
+	if !m.confirming && m.status == "" {
+		lines = append(lines, "", fmt.Sprintf("Terminal: %d×%d", m.width, m.height))
+	}
 	return strings.Join(lines, "\n")
 }
 
@@ -1043,6 +1348,7 @@ func (m *Model) moveSelection(delta int) {
 		m.irqDeviceDetailOffset = 0
 	}
 	m.status = ""
+	m.detailPage = 0
 }
 
 func (m *Model) prepareSelectedAction() {
@@ -1383,6 +1689,7 @@ func (m *Model) prepareSelectedAction() {
 	}
 
 	m.status = ""
+	m.detailPage = 0
 	m.confirming = true
 }
 
@@ -1500,6 +1807,7 @@ func (m *Model) openPage(page menuPage) {
 	m.page = page
 	m.selected = 0
 	m.confirming = false
+	m.detailPage = 0
 	m.status = ""
 	m.irqDeviceDetailOffset = 0
 }

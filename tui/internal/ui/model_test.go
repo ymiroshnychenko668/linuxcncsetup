@@ -2,6 +2,7 @@ package ui
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -9,6 +10,7 @@ import (
 	"testing"
 
 	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 )
 
 func TestInitialView(t *testing.T) {
@@ -26,6 +28,378 @@ func TestInitialView(t *testing.T) {
 	}
 	if !view.AltScreen {
 		t.Fatal("application should use the alternate screen")
+	}
+}
+
+func TestViewFitsResponsiveTerminalSizes(t *testing.T) {
+	states := []struct {
+		name  string
+		model Model
+	}{
+		{name: "main menu", model: New()},
+		{
+			name: "scrolled main menu",
+			model: func() Model {
+				model := New()
+				model.selected = len(mainSections) - 1
+				return model
+			}(),
+		},
+		{
+			name: "remote terminal form",
+			model: func() Model {
+				model := New()
+				model.page = menuRemoteTerminal
+				return model
+			}(),
+		},
+		{
+			name: "long confirmation",
+			model: func() Model {
+				model := New()
+				model.page = menuIRQReview
+				model.selected = 1
+				model.confirming = true
+				model.irqSnapshotLoaded = true
+				model.irqSnapshot = IRQSnapshot{OnlineCPUs: []int{0, 1, 2, 3}}
+				model.irqProtectedCPUs = []int{3}
+				return model
+			}(),
+		},
+	}
+	sizes := []struct {
+		width  int
+		height int
+	}{
+		{width: 40, height: 20},
+		{width: 46, height: 40},
+		{width: 60, height: 24},
+		{width: 80, height: 24},
+	}
+
+	for _, state := range states {
+		for _, size := range sizes {
+			name := fmt.Sprintf("%s/%dx%d", state.name, size.width, size.height)
+			t.Run(name, func(t *testing.T) {
+				model := state.model
+				updated, command := model.Update(tea.WindowSizeMsg{
+					Width:  size.width,
+					Height: size.height,
+				})
+				if command != nil {
+					t.Fatal("resize should not execute a command")
+				}
+				view := updated.(Model).View()
+				if width := lipgloss.Width(view.Content); width > size.width {
+					t.Fatalf("rendered width = %d; terminal width = %d", width, size.width)
+				}
+				if height := lipgloss.Height(view.Content); height > size.height {
+					t.Fatalf("rendered height = %d; terminal height = %d", height, size.height)
+				}
+			})
+		}
+	}
+}
+
+func TestViewUsesStackedLayoutOnlyWhenSplitWouldOverflow(t *testing.T) {
+	for _, test := range []struct {
+		width       int
+		wantStacked bool
+	}{
+		{width: 40, wantStacked: true},
+		{width: 46, wantStacked: true},
+		{width: 60, wantStacked: true},
+		{width: 72, wantStacked: true},
+		{width: 73, wantStacked: false},
+		{width: 80, wantStacked: false},
+	} {
+		model := New()
+		model.width = test.width
+		if layout := model.calculateViewLayout(); layout.stacked != test.wantStacked {
+			t.Fatalf(
+				"width %d stacked = %t; want %t",
+				test.width,
+				layout.stacked,
+				test.wantStacked,
+			)
+		}
+	}
+}
+
+func TestRenderPanelUsesRequestedTotalDimensions(t *testing.T) {
+	content := strings.Repeat("long content that wraps ", 20) +
+		strings.Repeat("\nmore content", 20)
+	for _, test := range []struct {
+		name   string
+		style  lipgloss.Style
+		width  int
+		height int
+	}{
+		{name: "desktop", style: panelStyle, width: 28, height: 18},
+		{name: "compact", style: compactPanelStyle, width: 36, height: 3},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			panel := renderPanelWithStyle(
+				test.style,
+				content,
+				test.width,
+				test.height,
+				panelOverflowTop,
+				0,
+			)
+			if width := lipgloss.Width(panel); width != test.width {
+				t.Fatalf("rendered panel width = %d; want total width %d", width, test.width)
+			}
+			if height := lipgloss.Height(panel); height != test.height {
+				t.Fatalf("rendered panel height = %d; want total height %d", height, test.height)
+			}
+		})
+	}
+}
+
+func TestRenderPanelCanPreserveBothEndsOfOverflow(t *testing.T) {
+	content := "first\nsecond\nthird\nfourth\nfifth"
+	panel := renderPanelWithStyle(
+		lipgloss.NewStyle(),
+		content,
+		10,
+		3,
+		panelOverflowEnds,
+		0,
+	)
+	if !strings.Contains(panel, "first") || !strings.Contains(panel, "fifth") {
+		t.Fatalf("end-preserving panel lost identity or action tail:\n%s", panel)
+	}
+	if !strings.Contains(panel, "⋯") {
+		t.Fatalf("end-preserving panel has no overflow marker:\n%s", panel)
+	}
+}
+
+func TestNarrowSidebarKeepsSelectedItemVisible(t *testing.T) {
+	model := New()
+	model.width = 40
+	model.height = 20
+	model.selected = len(mainSections) - 1
+	view := model.View()
+
+	if !strings.Contains(view.Content, mainSections[model.selected].title) {
+		t.Fatalf("narrow view does not show selected item %q", mainSections[model.selected].title)
+	}
+}
+
+func TestNarrowRemoteTerminalFormKeepsFieldsVisible(t *testing.T) {
+	for _, size := range []struct {
+		width  int
+		height int
+	}{
+		{width: 40, height: 20},
+		{width: 60, height: 24},
+		{width: 72, height: 24},
+	} {
+		t.Run(fmt.Sprintf("%dx%d", size.width, size.height), func(t *testing.T) {
+			model := New()
+			model.width = size.width
+			model.height = size.height
+			model.page = menuRemoteTerminal
+			model.remoteTerminal = remoteTerminalDraft{
+				user:          "operator",
+				machineName:   "mill",
+				listenAddress: "10.0.0.2",
+				port:          "8443",
+			}
+			view := model.View()
+
+			for _, label := range []string{
+				"Linux system user",
+				"Machine name",
+				"LAN IPv4 address",
+				"HTTPS port",
+			} {
+				if !strings.Contains(view.Content, label) {
+					t.Fatalf("form does not show %q", label)
+				}
+			}
+		})
+	}
+}
+
+func TestConfirmationSafetyRemainsVisibleAtSupportedSizes(t *testing.T) {
+	tests := []struct {
+		name     string
+		model    Model
+		expected []string
+	}{
+		{
+			name: "IRQ policy",
+			model: func() Model {
+				model := New()
+				model.page = menuIRQReview
+				model.selected = 1
+				model.confirming = true
+				model.irqSnapshotLoaded = true
+				model.irqSnapshot = IRQSnapshot{OnlineCPUs: []int{0, 1, 2, 3}}
+				model.irqProtectedCPUs = []int{3}
+				return model
+			}(),
+			expected: []string{
+				"Apply at next boot",
+				"not change live IRQs",
+				"LinuxCNC must be stopped",
+				"Press y to continue",
+			},
+		},
+		{
+			name: "LinuxCNC autostart",
+			model: func() Model {
+				model := New()
+				model.page = menuLinuxCNCConfigs
+				model.linuxCNCDesktop = linuxCNCDesktopSway
+				model.linuxCNCSections = linuxCNCConfigSections(
+					[]linuxCNCConfig{{label: "mill", path: "/configs/mill.ini"}},
+					linuxCNCDesktopSway,
+				)
+				model.confirming = true
+				return model
+			}(),
+			expected: []string{
+				"mill",
+				"will not be launched",
+				"now.",
+				"sudo will ask",
+				"Press y to continue",
+			},
+		},
+		{
+			name: "Remote Terminal install",
+			model: func() Model {
+				model := New()
+				model.page = menuRemoteTerminal
+				model.confirming = true
+				model.remoteTerminal = remoteTerminalDraft{
+					user:          "operator",
+					machineName:   "mill",
+					listenAddress: "10.0.0.2",
+					port:          "8443",
+				}
+				return model
+			}(),
+			expected: []string{
+				"Install Remote Terminal?",
+				"Machine: mill",
+				"https://10.0.0.2:8443/",
+				"self-signed",
+				"certificate.",
+				"sudo will ask",
+				"Press y to install",
+			},
+		},
+	}
+	sizes := []struct {
+		width  int
+		height int
+	}{
+		{width: 80, height: 24},
+		{width: 60, height: 24},
+		{width: 40, height: 20},
+	}
+
+	for _, test := range tests {
+		for _, size := range sizes {
+			name := fmt.Sprintf("%s/%dx%d", test.name, size.width, size.height)
+			t.Run(name, func(t *testing.T) {
+				model := test.model
+				model.width = size.width
+				model.height = size.height
+				view := model.View()
+				for _, expected := range test.expected {
+					if !strings.Contains(view.Content, expected) {
+						t.Fatalf("confirmation does not show %q:\n%s", expected, view.Content)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestNarrowConfirmationDetailsCanBePaged(t *testing.T) {
+	model := New()
+	model.width = 40
+	model.height = 20
+	model.page = menuLinuxCNCConfigs
+	model.linuxCNCDesktop = linuxCNCDesktopSway
+	model.linuxCNCSections = linuxCNCConfigSections(
+		[]linuxCNCConfig{{label: "mill", path: "/configs/mill.ini"}},
+		linuxCNCDesktopSway,
+	)
+	model.confirming = true
+
+	if view := model.View(); !strings.Contains(view.Content, "⋯") {
+		t.Fatalf("overflowing confirmation has no details indicator:\n%s", view.Content)
+	}
+	var pages strings.Builder
+	for range 6 {
+		updated, command := model.Update(tea.KeyPressMsg{Code: tea.KeyPgDown})
+		if command != nil {
+			t.Fatal("paging confirmation details should not execute a command")
+		}
+		model = updated.(Model)
+		pages.WriteString(model.View().Content)
+		pages.WriteByte('\n')
+	}
+	if maximum := model.maximumDetailPage(); model.detailPage != maximum {
+		t.Fatalf("PgDn detail page = %d; want capped maximum %d", model.detailPage, maximum)
+	}
+	for _, expected := range []string{"LinuxCNC may initialize", "connected machine"} {
+		if !strings.Contains(pages.String(), expected) {
+			t.Fatalf("paged confirmation never shows %q:\n%s", expected, pages.String())
+		}
+	}
+	if help := model.helpText(true); !strings.Contains(help, "Pg details") {
+		t.Fatalf("compact confirmation help does not advertise paging: %q", help)
+	}
+	model.detailPage = 1
+	updated, command := model.Update(tea.KeyPressMsg{Code: tea.KeyPgUp})
+	if command != nil {
+		t.Fatal("paging back should not execute a command")
+	}
+	if got := updated.(Model).detailPage; got != 0 {
+		t.Fatalf("PgUp detail page = %d", got)
+	}
+}
+
+func TestRemoteTerminalValidationStatusRemainsVisibleAtSupportedSizes(t *testing.T) {
+	for _, size := range []struct {
+		width  int
+		height int
+	}{
+		{width: 80, height: 24},
+		{width: 60, height: 24},
+		{width: 40, height: 20},
+	} {
+		t.Run(fmt.Sprintf("%dx%d", size.width, size.height), func(t *testing.T) {
+			model := New()
+			model.width = size.width
+			model.height = size.height
+			model.page = menuRemoteTerminal
+			model.remoteTerminal = remoteTerminalDraft{
+				user:          "operator",
+				machineName:   "mill",
+				listenAddress: "10.0.0.2",
+				port:          "8443",
+			}
+			model.status = "Cannot install Remote Terminal: machine name is invalid."
+
+			view := model.View()
+			for _, fragment := range []string{
+				"Cannot install Remote",
+				"name is",
+				"invalid.",
+			} {
+				if !strings.Contains(view.Content, fragment) {
+					t.Fatalf("validation status fragment %q is hidden:\n%s", fragment, view.Content)
+				}
+			}
+		})
 	}
 }
 
@@ -246,6 +620,7 @@ func TestIRQApplyConfirmationView(t *testing.T) {
 	model.page = menuIRQReview
 	model.selected = 1
 	model.width = 160
+	model.height = 48
 	model.confirming = true
 	model.irqSnapshotLoaded = true
 	model.irqSnapshot = IRQSnapshot{OnlineCPUs: []int{0, 1, 2, 3}}
@@ -600,6 +975,7 @@ func TestLinuxCNCAutostartConfirmationView(t *testing.T) {
 				test.desktop,
 			)
 			model.width = 160
+			model.height = 48
 			model.confirming = true
 			view := model.View()
 

@@ -206,6 +206,20 @@ func (m Model) renderRemoteTerminalForm(confirming bool) []string {
 	)
 }
 
+func renderCompactRemoteTerminalConfirmation(draft remoteTerminalDraft) []string {
+	draft = draft.normalized()
+	return []string{
+		warningStyle.Render("Install Remote Terminal?"),
+		fmt.Sprintf("User: %s", draft.user),
+		fmt.Sprintf("Machine: %s", draft.machineName),
+		fmt.Sprintf("URL: https://%s:%s/", draft.listenAddress, draft.port),
+		"Builds service, web UI, and pinned ttyd.",
+		"TLS: creates a self-signed certificate.",
+		"sudo will ask for your password.",
+		"Press y to install or n to cancel.",
+	}
+}
+
 func (m *Model) prepareRemoteTerminalInstall() bool {
 	m.remoteTerminal = m.remoteTerminal.normalized()
 	if err := validateRemoteTerminalDraft(m.remoteTerminal); err != nil {

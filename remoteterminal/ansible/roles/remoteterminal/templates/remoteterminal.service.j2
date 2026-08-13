@@ -19,6 +19,8 @@ Environment=USER={{ remoteterminal_user }}
 Environment=LOGNAME={{ remoteterminal_user }}
 Environment=SHELL={{ remoteterminal_selected_shell }}
 Environment=PATH=/usr/local/bin:/usr/bin:/bin
+Environment=COLORTERM=truecolor
+UnsetEnvironment=NO_COLOR
 Environment=REMOTE_TERMINAL_WEB_DIR={{ remoteterminal_release_dir }}/web
 ExecStart={{ remoteterminal_release_dir }}/bin/remoteterminal
 Restart=on-failure

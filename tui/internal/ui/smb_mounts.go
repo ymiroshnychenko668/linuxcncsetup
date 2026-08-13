@@ -74,7 +74,7 @@ func renderSMBMountAction(action sectionAction, confirming bool) []string {
 			renderSMBShareLocation(),
 			"",
 			"Ansible installs cifs-utils if needed,",
-			"creates a guest-access CIFS entry in",
+			"creates a persistent guest-access CIFS entry in",
 			"/etc/fstab, enables systemd automounting,",
 			"and mounts the share now.",
 			"",

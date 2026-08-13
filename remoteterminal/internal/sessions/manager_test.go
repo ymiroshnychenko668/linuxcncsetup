@@ -20,11 +20,14 @@ import (
 )
 
 type fakeTmuxSession struct {
-	target  string
-	id      string
-	name    string
-	mouse   bool
-	created int64
+	target       string
+	id           string
+	name         string
+	mouse        bool
+	status       string
+	historyLimit string
+	environment  map[string]string
+	created      int64
 }
 
 type fakeTmuxBuffer struct {
@@ -44,6 +47,7 @@ type fakeRunner struct {
 	selectionInspectError      error
 	selectionReadError         error
 	selectionBindings          map[string]string
+	globalEnvironment          map[string]string
 	newSessionErrorAfterCreate error
 }
 
@@ -51,6 +55,10 @@ func newFakeRunner() *fakeRunner {
 	return &fakeRunner{
 		sessions:          make(map[string]*fakeTmuxSession),
 		selectionBindings: make(map[string]string),
+		globalEnvironment: map[string]string{
+			tmuxColorEnvironment:   "not-truecolor",
+			tmuxNoColorEnvironment: "1",
+		},
 	}
 }
 
@@ -133,23 +141,74 @@ func (f *fakeRunner) Run(_ context.Context, binary string, args ...string) ([]by
 		}
 		f.selectionBindings[commandArgs[4]] = strings.Join(commandArgs[6:], "\x00")
 		return nil, nil
-	case "new-session":
-		if len(args) != 8 || args[0] != "-f" || args[1] != "/dev/null" ||
-			len(commandArgs) != 6 || commandArgs[3] != "-d" || commandArgs[4] != "-s" {
+	case "start-server":
+		if len(args) != 29 || args[0] != "-f" || args[1] != "/dev/null" ||
+			len(commandArgs) != 27 ||
+			commandArgs[3] != ";" ||
+			commandArgs[4] != "set-environment" || commandArgs[5] != "-g" ||
+			commandArgs[6] != tmuxColorEnvironment || commandArgs[7] != tmuxColorEnvironmentValue ||
+			commandArgs[8] != ";" ||
+			commandArgs[9] != "set-environment" || commandArgs[10] != "-gu" ||
+			commandArgs[11] != tmuxNoColorEnvironment || commandArgs[12] != ";" ||
+			commandArgs[13] != "set-option" || commandArgs[14] != "-g" ||
+			commandArgs[15] != tmuxStatusOption || commandArgs[16] != tmuxStatusMode ||
+			commandArgs[17] != ";" ||
+			commandArgs[18] != "set-option" || commandArgs[19] != "-g" ||
+			commandArgs[20] != tmuxHistoryLimitOption || commandArgs[21] != tmuxHistoryLimit ||
+			commandArgs[22] != ";" || commandArgs[23] != "new-session" ||
+			commandArgs[24] != "-d" || commandArgs[25] != "-s" {
 			return nil, fmt.Errorf("unsafe new-session args: %v", call)
 		}
-		target := commandArgs[5]
+		target := commandArgs[26]
 		if _, exists := f.sessions[target]; exists {
 			return nil, errors.New("duplicate target")
 		}
 		if err := os.WriteFile(socket, []byte("fake socket marker"), 0600); err != nil {
 			return nil, err
 		}
-		f.sessions[target] = &fakeTmuxSession{target: target, created: 1700000000}
+		f.globalEnvironment[tmuxColorEnvironment] = tmuxColorEnvironmentValue
+		delete(f.globalEnvironment, tmuxNoColorEnvironment)
+		environment := make(map[string]string, len(f.globalEnvironment))
+		for name, value := range f.globalEnvironment {
+			environment[name] = value
+		}
+		f.sessions[target] = &fakeTmuxSession{
+			target: target, status: tmuxStatusMode, historyLimit: tmuxHistoryLimit,
+			environment: environment, created: 1700000000,
+		}
 		if f.newSessionErrorAfterCreate != nil {
 			return []byte("simulated cancellation after tmux accepted new-session"), f.newSessionErrorAfterCreate
 		}
 		return nil, nil
+	case "set-environment":
+		if len(commandArgs) == 6 && commandArgs[3] == "-g" &&
+			commandArgs[4] == tmuxColorEnvironment && commandArgs[5] == tmuxColorEnvironmentValue {
+			f.globalEnvironment[tmuxColorEnvironment] = tmuxColorEnvironmentValue
+			return nil, nil
+		}
+		if len(commandArgs) == 5 && commandArgs[3] == "-gu" && commandArgs[4] == tmuxNoColorEnvironment {
+			delete(f.globalEnvironment, tmuxNoColorEnvironment)
+			return nil, nil
+		}
+		if len(commandArgs) == 7 && commandArgs[3] == "-t" &&
+			commandArgs[5] == tmuxColorEnvironment && commandArgs[6] == tmuxColorEnvironmentValue {
+			session := f.sessions[commandArgs[4]]
+			if session == nil {
+				return nil, errors.New("target missing")
+			}
+			session.environment[tmuxColorEnvironment] = tmuxColorEnvironmentValue
+			return nil, nil
+		}
+		if len(commandArgs) == 7 && commandArgs[3] == "-u" && commandArgs[4] == "-t" &&
+			commandArgs[6] == tmuxNoColorEnvironment {
+			session := f.sessions[commandArgs[5]]
+			if session == nil {
+				return nil, errors.New("target missing")
+			}
+			delete(session.environment, tmuxNoColorEnvironment)
+			return nil, nil
+		}
+		return nil, fmt.Errorf("unsafe set-environment args: %v", call)
 	case "set-option":
 		if len(commandArgs) == 6 && commandArgs[3] == "-s" {
 			switch commandArgs[4] {
@@ -185,6 +244,16 @@ func (f *fakeRunner) Run(_ context.Context, binary string, args ...string) ([]by
 				return nil, errors.New("mouse must be enabled")
 			}
 			session.mouse = true
+		case tmuxStatusOption:
+			if commandArgs[6] != tmuxStatusMode {
+				return nil, errors.New("status must be disabled")
+			}
+			session.status = commandArgs[6]
+		case tmuxHistoryLimitOption:
+			if commandArgs[6] != tmuxHistoryLimit {
+				return nil, errors.New("unexpected history limit")
+			}
+			session.historyLimit = commandArgs[6]
 		default:
 			return nil, errors.New("unexpected option")
 		}
@@ -297,7 +366,7 @@ func TestTtydArgumentsAreFixedAndShellFree(t *testing.T) {
 	id := "0123456789abcdef0123456789abcdef"
 	got := TtydArguments("/usr/bin/tmux", "/run/rt/tmux.sock", "/run/rt/ttyd/id.sock", id)
 	want := []string{
-		"-W", "-O", "-b", "/terminal/" + id,
+		"-W", "-O", "-t", ttydRendererPreference, "-b", "/terminal/" + id,
 		"-i", "/run/rt/ttyd/id.sock", "--", "/usr/bin/tmux", "-S", "/run/rt/tmux.sock",
 		"attach-session", "-t", "rt_" + id,
 	}
@@ -315,6 +384,32 @@ func TestCreateListConnectDeleteLifecycle(t *testing.T) {
 	if !ValidID(created.ID) || created.Name != "Main terminal" {
 		t.Fatalf("unexpected created session: %+v", created)
 	}
+	runner.mu.Lock()
+	createdTmux := runner.sessions[tmuxTarget(created.ID)]
+	initialColor := createdTmux.environment[tmuxColorEnvironment]
+	_, initialNoColor := createdTmux.environment[tmuxNoColorEnvironment]
+	initialStatus := createdTmux.status
+	initialHistoryLimit := createdTmux.historyLimit
+	createCalls := append([][]string(nil), runner.calls...)
+	runner.mu.Unlock()
+	if initialColor != tmuxColorEnvironmentValue || initialNoColor {
+		t.Fatalf("Create() initial pane environment = COLORTERM=%q NO_COLOR-present=%t", initialColor, initialNoColor)
+	}
+	if initialStatus != tmuxStatusMode || initialHistoryLimit != tmuxHistoryLimit {
+		t.Fatalf("Create() inherited options = status %q history-limit %q", initialStatus, initialHistoryLimit)
+	}
+	wantCreateCall := []string{
+		"tmux", "-f", "/dev/null", "-S", manager.tmuxSocket(),
+		"start-server", ";",
+		"set-environment", "-g", tmuxColorEnvironment, tmuxColorEnvironmentValue, ";",
+		"set-environment", "-gu", tmuxNoColorEnvironment, ";",
+		"set-option", "-g", tmuxStatusOption, tmuxStatusMode, ";",
+		"set-option", "-g", tmuxHistoryLimitOption, tmuxHistoryLimit, ";",
+		"new-session", "-d", "-s", tmuxTarget(created.ID),
+	}
+	if !containsCommand(createCalls, wantCreateCall) {
+		t.Fatalf("Create() did not sanitize the first pane in its tmux command queue: %#v", createCalls)
+	}
 	listed, err := manager.List(context.Background())
 	if err != nil || len(listed) != 1 || listed[0].ID != created.ID {
 		t.Fatalf("List() = %+v, %v", listed, err)
@@ -330,7 +425,14 @@ func TestCreateListConnectDeleteLifecycle(t *testing.T) {
 		t.Fatalf("ttyd starts = %d, want 1", len(starter.calls))
 	}
 	runner.mu.Lock()
-	mouseEnabled := runner.sessions[tmuxTarget(created.ID)].mouse
+	configuredTmux := runner.sessions[tmuxTarget(created.ID)]
+	mouseEnabled := configuredTmux.mouse
+	status := configuredTmux.status
+	historyLimit := configuredTmux.historyLimit
+	color := configuredTmux.environment[tmuxColorEnvironment]
+	_, noColor := configuredTmux.environment[tmuxNoColorEnvironment]
+	globalColor := runner.globalEnvironment[tmuxColorEnvironment]
+	_, globalNoColor := runner.globalEnvironment[tmuxNoColorEnvironment]
 	clipboardMode := runner.clipboardMode
 	clipboardTerminalOverride := runner.clipboardTerminalOverride
 	selectionBindings := make(map[string]string, len(runner.selectionBindings))
@@ -340,6 +442,13 @@ func TestCreateListConnectDeleteLifecycle(t *testing.T) {
 	runner.mu.Unlock()
 	if !mouseEnabled {
 		t.Fatal("Connect() did not enable tmux mouse scrolling")
+	}
+	if status != tmuxStatusMode || historyLimit != tmuxHistoryLimit {
+		t.Fatalf("Connect() tmux display options = status %q history-limit %q", status, historyLimit)
+	}
+	if color != tmuxColorEnvironmentValue || noColor || globalColor != tmuxColorEnvironmentValue || globalNoColor {
+		t.Fatalf("Connect() environment = session COLORTERM=%q NO_COLOR=%t, global COLORTERM=%q NO_COLOR=%t",
+			color, noColor, globalColor, globalNoColor)
 	}
 	if clipboardTerminalOverride != tmuxClipboardTerminalOverride {
 		t.Fatalf("Connect() clipboard override = %q, want %q", clipboardTerminalOverride, tmuxClipboardTerminalOverride)
@@ -356,7 +465,14 @@ func TestCreateListConnectDeleteLifecycle(t *testing.T) {
 		}
 	}
 	runner.mu.Lock()
-	runner.sessions[tmuxTarget(created.ID)].mouse = false
+	configuredTmux = runner.sessions[tmuxTarget(created.ID)]
+	configuredTmux.mouse = false
+	configuredTmux.status = "on"
+	configuredTmux.historyLimit = "2000"
+	configuredTmux.environment[tmuxColorEnvironment] = "not-truecolor"
+	configuredTmux.environment[tmuxNoColorEnvironment] = "1"
+	runner.globalEnvironment[tmuxColorEnvironment] = "not-truecolor"
+	runner.globalEnvironment[tmuxNoColorEnvironment] = "1"
 	runner.clipboardMode = ""
 	runner.clipboardTerminalOverride = ""
 	runner.selectionBindings = make(map[string]string)
@@ -368,7 +484,14 @@ func TestCreateListConnectDeleteLifecycle(t *testing.T) {
 		t.Fatalf("second connect started another ttyd: %d calls", len(starter.calls))
 	}
 	runner.mu.Lock()
-	mouseEnabled = runner.sessions[tmuxTarget(created.ID)].mouse
+	configuredTmux = runner.sessions[tmuxTarget(created.ID)]
+	mouseEnabled = configuredTmux.mouse
+	status = configuredTmux.status
+	historyLimit = configuredTmux.historyLimit
+	color = configuredTmux.environment[tmuxColorEnvironment]
+	_, noColor = configuredTmux.environment[tmuxNoColorEnvironment]
+	globalColor = runner.globalEnvironment[tmuxColorEnvironment]
+	_, globalNoColor = runner.globalEnvironment[tmuxNoColorEnvironment]
 	clipboardMode = runner.clipboardMode
 	clipboardTerminalOverride = runner.clipboardTerminalOverride
 	selectionBindings = make(map[string]string, len(runner.selectionBindings))
@@ -378,6 +501,12 @@ func TestCreateListConnectDeleteLifecycle(t *testing.T) {
 	runner.mu.Unlock()
 	if !mouseEnabled {
 		t.Fatal("repeated Connect() did not restore tmux mouse scrolling before reusing ttyd")
+	}
+	if status != tmuxStatusMode || historyLimit != tmuxHistoryLimit {
+		t.Fatal("repeated Connect() did not restore tmux display options before reusing ttyd")
+	}
+	if color != tmuxColorEnvironmentValue || noColor || globalColor != tmuxColorEnvironmentValue || globalNoColor {
+		t.Fatal("repeated Connect() did not sanitize tmux environments before reusing ttyd")
 	}
 	if clipboardTerminalOverride != tmuxClipboardTerminalOverride {
 		t.Fatalf("repeated Connect() clipboard override = %q, want %q", clipboardTerminalOverride, tmuxClipboardTerminalOverride)
@@ -425,8 +554,9 @@ func TestCreateCleansHiddenSessionWhenNewSessionReturnsErrorAfterSideEffect(t *t
 	createdTarget := ""
 	killedTarget := ""
 	for _, call := range calls {
-		if len(call) == 9 && call[1] == "-f" && call[2] == "/dev/null" && call[5] == "new-session" {
-			createdTarget = call[8]
+		if len(call) == 30 && call[1] == "-f" && call[2] == "/dev/null" &&
+			call[5] == "start-server" && call[26] == "new-session" {
+			createdTarget = call[29]
 		}
 		if len(call) == 6 && call[3] == "kill-session" {
 			killedTarget = call[5]

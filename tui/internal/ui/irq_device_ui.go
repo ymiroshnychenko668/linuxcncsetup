@@ -621,13 +621,13 @@ func renderIRQCells(rows [][]string) []string {
 }
 
 func (m Model) irqDeviceDetailHeight() int {
-	return max(m.height-9, 6)
+	layout := m.calculateViewLayout()
+	return max(layout.detailHeight-panelStyle.GetVerticalFrameSize(), 1)
 }
 
 func (m Model) irqDeviceDetailWidth() int {
-	contentWidth := max(m.width-appStyle.GetHorizontalFrameSize(), 1)
-	detailWidth := max(contentWidth-sidebarWidth-1, 20)
-	return max(detailWidth-panelStyle.GetHorizontalFrameSize(), 10)
+	layout := m.calculateViewLayout()
+	return max(layout.detailWidth-panelStyle.GetHorizontalFrameSize(), 1)
 }
 
 func (m Model) wrapIRQDeviceLines(lines []string) []string {

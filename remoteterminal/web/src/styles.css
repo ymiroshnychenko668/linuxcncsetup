@@ -239,12 +239,12 @@ input:focus-visible,
 .login-card__footnote { margin: 22px 12px 0; color: var(--faint); font-size: 11px; line-height: 1.55; text-align: center; }
 
 /* Workspace */
-.workspace { display: flex; width: 100vw; height: 100vh; overflow: hidden; background: var(--bg); }
+.workspace { display: flex; width: 100vw; height: 100vh; height: 100dvh; overflow: hidden; background: var(--bg); }
 .sidebar {
   z-index: 30;
   display: flex;
   width: var(--sidebar-width);
-  height: 100vh;
+  height: 100%;
   flex: 0 0 var(--sidebar-width);
   flex-direction: column;
   border-right: 1px solid var(--line);
@@ -315,7 +315,7 @@ input:focus-visible,
 .terminal-stage::before { position: absolute; inset: 0; pointer-events: none; background-image: radial-gradient(#25302d 1px, transparent 1px); background-size: 28px 28px; opacity: .16; content: ""; }
 .terminal-panel { position: absolute; z-index: 2; inset: 0; margin: 0; border: 0; outline-offset: -3px; background: #090b0c; }
 .terminal-panel[hidden] { display: none; }
-.terminal-frame { width: 100%; height: 100%; border: 0; background: #090b0c; }
+.terminal-frame { display: block; width: 100%; height: 100%; border: 0; background: #090b0c; }
 .terminal-status { position: absolute; z-index: 3; display: flex; inset: 0; align-items: center; justify-content: center; flex-direction: column; padding: 30px; text-align: center; background: rgba(8,11,12,.96); }
 .terminal-status__icon { display: grid; width: 52px; height: 52px; margin-bottom: 18px; place-items: center; border: 1px solid #38523c; border-radius: 14px; color: var(--green); background: #101b14; }
 .terminal-status__icon--pulse { animation: soft-pulse 1.7s ease-in-out infinite; }

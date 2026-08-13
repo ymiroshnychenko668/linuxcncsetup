@@ -77,6 +77,10 @@ func TestManagerRealProcessLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("HOME", hostileHome)
+	// Deliberately poison the manager's inherited colour environment. Create
+	// must sanitize the private tmux server before its first pane starts.
+	t.Setenv(tmuxColorEnvironment, "not-truecolor")
+	t.Setenv(tmuxNoColorEnvironment, "1")
 	// Debian's plugin-enabled libwebsockets searches a compiled absolute
 	// install directory, not LD_LIBRARY_PATH, for its libuv event-loop plugin.
 	// For an extracted-package test build, stage a private copy whose embedded
@@ -164,6 +168,24 @@ func TestManagerRealProcessLifecycle(t *testing.T) {
 		t.Fatalf("Create returned an invalid session: %+v", created)
 	}
 	requireTmuxSession(t, tmuxBinary, manager.tmuxSocket(), tmuxTarget(created.ID))
+	requireTmuxColorEnvironment(t, tmuxBinary, manager.tmuxSocket(), "-g")
+	requireInitialPaneColorEnvironment(t, tmuxBinary, manager.tmuxSocket(), tmuxTarget(created.ID))
+	initialCapture := integrationCommand(t, tmuxBinary, "-S", manager.tmuxSocket(),
+		"capture-pane", "-p", "-t", tmuxTarget(created.ID))
+	promptMarker := lastNonEmptyLine(initialCapture)
+	if promptMarker == "" {
+		t.Fatal("initial tmux shell did not render a prompt")
+	}
+	if output := integrationCommand(t, tmuxBinary, "-S", manager.tmuxSocket(),
+		"show-options", "-gv", tmuxStatusOption); strings.TrimSpace(output) != tmuxStatusMode {
+		t.Fatalf("Create global status = %q, want %q", strings.TrimSpace(output), tmuxStatusMode)
+	}
+	if output := integrationCommand(t, tmuxBinary, "-S", manager.tmuxSocket(),
+		"show-options", "-gv", tmuxHistoryLimitOption); strings.TrimSpace(output) != tmuxHistoryLimit {
+		t.Fatalf("Create global history-limit = %q, want %q", strings.TrimSpace(output), tmuxHistoryLimit)
+	}
+	initialTerminalOverrides := integrationCommand(t, tmuxBinary, "-S", manager.tmuxSocket(),
+		"show-options", "-s", "terminal-overrides")
 	t.Logf("Initialize/Create: runtime=%s id=%s target=%s", managedRuntime, created.ID, tmuxTarget(created.ID))
 
 	connected, basePath, err := manager.Connect(ctx, created.ID)
@@ -178,8 +200,26 @@ func TestManagerRealProcessLifecycle(t *testing.T) {
 		t.Fatalf("Connect did not enable tmux mouse scrolling: %v (%s)", err, strings.TrimSpace(string(output)))
 	}
 	if output, err := exec.CommandContext(ctx, tmuxBinary, "-S", manager.tmuxSocket(),
+		"show-options", "-v", "-t", tmuxTarget(created.ID), tmuxStatusOption).CombinedOutput(); err != nil || strings.TrimSpace(string(output)) != tmuxStatusMode {
+		t.Fatalf("Connect did not disable the tmux status row: %v (%s)", err, strings.TrimSpace(string(output)))
+	}
+	if output, err := exec.CommandContext(ctx, tmuxBinary, "-S", manager.tmuxSocket(),
+		"show-options", "-v", "-t", tmuxTarget(created.ID), tmuxHistoryLimitOption).CombinedOutput(); err != nil || strings.TrimSpace(string(output)) != tmuxHistoryLimit {
+		t.Fatalf("Connect did not configure tmux scrollback: %v (%s)", err, strings.TrimSpace(string(output)))
+	}
+	requireTmuxColorEnvironment(t, tmuxBinary, manager.tmuxSocket(), "-g")
+	requireTmuxColorEnvironment(t, tmuxBinary, manager.tmuxSocket(), "-t", tmuxTarget(created.ID))
+	if output, err := exec.CommandContext(ctx, tmuxBinary, "-S", manager.tmuxSocket(),
 		"show-options", "-sv", tmuxClipboardOption).CombinedOutput(); err != nil || strings.TrimSpace(string(output)) != tmuxClipboardTerminalOverride {
 		t.Fatalf("Connect did not configure browser clipboard integration: %v (%s)", err, strings.TrimSpace(string(output)))
+	}
+	configuredTerminalOverrides := integrationCommand(t, tmuxBinary, "-S", manager.tmuxSocket(),
+		"show-options", "-s", "terminal-overrides")
+	for _, original := range strings.Split(strings.TrimSpace(initialTerminalOverrides), "\n") {
+		if original != "" && !strings.Contains(configuredTerminalOverrides, original) {
+			t.Fatalf("Connect replaced built-in tmux terminal override %q; configured=%q",
+				original, strings.TrimSpace(configuredTerminalOverrides))
+		}
 	}
 	if output, err := exec.CommandContext(ctx, tmuxBinary, "-S", manager.tmuxSocket(),
 		"show-options", "-sv", tmuxClipboardModeOption).CombinedOutput(); err != nil || strings.TrimSpace(string(output)) != tmuxClipboardMode {
@@ -195,6 +235,14 @@ func TestManagerRealProcessLifecycle(t *testing.T) {
 		}
 	}
 	firstManaged, ttydPID := integrationManagedProcess(t, manager, created.ID)
+	manager.mu.Lock()
+	ttydCommand := append([]string(nil), firstManaged.process.(*execProcess).cmd.Args...)
+	manager.mu.Unlock()
+	wantTtydCommand := append([]string{ttydBinary}, TtydArguments(
+		tmuxBinary, manager.tmuxSocket(), manager.ttydSocket(created.ID), created.ID)...)
+	if strings.Join(ttydCommand, "\x00") != strings.Join(wantTtydCommand, "\x00") {
+		t.Fatalf("managed ttyd command\n got: %#v\nwant: %#v", ttydCommand, wantTtydCommand)
+	}
 	ttydSocket := manager.ttydSocket(created.ID)
 	if info, err := os.Stat(ttydSocket); err != nil || info.Mode()&os.ModeSocket == 0 {
 		t.Fatalf("Connect did not create ttyd Unix socket %s: mode=%v err=%v", ttydSocket, modeOf(info), err)
@@ -250,6 +298,16 @@ func TestManagerRealProcessLifecycle(t *testing.T) {
 	}
 	if err := firstWS.initializeTTyd(120, 40); err != nil {
 		t.Fatalf("initialize first ttyd protocol connection: %v", err)
+	}
+	preferences, err := firstWS.readTTydPreferences(5 * time.Second)
+	if err != nil {
+		t.Fatalf("read ttyd renderer preferences: %v", err)
+	}
+	if renderer, _ := preferences["rendererType"].(string); renderer != "canvas" {
+		t.Fatalf("ttyd rendererType = %#v, want canvas", preferences["rendererType"])
+	}
+	if output, err := firstWS.readTTydOutputUntil([]byte(promptMarker), 5*time.Second); err != nil {
+		t.Fatalf("initial tmux attach did not render the existing shell prompt: %v; output=%q", err, output)
 	}
 	if err := firstWS.writeTTydInput(firstCommand); err != nil {
 		t.Fatalf("send distinctive command through ttyd protocol: %v", err)
@@ -516,11 +574,77 @@ func integrationCommand(t *testing.T, binary string, args ...string) string {
 	return string(output)
 }
 
+func lastNonEmptyLine(output string) string {
+	lines := strings.Split(output, "\n")
+	for index := len(lines) - 1; index >= 0; index-- {
+		if line := strings.TrimSpace(lines[index]); line != "" {
+			return line
+		}
+	}
+	return ""
+}
+
 func requireTmuxSession(t *testing.T, binary, socket, target string) {
 	t.Helper()
 	output, err := exec.Command(binary, "-S", socket, "has-session", "-t", target).CombinedOutput()
 	if err != nil {
 		t.Fatalf("tmux target %q is absent from socket %s: %v (%s)", target, socket, err, strings.TrimSpace(string(output)))
+	}
+}
+
+func requireTmuxColorEnvironment(t *testing.T, binary, socket string, scope ...string) {
+	t.Helper()
+	arguments := []string{"-S", socket, "show-environment"}
+	arguments = append(arguments, scope...)
+	output := integrationCommand(t, binary, arguments...)
+	color := ""
+	noColor := false
+	for _, line := range strings.Split(output, "\n") {
+		name, value, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		switch name {
+		case tmuxColorEnvironment:
+			color = value
+		case tmuxNoColorEnvironment:
+			noColor = true
+		}
+	}
+	if color != tmuxColorEnvironmentValue || noColor {
+		t.Fatalf("tmux environment %v = COLORTERM=%q NO_COLOR-present=%t; output=%q",
+			scope, color, noColor, strings.TrimSpace(output))
+	}
+}
+
+func requireInitialPaneColorEnvironment(t *testing.T, binary, socket, target string) {
+	t.Helper()
+	rawPID := integrationCommand(t, binary, "-S", socket,
+		"display-message", "-p", "-t", target, "#{pane_pid}")
+	panePID, err := strconv.Atoi(strings.TrimSpace(rawPID))
+	if err != nil || panePID < 1 {
+		t.Fatalf("invalid tmux pane pid %q: %v", strings.TrimSpace(rawPID), err)
+	}
+	environment, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(panePID), "environ"))
+	if err != nil {
+		t.Fatalf("read first pane environment: %v", err)
+	}
+	color := ""
+	noColor := false
+	for _, entry := range bytes.Split(environment, []byte{0}) {
+		name, value, ok := bytes.Cut(entry, []byte{'='})
+		if !ok {
+			continue
+		}
+		switch string(name) {
+		case tmuxColorEnvironment:
+			color = string(value)
+		case tmuxNoColorEnvironment:
+			noColor = true
+		}
+	}
+	if color != tmuxColorEnvironmentValue || noColor {
+		t.Fatalf("first pane environment = COLORTERM=%q NO_COLOR-present=%t", color, noColor)
 	}
 }
 
@@ -669,6 +793,28 @@ func (websocket *integrationWebSocket) writeTTydInput(input string) error {
 	payload[0] = '0'
 	copy(payload[1:], input)
 	return websocket.writeFrame(0x2, payload)
+}
+
+func (websocket *integrationWebSocket) readTTydPreferences(timeout time.Duration) (map[string]interface{}, error) {
+	deadline := time.Now().Add(timeout)
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return nil, fmt.Errorf("timed out after %s waiting for ttyd preferences", timeout)
+		}
+		opcode, payload, err := websocket.readMessage(remaining)
+		if err != nil {
+			return nil, err
+		}
+		if opcode != 0x2 || len(payload) == 0 || payload[0] != '2' {
+			continue
+		}
+		preferences := make(map[string]interface{})
+		if err := json.Unmarshal(payload[1:], &preferences); err != nil {
+			return nil, fmt.Errorf("decode ttyd preferences: %w", err)
+		}
+		return preferences, nil
+	}
 }
 
 func (websocket *integrationWebSocket) readTTydOutputUntil(marker []byte, timeout time.Duration) ([]byte, error) {

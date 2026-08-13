@@ -171,6 +171,22 @@ func TestMaterializedInstallPlaybookSyntax(t *testing.T) {
 	}
 }
 
+func TestServiceTemplateSanitizesTerminalColorEnvironment(t *testing.T) {
+	contents, err := os.ReadFile(filepath.Join("ansible", "roles", "remoteterminal", "templates", "remoteterminal.service.j2"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	unit := string(contents)
+	for _, directive := range []string{
+		"Environment=COLORTERM=truecolor\n",
+		"UnsetEnvironment=NO_COLOR\n",
+	} {
+		if !strings.Contains(unit, directive) {
+			t.Fatalf("service template is missing %q", strings.TrimSpace(directive))
+		}
+	}
+}
+
 func assertReadableSourceModes(t *testing.T, sourceDirectory string) {
 	t.Helper()
 

@@ -46,8 +46,16 @@ const (
 	tmuxSelectionBindingPrefix    = tmuxSelectionBufferPrefix + "#{session_name}-"
 	tmuxClipboardModeOption       = "set-clipboard"
 	tmuxClipboardMode             = "external"
-	tmuxClipboardOption           = "terminal-overrides"
-	tmuxClipboardTerminalOverride = `xterm-256color:Ms=\E]52;c;%p2%s\007`
+	tmuxClipboardOption           = "terminal-overrides[99]"
+	tmuxClipboardTerminalOverride = `xterm-256color:Tc:Ms=\E]52;c;%p2%s\007`
+	tmuxStatusOption              = "status"
+	tmuxStatusMode                = "off"
+	tmuxHistoryLimitOption        = "history-limit"
+	tmuxHistoryLimit              = "50000"
+	tmuxColorEnvironment          = "COLORTERM"
+	tmuxColorEnvironmentValue     = "truecolor"
+	tmuxNoColorEnvironment        = "NO_COLOR"
+	ttydRendererPreference        = "rendererType=canvas"
 )
 
 // Session is the public description returned by the API. ID is an opaque,
@@ -411,8 +419,19 @@ func (m *Manager) Create(ctx context.Context, name string) (Session, error) {
 		_, _ = m.runner.Run(cleanupCtx, m.config.TmuxBinary,
 			"-S", m.tmuxSocket(), "kill-session", "-t", target)
 	}
+	// Prepare the private server's environment and inherited session options in
+	// the same tmux command queue which creates the first pane. Running these as
+	// later commands would be too late: the initial shell would already have
+	// inherited a service manager's NO_COLOR value and the default 2000-line
+	// history limit. The literal separators are tmux argv, never shell syntax.
 	if output, err := m.runner.Run(ctx, m.config.TmuxBinary,
-		"-f", "/dev/null", "-S", m.tmuxSocket(), "new-session", "-d", "-s", target); err != nil {
+		"-f", "/dev/null", "-S", m.tmuxSocket(),
+		"start-server", ";",
+		"set-environment", "-g", tmuxColorEnvironment, tmuxColorEnvironmentValue, ";",
+		"set-environment", "-gu", tmuxNoColorEnvironment, ";",
+		"set-option", "-g", tmuxStatusOption, tmuxStatusMode, ";",
+		"set-option", "-g", tmuxHistoryLimitOption, tmuxHistoryLimit, ";",
+		"new-session", "-d", "-s", target); err != nil {
 		cleanup()
 		return Session{}, commandError("create tmux session", output, err)
 	}
@@ -467,12 +486,12 @@ func (m *Manager) Connect(ctx context.Context, id string) (Session, string, erro
 	}
 	// tmux normally emits OSC 52 with an empty clipboard selector, while ttyd's
 	// xterm clipboard addon accepts the explicit "c" system-clipboard selector.
-	// The private server always exposes ttyd as xterm-256color, so replace its
-	// otherwise-empty terminal-overrides array before a client attaches. Setting
-	// the complete option (rather than appending) keeps repeated connects
-	// idempotent and cannot affect the user's ordinary tmux server. External
-	// mode lets tmux copy out but prevents pane applications from setting the
-	// browser clipboard through tmux.
+	// The private server always exposes ttyd as xterm-256color. Use a stable
+	// indexed override so repeated connects are idempotent without replacing the
+	// built-in terminal-overrides shipped by tmux 3.1. Tc preserves true colour
+	// and the explicit "c" OSC 52 selector is accepted by ttyd's clipboard
+	// addon. External mode lets tmux copy out but prevents pane applications
+	// from setting the browser clipboard through tmux.
 	if output, err := m.runner.Run(ctx, m.config.TmuxBinary,
 		"-S", m.tmuxSocket(), "set-option", "-s", tmuxClipboardModeOption, tmuxClipboardMode); err != nil {
 		return Session{}, "", commandError("restrict tmux clipboard integration", output, err)
@@ -480,6 +499,26 @@ func (m *Manager) Connect(ctx context.Context, id string) (Session, string, erro
 	if output, err := m.runner.Run(ctx, m.config.TmuxBinary,
 		"-S", m.tmuxSocket(), "set-option", "-s", tmuxClipboardOption, tmuxClipboardTerminalOverride); err != nil {
 		return Session{}, "", commandError("enable browser clipboard integration", output, err)
+	}
+	// Sanitize both scopes. The global environment covers future sessions and
+	// the target environment covers future panes in sessions recovered from an
+	// older private server. The systemd unit and Create command queue handle the
+	// initial pane before Connect can run.
+	if output, err := m.runner.Run(ctx, m.config.TmuxBinary,
+		"-S", m.tmuxSocket(), "set-environment", "-g", tmuxColorEnvironment, tmuxColorEnvironmentValue); err != nil {
+		return Session{}, "", commandError("configure tmux color environment", output, err)
+	}
+	if output, err := m.runner.Run(ctx, m.config.TmuxBinary,
+		"-S", m.tmuxSocket(), "set-environment", "-gu", tmuxNoColorEnvironment); err != nil {
+		return Session{}, "", commandError("remove tmux no-color environment", output, err)
+	}
+	if output, err := m.runner.Run(ctx, m.config.TmuxBinary,
+		"-S", m.tmuxSocket(), "set-environment", "-t", tmuxTarget(id), tmuxColorEnvironment, tmuxColorEnvironmentValue); err != nil {
+		return Session{}, "", commandError("configure session color environment", output, err)
+	}
+	if output, err := m.runner.Run(ctx, m.config.TmuxBinary,
+		"-S", m.tmuxSocket(), "set-environment", "-u", "-t", tmuxTarget(id), tmuxNoColorEnvironment); err != nil {
+		return Session{}, "", commandError("remove session no-color environment", output, err)
 	}
 	// tmux paste buffers are shared by every session in a server. Copy the drag
 	// selection directly with a format-expanded prefix based on the private tmux
@@ -495,6 +534,18 @@ func (m *Manager) Connect(ctx context.Context, id string) (Session, string, erro
 			"send-keys", "-X", "copy-selection-and-cancel", tmuxSelectionBindingPrefix); err != nil {
 			return Session{}, "", commandError("scope tmux mouse selections", output, err)
 		}
+	}
+	// Hide tmux's status row so the pane receives every row fitted by xterm.js.
+	// Restore the large scrollback setting for sessions created by older
+	// releases as well; tmux applies history-limit to windows created after the
+	// option is set, while Create above covers the initial window.
+	if output, err := m.runner.Run(ctx, m.config.TmuxBinary,
+		"-S", m.tmuxSocket(), "set-option", "-t", tmuxTarget(id), tmuxStatusOption, tmuxStatusMode); err != nil {
+		return Session{}, "", commandError("hide tmux status line", output, err)
+	}
+	if output, err := m.runner.Run(ctx, m.config.TmuxBinary,
+		"-S", m.tmuxSocket(), "set-option", "-t", tmuxTarget(id), tmuxHistoryLimitOption, tmuxHistoryLimit); err != nil {
+		return Session{}, "", commandError("increase tmux history limit", output, err)
 	}
 	// tmux owns the scrollback while attached through ttyd. Without mouse
 	// handling, xterm.js sees tmux's alternate screen and converts wheel input
@@ -686,6 +737,7 @@ func TtydArguments(tmuxBinary, tmuxSocket, ttydSocket, id string) []string {
 	return []string{
 		"-W",
 		"-O",
+		"-t", ttydRendererPreference,
 		"-b", terminalBasePath(id),
 		"-i", ttydSocket,
 		"--",
