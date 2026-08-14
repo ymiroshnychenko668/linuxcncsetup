@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { act, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { ApiError, type CodeServerInstance, type TerminalSession } from '../api'
@@ -68,18 +68,6 @@ function installTerminalFocus(frame: HTMLIFrameElement) {
     value: { focus, textarea },
   })
   return focus
-}
-
-function installTerminalSelection(frame: HTMLIFrameElement, text: string | (() => string)) {
-  const getSelection = vi.fn(typeof text === 'function' ? text : () => text)
-  const clearSelection = vi.fn()
-  const existingTerminal = (frame.contentWindow as Window & { term?: object }).term ?? {}
-  Object.defineProperty(frame.contentWindow, 'term', {
-    configurable: true,
-    value: { ...existingTerminal, getSelection, clearSelection },
-  })
-  fireEvent.load(frame)
-  return { getSelection, clearSelection }
 }
 
 const mocks = vi.hoisted(() => ({
@@ -308,8 +296,9 @@ describe('Workspace', () => {
     expect(screen.getByTitle('alpha terminal').closest('[role="tabpanel"]')).toHaveAttribute('hidden')
     expect(screen.getByRole('heading', { name: 'Workshop Mill / project' })).toBeInTheDocument()
     const topbar = document.querySelector('.topbar') as HTMLElement
-    expect(within(topbar).getByRole('button', { name: 'Reload Code Server editor' })).toBeInTheDocument()
-    expect(within(topbar).getByRole('button', { name: 'Shut down project Code Server' })).toBeInTheDocument()
+    expect(topbar.querySelector('.topbar__actions')).not.toBeInTheDocument()
+    expect(within(topbar).queryByRole('button', { name: 'Reload Code Server editor' })).not.toBeInTheDocument()
+    expect(within(topbar).queryByRole('button', { name: 'Shut down project Code Server' })).not.toBeInTheDocument()
   })
 
   it('keeps restored Code Server frames lazy until first activation and mounted afterward', async () => {
@@ -361,8 +350,7 @@ describe('Workspace', () => {
 
     await user.click(await screen.findByRole('button', { name: /alpha.*open/i }))
     await user.click(screen.getByRole('button', { name: /open project code server/i }))
-    const topbar = document.querySelector('.topbar') as HTMLElement
-    await user.click(within(topbar).getByRole('button', { name: 'Shut down project Code Server' }))
+    await user.click(screen.getByRole('button', { name: 'Shut down project Code Server' }))
     await user.click(screen.getByRole('button', { name: 'Shut down Code Server' }))
 
     await waitFor(() => expect(mocks.shutdownCodeServer).toHaveBeenCalledWith(projectCodeServer.id))
@@ -554,330 +542,27 @@ describe('Workspace', () => {
     unmount()
   })
 
-  it('documents selection and paste chords without a clipboard-permission flow', async () => {
+  it('shows native-copy guidance without adding actions to the page header', async () => {
     render(<Workspace machineName="Workshop Mill" username="operator" onLogout={vi.fn()} />)
-    const user = userEvent.setup()
 
-    await user.click(screen.getByRole('button', { name: 'Copy & paste' }))
-
-    const dialog = screen.getByRole('dialog', { name: 'Terminal copy and paste' })
-    expect(dialog).toHaveTextContent('drag normally')
-    expect(dialog).toHaveTextContent('Shift + drag (Linux/Windows) or Option + drag (macOS)')
-    expect(dialog).toHaveTextContent('Copy selection button')
-    expect(dialog).toHaveTextContent('Ctrl+C (Linux/Windows) or Command+C (macOS)')
-    expect(dialog).toHaveTextContent('Ctrl+Shift+V (Linux/Windows) or Command+V (macOS)')
-    expect(dialog).toHaveTextContent('Shift+Insert')
-    expect(dialog).toHaveTextContent('ordinary HTTP as well as HTTPS')
-    expect(dialog).not.toHaveTextContent('Copy now')
+    const note = await screen.findByText(/The selection is copied automatically/)
+    expect(note).toHaveTextContent('Shift')
+    expect(note).toHaveTextContent('Option')
+    expect(screen.queryByRole('button', { name: 'Copy & paste' })).not.toBeInTheDocument()
+    expect(document.querySelector('.topbar__actions')).not.toBeInTheDocument()
   })
 
-  it('uses the exact live xterm selection on the first click without calling the fallback API', async () => {
+  it('uses native xterm copy without exposing the legacy selection request', async () => {
     render(<Workspace machineName="Workshop Mill" username="operator" onLogout={vi.fn()} />)
     const user = userEvent.setup()
 
     await user.click(await screen.findByRole('button', { name: /alpha.*open/i }))
-    const frame = await screen.findByTitle('alpha terminal') as HTMLIFrameElement
-    expect(screen.getByRole('button', { name: 'Copy selection' })).toBeDisabled()
-    const { getSelection, clearSelection } = installTerminalSelection(frame, 'live xterm text')
-    const copyButton = screen.getByRole('button', { name: 'Copy selection' })
-    expect(copyButton).toBeEnabled()
-
-    await user.hover(copyButton)
-    copyButton.focus()
+    expect(await screen.findByTitle('alpha terminal')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Copy selection' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Copy & paste' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Reconnect terminal' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Delete current terminal session' })).not.toBeInTheDocument()
     expect(mocks.takeLatestSelection).not.toHaveBeenCalled()
-    await user.click(copyButton)
-
-    expect(getSelection).toHaveBeenCalledTimes(1)
-    expect(clearSelection).toHaveBeenCalledTimes(1)
-    expect(mocks.takeLatestSelection).not.toHaveBeenCalled()
-    await waitFor(() => expect(mocks.discardSelections).toHaveBeenCalledWith(alpha.id, expect.any(AbortSignal)))
-    expect(screen.getByRole('textbox', { name: 'Selected terminal text' })).toHaveValue('live xterm text')
-  })
-
-  it('holds the forced-selection dialog open until older tmux buffers are discarded', async () => {
-    const barrier = deferred<void>()
-    mocks.discardSelections.mockReturnValueOnce(barrier.promise)
-    render(<Workspace machineName="Workshop Mill" username="operator" onLogout={vi.fn()} />)
-    const user = userEvent.setup()
-
-    await user.click(await screen.findByRole('button', { name: /alpha.*open/i }))
-    const frame = await screen.findByTitle('alpha terminal') as HTMLIFrameElement
-    installTerminalSelection(frame, 'forced selection B')
-    await user.click(screen.getByRole('button', { name: 'Copy selection' }))
-
-    expect(screen.getByRole('textbox')).toHaveValue('forced selection B')
-    expect(screen.getByRole('button', { name: 'Close' })).toBeDisabled()
-    expect(screen.getByText(/Clearing older tmux selections/, { selector: 'p[role="status"]' })).toBeInTheDocument()
-    await act(async () => barrier.resolve())
-    await waitFor(() => expect(screen.getByRole('button', { name: 'Close' })).toBeEnabled())
-  })
-
-  it('never returns a stale tmux buffer after an uncertain forced-selection cleanup', async () => {
-    mocks.discardSelections
-      .mockRejectedValueOnce(new ApiError('cleanup unavailable', 500, 'internal_error'))
-      .mockResolvedValueOnce(undefined)
-    render(<Workspace machineName="Workshop Mill" username="operator" onLogout={vi.fn()} />)
-    const user = userEvent.setup()
-
-    await user.click(await screen.findByRole('button', { name: /alpha.*open/i }))
-    const frame = await screen.findByTitle('alpha terminal') as HTMLIFrameElement
-    let selection = 'forced selection B'
-    const { clearSelection } = installTerminalSelection(frame, () => selection)
-    clearSelection.mockImplementation(() => { selection = '' })
-
-    await user.click(screen.getByRole('button', { name: 'Copy selection' }))
-    expect(await screen.findByRole('alert')).toHaveTextContent('older tmux selection state could not be cleared')
-    await user.click(screen.getByRole('button', { name: 'Close' }))
-
-    await user.click(screen.getByRole('button', { name: 'Copy selection' }))
-    await waitFor(() => expect(mocks.discardSelections).toHaveBeenCalledTimes(2))
-    expect(mocks.takeLatestSelection).not.toHaveBeenCalled()
-    expect(await screen.findByRole('alert')).toHaveTextContent('Make a fresh selection')
-    expect(screen.queryByDisplayValue('stale selection A')).not.toBeInTheDocument()
-  })
-
-  it('uses a confirmed reconnect boundary instead of discarding the first fresh selection', async () => {
-    mocks.discardSelections.mockRejectedValueOnce(new ApiError('cleanup unavailable', 500, 'internal_error'))
-    render(<Workspace machineName="Workshop Mill" username="operator" onLogout={vi.fn()} />)
-    const user = userEvent.setup()
-
-    await user.click(await screen.findByRole('button', { name: /alpha.*open/i }))
-    let frame = await screen.findByTitle('alpha terminal') as HTMLIFrameElement
-    installTerminalSelection(frame, 'forced selection before reconnect')
-    await user.click(screen.getByRole('button', { name: 'Copy selection' }))
-    expect(await screen.findByRole('alert')).toHaveTextContent('older tmux selection state could not be cleared')
-    await user.click(screen.getByRole('button', { name: 'Close' }))
-
-    await user.click(screen.getByRole('button', { name: 'Reconnect terminal' }))
-    expect(screen.getByRole('button', { name: 'Copy selection' })).toBeDisabled()
-    await waitFor(() => expect(mocks.connectSession).toHaveBeenCalledTimes(2))
-    const previousFrame = frame
-    await waitFor(() => expect(screen.getByTitle('alpha terminal')).not.toBe(previousFrame))
-    frame = await screen.findByTitle('alpha terminal') as HTMLIFrameElement
-    installTerminalSelection(frame, '')
-
-    mocks.takeLatestSelection.mockResolvedValueOnce('fresh tmux selection after reconnect')
-    await user.click(screen.getByRole('button', { name: 'Copy selection' }))
-    expect(await screen.findByRole('textbox')).toHaveValue('fresh tmux selection after reconnect')
-    expect(mocks.discardSelections).toHaveBeenCalledTimes(1)
-    expect(mocks.takeLatestSelection).toHaveBeenCalledTimes(1)
-  })
-
-  it('clears a forced xterm selection so a later tmux selection is not shadowed', async () => {
-    render(<Workspace machineName="Workshop Mill" username="operator" onLogout={vi.fn()} />)
-    const user = userEvent.setup()
-
-    await user.click(await screen.findByRole('button', { name: /alpha.*open/i }))
-    const frame = await screen.findByTitle('alpha terminal') as HTMLIFrameElement
-    let liveSelection = 'forced selection A'
-    const { clearSelection } = installTerminalSelection(frame, () => liveSelection)
-    clearSelection.mockImplementation(() => { liveSelection = '' })
-
-    await user.click(screen.getByRole('button', { name: 'Copy selection' }))
-    expect(screen.getByRole('textbox')).toHaveValue('forced selection A')
-    await user.click(screen.getByRole('button', { name: 'Close' }))
-
-    mocks.takeLatestSelection.mockResolvedValueOnce('new tmux selection B')
-    await user.click(screen.getByRole('button', { name: 'Copy selection' }))
-    await waitFor(() => expect(mocks.takeLatestSelection).toHaveBeenCalledTimes(1))
-    expect(await screen.findByRole('textbox')).toHaveValue('new tmux selection B')
-  })
-
-  it('falls back to the one-shot API over HTTP when the Clipboard API is absent', async () => {
-    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: undefined })
-    expect(window.location.protocol).toBe('http:')
-    render(<Workspace machineName="Workshop Mill" username="operator" onLogout={vi.fn()} />)
-    const user = userEvent.setup()
-
-    await user.click(await screen.findByRole('button', { name: /alpha.*open/i }))
-    const frame = await screen.findByTitle('alpha terminal') as HTMLIFrameElement
-    installTerminalSelection(frame, '')
-    await user.click(screen.getByRole('button', { name: 'Copy selection' }))
-
-    await waitFor(() => expect(mocks.takeLatestSelection).toHaveBeenCalledWith(alpha.id, expect.any(AbortSignal)))
-    expect(await screen.findByRole('textbox', { name: 'Selected terminal text' })).toHaveValue('selected terminal text')
-  })
-
-  it('preserves multiline Unicode and whitespace and selects the complete text', async () => {
-    const exactText = '\n  Київ\t😀\u00a0\nlast line  \n'
-    render(<Workspace machineName="Workshop Mill" username="operator" onLogout={vi.fn()} />)
-    const user = userEvent.setup()
-
-    await user.click(await screen.findByRole('button', { name: /alpha.*open/i }))
-    const frame = await screen.findByTitle('alpha terminal') as HTMLIFrameElement
-    installTerminalSelection(frame, exactText)
-    await user.click(screen.getByRole('button', { name: 'Copy selection' }))
-
-    const textarea = screen.getByRole('textbox', { name: 'Selected terminal text' }) as HTMLTextAreaElement
-    expect(textarea.value).toBe(exactText)
-    expect(textarea).toHaveFocus()
-    expect(textarea.selectionStart).toBe(0)
-    expect(textarea.selectionEnd).toBe(exactText.length)
-    expect(screen.getByRole('dialog')).toHaveTextContent('context menu or long-press')
-
-    textarea.setSelectionRange(2, 5)
-    await user.click(screen.getByRole('button', { name: 'Select all' }))
-    expect(textarea).toHaveFocus()
-    expect(textarea.selectionStart).toBe(0)
-    expect(textarea.selectionEnd).toBe(exactText.length)
-  })
-
-  it('clears retained copy text on close and tab change', async () => {
-    let selection = 'sensitive terminal text'
-    const onLogout = vi.fn()
-    render(<Workspace machineName="Workshop Mill" username="operator" onLogout={onLogout} />)
-    const user = userEvent.setup()
-
-    await user.click(await screen.findByRole('button', { name: /alpha.*open/i }))
-    const frame = await screen.findByTitle('alpha terminal') as HTMLIFrameElement
-    installTerminalSelection(frame, () => selection)
-    await user.click(screen.getByRole('button', { name: 'Copy selection' }))
-    expect(screen.getByRole('textbox')).toHaveValue(selection)
-
-    await user.click(screen.getByRole('button', { name: 'Close' }))
-    expect(screen.queryByDisplayValue(selection)).not.toBeInTheDocument()
-    selection = 'fresh retry text'
-    await user.click(screen.getByRole('button', { name: 'Copy selection' }))
-    expect(screen.getByRole('textbox')).toHaveValue(selection)
-
-    await user.click(screen.getByRole('button', { name: /beta.*open/i }))
-    expect(screen.queryByDisplayValue(selection)).not.toBeInTheDocument()
-  })
-
-  it('clears an open copy dialog before logout completes', async () => {
-    const pendingLogout = deferred<void>()
-    mocks.logout.mockReturnValueOnce(pendingLogout.promise)
-    render(<Workspace machineName="Workshop Mill" username="operator" onLogout={vi.fn()} />)
-    const user = userEvent.setup()
-
-    await user.click(await screen.findByRole('button', { name: /alpha.*open/i }))
-    const frame = await screen.findByTitle('alpha terminal') as HTMLIFrameElement
-    installTerminalSelection(frame, 'logout secret')
-    await user.click(screen.getByRole('button', { name: 'Copy selection' }))
-    expect(screen.getByDisplayValue('logout secret')).toBeInTheDocument()
-
-    screen.getByRole('button', { name: 'Sign out' }).click()
-    await waitFor(() => expect(mocks.logout).toHaveBeenCalledTimes(1))
-    expect(screen.queryByDisplayValue('logout secret')).not.toBeInTheDocument()
-    await act(async () => pendingLogout.resolve())
-  })
-
-  it('aborts and ignores a stale fallback response after the active tab changes', async () => {
-    const stale = deferred<string>()
-    mocks.takeLatestSelection.mockReturnValueOnce(stale.promise)
-    render(<Workspace machineName="Workshop Mill" username="operator" onLogout={vi.fn()} />)
-    const user = userEvent.setup()
-
-    await user.click(await screen.findByRole('button', { name: /alpha.*open/i }))
-    const frame = await screen.findByTitle('alpha terminal') as HTMLIFrameElement
-    installTerminalSelection(frame, '')
-    await user.click(screen.getByRole('button', { name: 'Copy selection' }))
-    await waitFor(() => expect(mocks.takeLatestSelection).toHaveBeenCalledTimes(1))
-    const signal = mocks.takeLatestSelection.mock.calls[0][1] as AbortSignal
-
-    await user.click(screen.getByRole('button', { name: /beta.*open/i }))
-    expect(signal.aborted).toBe(true)
-    await act(async () => stale.resolve('stale alpha text'))
-
-    expect(screen.queryByDisplayValue('stale alpha text')).not.toBeInTheDocument()
-    expect(screen.queryByRole('dialog', { name: 'Copy terminal selection' })).not.toBeInTheDocument()
-  })
-
-  it('aborts and ignores a pre-reconnect fallback response', async () => {
-    const stale = deferred<string>()
-    mocks.takeLatestSelection.mockReturnValueOnce(stale.promise)
-    render(<Workspace machineName="Workshop Mill" username="operator" onLogout={vi.fn()} />)
-    const user = userEvent.setup()
-
-    await user.click(await screen.findByRole('button', { name: /alpha.*open/i }))
-    const frame = await screen.findByTitle('alpha terminal') as HTMLIFrameElement
-    installTerminalSelection(frame, '')
-    await user.click(screen.getByRole('button', { name: 'Copy selection' }))
-    await waitFor(() => expect(mocks.takeLatestSelection).toHaveBeenCalledTimes(1))
-    const signal = mocks.takeLatestSelection.mock.calls[0][1] as AbortSignal
-
-    await user.click(screen.getByRole('button', { name: 'Reconnect terminal' }))
-    expect(signal.aborted).toBe(true)
-    expect(screen.getByRole('button', { name: 'Copy selection' })).toBeDisabled()
-    await act(async () => stale.resolve('pre-reconnect stale text'))
-
-    expect(screen.queryByDisplayValue('pre-reconnect stale text')).not.toBeInTheDocument()
-    expect(screen.queryByRole('dialog', { name: 'Copy terminal selection' })).not.toBeInTheDocument()
-  })
-
-  it('invalidates a pending copy when the terminal reconnects from its offline error overlay', async () => {
-    const stale = deferred<string>()
-    mocks.takeLatestSelection.mockReturnValueOnce(stale.promise)
-    render(<Workspace machineName="Workshop Mill" username="operator" onLogout={vi.fn()} />)
-    const user = userEvent.setup()
-
-    await user.click(await screen.findByRole('button', { name: /alpha.*open/i }))
-    const frame = await screen.findByTitle('alpha terminal') as HTMLIFrameElement
-    installTerminalSelection(frame, '')
-    await user.click(screen.getByRole('button', { name: 'Copy selection' }))
-    await waitFor(() => expect(mocks.takeLatestSelection).toHaveBeenCalledTimes(1))
-    const signal = mocks.takeLatestSelection.mock.calls[0][1] as AbortSignal
-
-    fireEvent(window, new Event('offline'))
-    await waitFor(() => expect(signal.aborted).toBe(true))
-    expect(screen.getByRole('button', { name: 'Copy selection' })).toBeDisabled()
-    await user.click(screen.getByRole('button', { name: 'Reconnect' }))
-    await act(async () => stale.resolve('stale response from failed connection'))
-
-    expect(screen.queryByDisplayValue('stale response from failed connection')).not.toBeInTheDocument()
-    expect(screen.queryByRole('dialog', { name: 'Copy terminal selection' })).not.toBeInTheDocument()
-  })
-
-  it('cancels a pending copy fallback before opening another modal', async () => {
-    const stale = deferred<string>()
-    mocks.takeLatestSelection.mockReturnValueOnce(stale.promise)
-    render(<Workspace machineName="Workshop Mill" username="operator" onLogout={vi.fn()} />)
-    const user = userEvent.setup()
-
-    await user.click(await screen.findByRole('button', { name: /alpha.*open/i }))
-    const frame = await screen.findByTitle('alpha terminal') as HTMLIFrameElement
-    installTerminalSelection(frame, '')
-    await user.click(screen.getByRole('button', { name: 'Copy selection' }))
-    await waitFor(() => expect(mocks.takeLatestSelection).toHaveBeenCalledTimes(1))
-    const signal = mocks.takeLatestSelection.mock.calls[0][1] as AbortSignal
-
-    await user.click(screen.getByRole('button', { name: 'Copy & paste' }))
-    expect(signal.aborted).toBe(true)
-    expect(screen.getAllByRole('dialog')).toHaveLength(1)
-    await act(async () => stale.resolve('must not open a second modal'))
-    expect(screen.getAllByRole('dialog')).toHaveLength(1)
-    expect(screen.queryByDisplayValue('must not open a second modal')).not.toBeInTheDocument()
-  })
-
-  it('rejects a live xterm selection larger than 1 MiB without falling back', async () => {
-    const oversized = '😀'.repeat(262_145)
-    render(<Workspace machineName="Workshop Mill" username="operator" onLogout={vi.fn()} />)
-    const user = userEvent.setup()
-
-    await user.click(await screen.findByRole('button', { name: /alpha.*open/i }))
-    const frame = await screen.findByTitle('alpha terminal') as HTMLIFrameElement
-    installTerminalSelection(frame, oversized)
-    await user.click(screen.getByRole('button', { name: 'Copy selection' }))
-
-    expect(await screen.findByRole('alert')).toHaveTextContent('larger than 1 MiB')
-    expect(mocks.takeLatestSelection).not.toHaveBeenCalled()
-    expect(screen.queryByRole('dialog', { name: 'Copy terminal selection' })).not.toBeInTheDocument()
-  })
-
-  it('explains how to select text when neither xterm nor tmux has a selection', async () => {
-    mocks.takeLatestSelection.mockRejectedValueOnce(new ApiError('backend detail', 409, 'no_selection'))
-    render(<Workspace machineName="Workshop Mill" username="operator" onLogout={vi.fn()} />)
-    const user = userEvent.setup()
-
-    await user.click(await screen.findByRole('button', { name: /alpha.*open/i }))
-    const frame = await screen.findByTitle('alpha terminal') as HTMLIFrameElement
-    installTerminalSelection(frame, '')
-    await user.click(screen.getByRole('button', { name: 'Copy selection' }))
-
-    const alert = await screen.findByRole('alert')
-    expect(alert).toHaveTextContent('Drag over terminal text normally')
-    expect(alert).toHaveTextContent('Shift (Option on macOS) while dragging')
-    expect(alert).not.toHaveTextContent('snapshot')
-    expect(screen.queryByRole('dialog', { name: 'Copy terminal selection' })).not.toBeInTheDocument()
+    expect(mocks.discardSelections).not.toHaveBeenCalled()
   })
 })

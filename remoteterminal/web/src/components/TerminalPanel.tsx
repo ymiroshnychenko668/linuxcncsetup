@@ -1,14 +1,14 @@
-import { forwardRef, useCallback, useEffect, useImperativeHandle, useLayoutEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { ApiError, api, type TerminalSession } from '../api'
 import { AlertIcon, RefreshIcon, TerminalIcon } from '../icons'
 
 export type TerminalState = 'connecting' | 'connected' | 'error'
 
 interface TtydTerminal {
-  clearSelection?: () => void
   fit?: () => void
   focus?: () => void
   getSelection?: () => string
+  onSelectionChange?: (listener: () => void) => { dispose: () => void }
   refresh?: (start: number, end: number) => void
   rows?: number
   textarea?: HTMLTextAreaElement
@@ -22,23 +22,17 @@ interface TerminalPanelProps {
   session: TerminalSession
   active: boolean
   focusRequestKey: number
-  reconnectKey: number
   onStateChange: (id: string, state: TerminalState) => void
   onSessionChange: (session: TerminalSession) => void
 }
 
-export interface TerminalPanelHandle {
-  takeSelection: () => string
-}
-
-export const TerminalPanel = forwardRef<TerminalPanelHandle, TerminalPanelProps>(function TerminalPanel({
+export function TerminalPanel({
   session,
   active,
   focusRequestKey,
-  reconnectKey,
   onStateChange,
   onSessionChange,
-}, ref) {
+}: TerminalPanelProps) {
   const [state, setState] = useState<TerminalState>('connecting')
   const [terminalUrl, setTerminalUrl] = useState<string | null>(null)
   const [frameKey, setFrameKey] = useState(0)
@@ -54,6 +48,8 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, TerminalPanelProps>
   const focusOwnerRef = useRef<Element | null>(null)
   const focusAnimationFrameRef = useRef<number | null>(null)
   const focusRetryTimeoutRef = useRef<number | null>(null)
+  const selectionRetryTimeoutRef = useRef<number | null>(null)
+  const removeSelectionListenerRef = useRef<(() => void) | null>(null)
 
   const updateState = useCallback((next: TerminalState) => {
     setState(next)
@@ -157,26 +153,59 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, TerminalPanelProps>
     return false
   }, [])
 
-  const takeSelection = useCallback(() => {
+  const cancelSelectionCopy = useCallback(() => {
+    if (selectionRetryTimeoutRef.current !== null) {
+      window.clearTimeout(selectionRetryTimeoutRef.current)
+      selectionRetryTimeoutRef.current = null
+    }
+    removeSelectionListenerRef.current?.()
+    removeSelectionListenerRef.current = null
+  }, [])
+
+  const enableSelectionCopy = useCallback(() => {
+    removeSelectionListenerRef.current?.()
+    removeSelectionListenerRef.current = null
+
     try {
+      const terminalDocument = frameRef.current?.contentDocument
+      if (!terminalDocument) return false
       const terminal = (frameRef.current?.contentWindow as TtydWindow | null)?.term
-      if (typeof terminal?.getSelection !== 'function') return ''
-      const selection = terminal.getSelection()
-      if (typeof selection !== 'string' || selection === '') return ''
-      try {
-        terminal.clearSelection?.()
-      } catch {
-        // The captured text is still exact and usable if xterm is navigating
-        // between getSelection and the best-effort stale-selection cleanup.
+      if (typeof terminal?.getSelection !== 'function' || typeof terminal.onSelectionChange !== 'function') {
+        return false
       }
-      return selection
+      const selectionSubscription = terminal.onSelectionChange(() => {
+        try {
+          const selection = terminal.getSelection?.()
+          if (typeof selection !== 'string' || selection === '') return
+          // This mirrors ttyd's stock copy-on-selection behavior. xterm owns
+          // the synchronous copy event and writes its exact selection through
+          // ClipboardEvent.clipboardData, so it also works on ordinary HTTP.
+          terminalDocument.execCommand('copy')
+        } catch {
+          // A managed browser may disable legacy copy. The visible xterm
+          // selection remains available to the native context menu.
+        }
+      })
+      removeSelectionListenerRef.current = () => selectionSubscription?.dispose()
+      return true
     } catch {
-      // Access can fail while the same-origin terminal iframe is navigating.
-      return ''
+      // The terminal is expected to be same-origin, but a navigation in
+      // progress must not break the surrounding workspace.
+      return false
     }
   }, [])
 
-  useImperativeHandle(ref, () => ({ takeSelection }), [takeSelection])
+  const scheduleSelectionCopy = useCallback(function scheduleSelectionCopy(attempt = 0) {
+    cancelSelectionCopy()
+    if (enableSelectionCopy()) return
+
+    const retryDelay = REFIT_RETRY_DELAYS_MS[attempt]
+    if (retryDelay === undefined) return
+    selectionRetryTimeoutRef.current = window.setTimeout(() => {
+      selectionRetryTimeoutRef.current = null
+      scheduleSelectionCopy(attempt + 1)
+    }, retryDelay)
+  }, [cancelSelectionCopy, enableSelectionCopy])
 
   const scheduleTerminalFocus = useCallback(function scheduleTerminalFocus(attempt = 0) {
     const request = focusRequestRef.current
@@ -214,8 +243,9 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, TerminalPanelProps>
     void connect()
     return () => {
       attemptRef.current += 1
+      cancelSelectionCopy()
     }
-  }, [connect, reconnectKey])
+  }, [cancelSelectionCopy, connect])
 
   useLayoutEffect(() => {
     activeRef.current = active
@@ -288,6 +318,7 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, TerminalPanelProps>
           title={`${session.name} terminal`}
           allow="clipboard-read 'none'; clipboard-write 'none'"
           onLoad={() => {
+            scheduleSelectionCopy()
             updateState('connected')
             scheduleTerminalRefit()
             scheduleTerminalFocus()
@@ -319,4 +350,4 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, TerminalPanelProps>
       ) : null}
     </section>
   )
-})
+}

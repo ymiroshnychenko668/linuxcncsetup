@@ -1,8 +1,7 @@
-import { createRef } from 'react'
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { TerminalSession } from '../api'
-import { TerminalPanel, type TerminalPanelHandle } from './TerminalPanel'
+import { TerminalPanel } from './TerminalPanel'
 
 const session: TerminalSession = {
   id: 'session-alpha',
@@ -22,13 +21,16 @@ vi.mock('../api', async () => {
 })
 
 interface MockTerminal {
+  execCommand: ReturnType<typeof vi.fn>
   fit: ReturnType<typeof vi.fn>
+  fireSelectionChange: () => void
   focus: ReturnType<typeof vi.fn>
   focusTextarea: () => void
-  clearSelection: ReturnType<typeof vi.fn>
   getSelection: ReturnType<typeof vi.fn>
+  onSelectionChange: ReturnType<typeof vi.fn>
   refresh: ReturnType<typeof vi.fn>
   rows: number
+  selectionDisposers: ReturnType<typeof vi.fn>[]
   textarea: HTMLTextAreaElement
 }
 
@@ -61,6 +63,15 @@ function flushAnimationFrames() {
 
 function installTerminal(frame: HTMLIFrameElement): MockTerminal {
   const terminalDocument = document.implementation.createHTMLDocument('terminal')
+  const execCommand = vi.fn()
+  Object.defineProperty(terminalDocument, 'execCommand', {
+    configurable: true,
+    value: execCommand,
+  })
+  Object.defineProperty(frame, 'contentDocument', {
+    configurable: true,
+    value: terminalDocument,
+  })
   const textarea = terminalDocument.createElement('textarea')
   terminalDocument.body.append(textarea)
   let textareaFocused = false
@@ -71,17 +82,29 @@ function installTerminal(frame: HTMLIFrameElement): MockTerminal {
     configurable: true,
     get: () => textareaFocused ? textarea : terminalDocument.body,
   })
+  const selectionChangeListeners: Array<() => void> = []
+  const selectionDisposers: ReturnType<typeof vi.fn>[] = []
   const terminal = {
+    execCommand,
     fit: vi.fn(),
+    fireSelectionChange: () => {
+      selectionChangeListeners[selectionChangeListeners.length - 1]?.()
+    },
     focus: vi.fn(() => {
       frame.focus()
       focusTextarea()
     }),
     focusTextarea,
-    clearSelection: vi.fn(),
     getSelection: vi.fn(() => ''),
+    onSelectionChange: vi.fn((listener: () => void) => {
+      selectionChangeListeners.push(listener)
+      const dispose = vi.fn()
+      selectionDisposers.push(dispose)
+      return { dispose }
+    }),
     refresh: vi.fn(),
     rows: 24,
+    selectionDisposers,
     textarea,
   }
   Object.defineProperty(frame.contentWindow, 'term', {
@@ -125,7 +148,6 @@ describe('TerminalPanel', () => {
         session={session}
         active={false}
         focusRequestKey={0}
-        reconnectKey={0}
         onStateChange={onStateChange}
         onSessionChange={onSessionChange}
       />,
@@ -139,7 +161,6 @@ describe('TerminalPanel', () => {
         session={session}
         active
         focusRequestKey={0}
-        reconnectKey={0}
         onStateChange={onStateChange}
         onSessionChange={onSessionChange}
       />,
@@ -167,7 +188,6 @@ describe('TerminalPanel', () => {
         session={session}
         active={false}
         focusRequestKey={0}
-        reconnectKey={0}
         onStateChange={onStateChange}
         onSessionChange={onSessionChange}
       />,
@@ -180,7 +200,6 @@ describe('TerminalPanel', () => {
         session={session}
         active
         focusRequestKey={0}
-        reconnectKey={0}
         onStateChange={onStateChange}
         onSessionChange={onSessionChange}
       />,
@@ -203,7 +222,6 @@ describe('TerminalPanel', () => {
         session={session}
         active={false}
         focusRequestKey={0}
-        reconnectKey={0}
         onStateChange={onStateChange}
         onSessionChange={onSessionChange}
       />,
@@ -227,7 +245,6 @@ describe('TerminalPanel', () => {
         session={session}
         active={false}
         focusRequestKey={0}
-        reconnectKey={0}
         onStateChange={onStateChange}
         onSessionChange={onSessionChange}
       />,
@@ -242,7 +259,6 @@ describe('TerminalPanel', () => {
           session={session}
           active
           focusRequestKey={1}
-          reconnectKey={0}
           onStateChange={onStateChange}
           onSessionChange={onSessionChange}
         />,
@@ -272,7 +288,6 @@ describe('TerminalPanel', () => {
           session={session}
           active={false}
           focusRequestKey={2}
-          reconnectKey={0}
           onStateChange={onStateChange}
           onSessionChange={onSessionChange}
         />,
@@ -286,7 +301,6 @@ describe('TerminalPanel', () => {
           session={session}
           active
           focusRequestKey={2}
-          reconnectKey={0}
           onStateChange={onStateChange}
           onSessionChange={onSessionChange}
         />,
@@ -306,7 +320,6 @@ describe('TerminalPanel', () => {
         session={session}
         active={false}
         focusRequestKey={0}
-        reconnectKey={0}
         onStateChange={onStateChange}
         onSessionChange={onSessionChange}
       />,
@@ -321,7 +334,6 @@ describe('TerminalPanel', () => {
           session={session}
           active
           focusRequestKey={1}
-          reconnectKey={0}
           onStateChange={onStateChange}
           onSessionChange={onSessionChange}
         />,
@@ -341,15 +353,12 @@ describe('TerminalPanel', () => {
     }
   })
 
-  it('takes and clears the exact same-origin xterm selection and safely returns empty while unavailable or navigating', async () => {
-    const ref = createRef<TerminalPanelHandle>()
-    render(
+  it('copies nonempty xterm selections and disposes selection listeners on reload and cleanup', async () => {
+    const { unmount } = render(
       <TerminalPanel
-        ref={ref}
         session={session}
         active
         focusRequestKey={0}
-        reconnectKey={0}
         onStateChange={vi.fn()}
         onSessionChange={vi.fn()}
       />,
@@ -357,22 +366,52 @@ describe('TerminalPanel', () => {
 
     const frame = await screen.findByTitle('alpha terminal') as HTMLIFrameElement
     expect(frame).toHaveAttribute('allow', "clipboard-read 'none'; clipboard-write 'none'")
-    expect(ref.current?.takeSelection()).toBe('')
-
     const terminal = installTerminal(frame)
-    const exactText = '  first\nКиїв\t😀\n'
-    terminal.getSelection.mockReturnValue(exactText)
-    expect(ref.current?.takeSelection()).toBe(exactText)
-    expect(terminal.clearSelection).toHaveBeenCalledTimes(1)
+    fireEvent.load(frame)
 
-    terminal.clearSelection.mockImplementationOnce(() => {
-      throw new DOMException('navigating', 'SecurityError')
-    })
-    expect(ref.current?.takeSelection()).toBe(exactText)
+    expect(terminal.onSelectionChange).toHaveBeenCalledTimes(1)
+    terminal.fireSelectionChange()
+    expect(terminal.execCommand).not.toHaveBeenCalled()
 
-    terminal.getSelection.mockImplementation(() => {
-      throw new DOMException('navigating', 'SecurityError')
-    })
-    expect(ref.current?.takeSelection()).toBe('')
+    terminal.getSelection.mockReturnValue('selected terminal text')
+    terminal.fireSelectionChange()
+    expect(terminal.execCommand).toHaveBeenCalledOnce()
+    expect(terminal.execCommand).toHaveBeenCalledWith('copy')
+
+    fireEvent.load(frame)
+    expect(terminal.selectionDisposers[0]).toHaveBeenCalledOnce()
+    expect(terminal.onSelectionChange).toHaveBeenCalledTimes(2)
+
+    unmount()
+    expect(terminal.selectionDisposers[1]).toHaveBeenCalledOnce()
+  })
+
+  it('retries native copy setup when ttyd exposes xterm after the iframe load event', async () => {
+    render(
+      <TerminalPanel
+        session={session}
+        active
+        focusRequestKey={0}
+        onStateChange={vi.fn()}
+        onSessionChange={vi.fn()}
+      />,
+    )
+
+    const frame = await screen.findByTitle('alpha terminal') as HTMLIFrameElement
+    vi.useFakeTimers()
+    try {
+      fireEvent.load(frame)
+      const terminal = installTerminal(frame)
+      expect(terminal.onSelectionChange).not.toHaveBeenCalled()
+
+      act(() => vi.advanceTimersByTime(50))
+      expect(terminal.onSelectionChange).toHaveBeenCalledOnce()
+
+      terminal.getSelection.mockReturnValue('late ttyd selection')
+      terminal.fireSelectionChange()
+      expect(terminal.execCommand).toHaveBeenCalledWith('copy')
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })

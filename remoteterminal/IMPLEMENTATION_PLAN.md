@@ -289,31 +289,26 @@ Closing a code-server tab also only detaches the browser view. Shutting down a c
 
 Version 1 uses the pinned ttyd/xterm browser client inside a same-origin terminal frame.
 
-- Take an exact xterm selection first, then fall back to the newest bounded
-  yellow tmux selection through an authenticated, CSRF-protected, non-cached,
-  one-shot same-origin endpoint.
-- While a forced xterm selection dialog blocks new terminal interaction, use
-  an idempotent CSRF-protected discard mutation to remove older tmux buffers
-  without reading them. An uncertain discard must be reset before the UI can
-  accept another normal-drag selection.
-- Treat every terminal Connect as a server-side clipboard-source boundary:
-  clear the session's pending selection buffers before exposing the terminal,
-  and keep Copy selection disabled until Connect and iframe load complete.
-- Always show the selected text in a visible, focused, fully selected readonly
-  field outside the terminal frame. The user completes native copy with
-  `Ctrl+C`, `Command+C`, the context menu, or long-press; this path also works
-  on ordinary remote HTTP.
-- Use `Shift` while dragging on Linux/Windows, or `Option` on macOS, when a
-  mouse-aware pane application captures ordinary drag events.
+- Use `Shift` while dragging on Linux/Windows, or `Option` on macOS, to force
+  an xterm selection while tmux mouse handling remains enabled for scrollback.
+- On every nonempty xterm selection change, synchronously trigger the document
+  copy command. xterm's built-in copy event supplies the exact selected text,
+  matching stock ttyd behavior without a server clipboard request or modal.
+- Keep the selection visible so a browser context-menu Copy action can repeat
+  the operation or serve as the fallback when policy blocks automatic copy.
+- Keep `Ctrl+C` as terminal interrupt input. Do not advertise browser-reserved
+  key chords as the primary Linux/Windows copy workflow.
 - Paste with `Ctrl+Shift+V` or `Shift+Insert` on Linux/Windows, and `Command+V`
   on macOS.
-- Explicitly deny Clipboard API access to the terminal frame.
+- Explicitly deny asynchronous Clipboard API access to the terminal frame and
+  keep tmux OSC 52 integration disabled.
 - Test plain text, multiline text, Unicode, and Ukrainian keyboard input in supported browsers.
 
-The pinned ttyd build is patched to remove its ClipboardAddon and deprecated
-copy-on-selection path. tmux keeps OSC 52 disabled. No production copy path
-depends on `navigator.clipboard`, `document.execCommand`, secure context,
-transient user activation, or iframe clipboard permission.
+The pinned ttyd build remains patched to remove ClipboardAddon and its
+`navigator.clipboard`/OSC 52 surface. The same-origin terminal wrapper restores
+only ttyd's selection-change copy trigger; xterm core owns the resulting copy
+event. This remains usable on ordinary HTTP and requires no iframe Clipboard
+API permission.
 
 ## Systemd deployment
 
@@ -385,7 +380,7 @@ These flags do not retain live processes or `/run/remoteterminal`; all default t
 
 ### Phase 3: React frontend — implemented
 
-- Login/logout, session loading/creation/deletion, error and reconnect states, accessible vertical tabs, mounted terminal frames, responsive styling, and the native-copy dialog/help are implemented.
+- Login/logout, session loading/creation/deletion, error and reconnect states, accessible vertical tabs, mounted terminal frames, responsive styling, and native-copy help are implemented.
 - Folder browsing, launch/reuse, active-code-server management, confirmed shutdown, visually distinct mounted editor tabs, and responsive editor controls are implemented.
 - Actual clipboard and keyboard behavior remains subject to supported-browser acceptance.
 
@@ -493,7 +488,7 @@ These remain the release criteria. Source implementation and local automation do
 ## Current version 1 decisions and defaults
 
 1. **Transport:** HTTP is the production appliance default for the isolated machine LAN. It skips TLS, uses a separate cookie name, exposes credentials/session traffic on the LAN, and requires an exact managed Chromium secure-origin exception for normal remote code-server webviews. HTTPS remains available; operators then verify the generated certificate fingerprint or supply a trusted certificate/key pair.
-2. **Clipboard:** **Copy selection** takes an exact forced xterm selection first, otherwise consumes the newest yellow tmux selection. It opens a visible readonly field with the exact text already focused and selected; native `Ctrl+C`/`Command+C`, context-menu Copy, or long-press performs the final system-clipboard write on HTTP and HTTPS. Mouse-aware pane applications require `Shift`-drag on Linux/Windows or `Option`-drag on macOS. Paste uses `Ctrl+Shift+V`/`Shift+Insert` on Linux/Windows or `Command+V` on macOS.
+2. **Clipboard:** `Shift`-drag on Linux/Windows or `Option`-drag on macOS creates a visible xterm selection and copies it automatically, matching stock ttyd behavior without a server request or copy dialog. Browser context-menu Copy repeats or falls back while the selection remains highlighted. `Ctrl+C` remains terminal interrupt input. Paste uses `Ctrl+Shift+V`/`Shift+Insert` on Linux/Windows or `Command+V` on macOS.
 3. **Port:** `8443` is the default listener port. `remoteterminal_port` overrides it within the validated unprivileged port range.
 4. **Session limit:** Eight managed sessions is the default. `remoteterminal_max_sessions` overrides it from 1 through 64.
 5. **Persistence:** Version 1 preserves tmux sessions across browser disconnect, tab closure, and logout while the service continues running. Service restart, upgrade restart, reboot, and uninstall are outside that guarantee. Durable restart/reboot persistence is a future design choice.
