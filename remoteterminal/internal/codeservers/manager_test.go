@@ -437,10 +437,18 @@ func TestCreateUsesFixedArgvPersistsProfileAndReusesCanonicalFolder(t *testing.T
 	if !reflect.DeepEqual(startCall, wantStart) {
 		t.Fatalf("new-session argv = %#v, want %#v", startCall, wantStart)
 	}
-	for _, child := range []string{"user-data", "extensions"} {
+	for _, child := range []string{"user-data", filepath.Join("user-data", "User"), "extensions"} {
 		if info, statErr := os.Stat(filepath.Join(profile, child)); statErr != nil || !info.IsDir() {
 			t.Fatalf("profile %s missing: %v", child, statErr)
 		}
+	}
+	settingsData, readSettingsErr := os.ReadFile(filepath.Join(profile, "user-data", "User", "settings.json"))
+	if readSettingsErr != nil || string(settingsData) != "{\n  \"workbench.colorTheme\": \"Dark Modern\"\n}\n" {
+		t.Fatalf("dark theme settings = %q err=%v", settingsData, readSettingsErr)
+	}
+	markerData, markerErr := os.ReadFile(filepath.Join(profile, codeServerThemeMarker))
+	if markerErr != nil || string(markerData) != "Dark Modern\n" {
+		t.Fatalf("dark theme marker = %q err=%v", markerData, markerErr)
 	}
 	configData, readErr := os.ReadFile(manager.configPath(instance.ID))
 	if readErr != nil || string(configData) != "auth: none\ncert: false\n" {
@@ -453,6 +461,61 @@ func TestCreateUsesFixedArgvPersistsProfileAndReusesCanonicalFolder(t *testing.T
 	reusedInstance, reused, err := manager.Create(context.Background(), folder)
 	if err != nil || !reused || reusedInstance.ID != instance.ID {
 		t.Fatalf("reuse = %#v/%t/%v", reusedInstance, reused, err)
+	}
+}
+
+func TestCodeServerDarkThemeMigrationPreservesJSONCAndRunsOnce(t *testing.T) {
+	profile := t.TempDir()
+	settingsDirectory := filepath.Join(profile, "user-data", "User")
+	if err := os.MkdirAll(settingsDirectory, 0700); err != nil {
+		t.Fatal(err)
+	}
+	settingsPath := filepath.Join(settingsDirectory, "settings.json")
+	original := "{\n  // Keep unrelated editor preferences.\n  \"editor.fontSize\": 15,\n  \"workbench.colorTheme\": \"Default Light Modern\",\n}\n"
+	if err := os.WriteFile(settingsPath, []byte(original), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := ensureCodeServerDarkTheme(profile); err != nil {
+		t.Fatal(err)
+	}
+	updated, err := os.ReadFile(settingsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(updated), "// Keep unrelated editor preferences.") ||
+		!strings.Contains(string(updated), "\"editor.fontSize\": 15") ||
+		!strings.Contains(string(updated), "\"workbench.colorTheme\": \"Dark Modern\"") ||
+		strings.Contains(string(updated), "Default Light Modern") {
+		t.Fatalf("migrated settings = %s", updated)
+	}
+
+	userChoice := []byte("{\n  \"workbench.colorTheme\": \"Solarized Light\"\n}\n")
+	if err := os.WriteFile(settingsPath, userChoice, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureCodeServerDarkTheme(profile); err != nil {
+		t.Fatal(err)
+	}
+	afterSecondRun, err := os.ReadFile(settingsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(afterSecondRun, userChoice) {
+		t.Fatalf("completed migration overwrote later user choice: %s", afterSecondRun)
+	}
+}
+
+func TestSetTopLevelJSONCStringAddsSettingAroundNestedJSONC(t *testing.T) {
+	document := []byte("{\n  \"editor.codeActionsOnSave\": {\n    \"source.organizeImports\": true,\n  }, // keep trailing comment\n}\n")
+	updated, changed, err := setTopLevelJSONCString(document, "workbench.colorTheme", "Dark Modern")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !changed || !strings.Contains(string(updated), "\"workbench.colorTheme\": \"Dark Modern\"") ||
+		!strings.Contains(string(updated), "// keep trailing comment") ||
+		!strings.Contains(string(updated), "\"source.organizeImports\": true") {
+		t.Fatalf("updated JSONC = %s", updated)
 	}
 }
 

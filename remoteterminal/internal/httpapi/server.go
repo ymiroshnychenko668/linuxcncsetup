@@ -60,6 +60,7 @@ type Config struct {
 	MachineName     string
 	WebDir          string
 	AbsoluteTimeout time.Duration
+	RememberTimeout time.Duration
 	AuthConcurrency int
 	// InsecureHTTP must only be set when the outer listener is plain HTTP. Its
 	// zero value deliberately preserves the secure __Host- cookie contract.
@@ -86,7 +87,7 @@ type Server struct {
 
 func New(config Config, authenticator auth.Authenticator, authSessions *auth.Store,
 	throttler *auth.Throttler, manager SessionManager, codeServerManager CodeServerManager, logger *log.Logger) (*Server, error) {
-	if config.AllowedUser == "" || config.MachineName == "" || config.WebDir == "" || config.AbsoluteTimeout <= 0 || config.AuthConcurrency <= 0 {
+	if config.AllowedUser == "" || config.MachineName == "" || config.WebDir == "" || config.AbsoluteTimeout <= 0 || config.RememberTimeout <= 0 || config.AuthConcurrency <= 0 {
 		return nil, errors.New("invalid HTTP server configuration")
 	}
 	if authenticator == nil || authSessions == nil || throttler == nil || manager == nil || codeServerManager == nil {
@@ -212,8 +213,9 @@ func (s *Server) publicConfig(w http.ResponseWriter, r *http.Request) {
 }
 
 type loginRequest struct {
-	Username string `json:"username"`
-	Password string `json:"password"`
+	Username   string `json:"username"`
+	Password   string `json:"password"`
+	RememberMe bool   `json:"rememberMe"`
 }
 
 func (s *Server) login(w http.ResponseWriter, r *http.Request) {
@@ -259,7 +261,14 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "authentication_failed", "Invalid username or password.")
 		return
 	}
-	token, session, err := s.authSessions.Create(request.Username)
+	var token string
+	var session auth.Session
+	var err error
+	if request.RememberMe {
+		token, session, err = s.authSessions.CreateRemembered(request.Username, s.config.RememberTimeout)
+	} else {
+		token, session, err = s.authSessions.Create(request.Username)
+	}
 	if err != nil {
 		s.logger.Printf("create authentication session: %v", err)
 		writeError(w, http.StatusServiceUnavailable, "authentication_unavailable", "Authentication is temporarily unavailable.")
@@ -267,16 +276,19 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 	}
 	s.throttler.Success(ipKey)
 	s.throttler.Success(usernameKey)
-	http.SetCookie(w, &http.Cookie{
+	cookie := &http.Cookie{
 		Name:     s.cookieName,
 		Value:    token,
 		Path:     "/",
 		Secure:   s.cookieSecure,
 		HttpOnly: true,
 		SameSite: http.SameSiteStrictMode,
-		Expires:  session.ExpiresAt,
-		MaxAge:   int(time.Until(session.ExpiresAt).Seconds()),
-	})
+	}
+	if session.Remembered {
+		cookie.Expires = session.ExpiresAt
+		cookie.MaxAge = int(time.Until(session.ExpiresAt).Seconds())
+	}
+	http.SetCookie(w, cookie)
 	writeJSON(w, http.StatusOK, authResponse(session))
 }
 
@@ -315,7 +327,11 @@ func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
 	if !s.authorizeMutation(w, r, session) {
 		return
 	}
-	s.authSessions.Delete(token)
+	if err := s.authSessions.Delete(token); err != nil {
+		s.logger.Printf("delete authentication session: %v", err)
+		writeError(w, http.StatusServiceUnavailable, "authentication_unavailable", "Authentication is temporarily unavailable.")
+		return
+	}
 	s.connections.CloseToken(token)
 	s.clearCookie(w)
 	writeJSON(w, http.StatusOK, map[string]bool{"authenticated": false})

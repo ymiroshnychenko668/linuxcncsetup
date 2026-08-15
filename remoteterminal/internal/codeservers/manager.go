@@ -52,6 +52,9 @@ const (
 	defaultPollInterval     = 100 * time.Millisecond
 	defaultLivenessPoll     = 500 * time.Millisecond
 	defaultProxyVerify      = 2 * time.Second
+	codeServerDarkTheme     = "Dark Modern"
+	codeServerThemeMarker   = ".remoteterminal-dark-theme-v1"
+	maxCodeServerSettings   = 1 << 20
 )
 
 // Instance is the public description of one active code-server workspace.
@@ -866,11 +869,20 @@ func (m *Manager) prepareStorageLocked(id, folder string) error {
 		return fmt.Errorf("create code-server runtime directory: %w", err)
 	}
 	profileDir := m.profileDir(folder)
-	for _, path := range []string{profileDir, filepath.Join(profileDir, "user-data"), filepath.Join(profileDir, "extensions")} {
+	for _, path := range []string{
+		profileDir,
+		filepath.Join(profileDir, "user-data"),
+		filepath.Join(profileDir, "user-data", "User"),
+		filepath.Join(profileDir, "extensions"),
+	} {
 		if err := secureDirectory(path); err != nil {
 			_ = os.RemoveAll(instanceDir)
 			return fmt.Errorf("prepare code-server profile: %w", err)
 		}
+	}
+	if err := ensureCodeServerDarkTheme(profileDir); err != nil {
+		_ = os.RemoveAll(instanceDir)
+		return fmt.Errorf("configure code-server dark theme: %w", err)
 	}
 	configFile, err := os.OpenFile(m.configPath(id), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
 	if err != nil {
@@ -887,6 +899,377 @@ func (m *Manager) prepareStorageLocked(id, folder string) error {
 		return fmt.Errorf("close code-server configuration: %w", closeErr)
 	}
 	return nil
+}
+
+// ensureCodeServerDarkTheme migrates each isolated editor profile once. The
+// marker makes Dark Modern the requested deployment default without fighting
+// a later theme choice made from inside code-server.
+func ensureCodeServerDarkTheme(profileDir string) error {
+	markerPath := filepath.Join(profileDir, codeServerThemeMarker)
+	if markerInfo, err := os.Lstat(markerPath); err == nil {
+		if err := validatePrivateRegularFile(markerPath, markerInfo); err != nil {
+			return err
+		}
+		if markerInfo.Size() > 64 {
+			return errors.New("code-server theme marker is unexpectedly large")
+		}
+		marker, err := os.ReadFile(markerPath)
+		if err != nil {
+			return fmt.Errorf("read code-server theme marker: %w", err)
+		}
+		if string(marker) != codeServerDarkTheme+"\n" {
+			return errors.New("code-server theme marker has unexpected contents")
+		}
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("inspect code-server theme marker: %w", err)
+	}
+
+	settingsPath := filepath.Join(profileDir, "user-data", "User", "settings.json")
+	settings := []byte("{}\n")
+	settingsExist := false
+	if settingsInfo, err := os.Lstat(settingsPath); err == nil {
+		settingsExist = true
+		if err := validatePrivateRegularFile(settingsPath, settingsInfo); err != nil {
+			return err
+		}
+		if settingsInfo.Size() > maxCodeServerSettings {
+			return errors.New("code-server user settings are unexpectedly large")
+		}
+		settings, err = os.ReadFile(settingsPath)
+		if err != nil {
+			return fmt.Errorf("read code-server user settings: %w", err)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("inspect code-server user settings: %w", err)
+	}
+	settingsText := strings.TrimPrefix(string(settings), "\ufeff")
+	if strings.TrimSpace(settingsText) == "" {
+		settingsText = "{}\n"
+	}
+	settings = []byte(settingsText)
+
+	updated, changed, err := setTopLevelJSONCString(settings, "workbench.colorTheme", codeServerDarkTheme)
+	if err != nil {
+		return fmt.Errorf("update code-server user settings: %w", err)
+	}
+	if changed || !settingsExist {
+		if err := writePrivateFileAtomic(settingsPath, updated); err != nil {
+			return fmt.Errorf("write code-server user settings: %w", err)
+		}
+	} else if err := os.Chmod(settingsPath, 0600); err != nil {
+		return fmt.Errorf("secure code-server user settings: %w", err)
+	}
+	if err := writePrivateFileAtomic(markerPath, []byte(codeServerDarkTheme+"\n")); err != nil {
+		return fmt.Errorf("write code-server theme marker: %w", err)
+	}
+	return nil
+}
+
+func validatePrivateRegularFile(path string, info os.FileInfo) error {
+	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("%s is not a regular file", path)
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || stat.Uid != uint32(os.Geteuid()) || stat.Nlink != 1 {
+		return fmt.Errorf("%s does not have safe ownership and link count", path)
+	}
+	return nil
+}
+
+func writePrivateFileAtomic(path string, contents []byte) (err error) {
+	directory := filepath.Dir(path)
+	temporary, err := os.CreateTemp(directory, ".remoteterminal-settings-*")
+	if err != nil {
+		return err
+	}
+	temporaryPath := temporary.Name()
+	defer func() {
+		_ = temporary.Close()
+		_ = os.Remove(temporaryPath)
+	}()
+	if err := temporary.Chmod(0600); err != nil {
+		return err
+	}
+	if _, err := temporary.Write(contents); err != nil {
+		return err
+	}
+	if err := temporary.Sync(); err != nil {
+		return err
+	}
+	if err := temporary.Close(); err != nil {
+		return err
+	}
+	return os.Rename(temporaryPath, path)
+}
+
+// setTopLevelJSONCString changes one active top-level JSON/JSONC string
+// setting while preserving all unrelated formatting and comments.
+func setTopLevelJSONCString(document []byte, key, value string) ([]byte, bool, error) {
+	scanner := jsoncScanner{data: document}
+	if err := scanner.skipTrivia(); err != nil {
+		return nil, false, err
+	}
+	if scanner.i >= len(document) || document[scanner.i] != '{' {
+		return nil, false, errors.New("settings must contain a top-level object")
+	}
+	scanner.i++
+	propertyCount := 0
+	lastValueEnd := scanner.i
+	lastHadComma := false
+
+	for {
+		if err := scanner.skipTrivia(); err != nil {
+			return nil, false, err
+		}
+		if scanner.i >= len(document) {
+			return nil, false, errors.New("unterminated settings object")
+		}
+		if document[scanner.i] == '}' {
+			closingBrace := scanner.i
+			scanner.i++
+			if err := scanner.skipTrivia(); err != nil {
+				return nil, false, err
+			}
+			if scanner.i != len(document) {
+				return nil, false, errors.New("unexpected content after settings object")
+			}
+
+			closingIndent := lineIndentBefore(document, closingBrace)
+			insertion := make([]byte, 0, len(key)+len(value)+len(closingIndent)+16)
+			if closingBrace == 0 || document[closingBrace-1] != '\n' {
+				insertion = append(insertion, '\n')
+			}
+			insertion = append(insertion, closingIndent...)
+			insertion = append(insertion, ' ', ' ')
+			insertion = strconv.AppendQuote(insertion, key)
+			insertion = append(insertion, ':', ' ')
+			insertion = strconv.AppendQuote(insertion, value)
+			insertion = append(insertion, '\n')
+			insertion = append(insertion, closingIndent...)
+
+			updated := make([]byte, 0, len(document)+len(insertion)+1)
+			updated = append(updated, document[:lastValueEnd]...)
+			if propertyCount > 0 && !lastHadComma {
+				updated = append(updated, ',')
+			}
+			updated = append(updated, document[lastValueEnd:closingBrace]...)
+			updated = append(updated, insertion...)
+			updated = append(updated, document[closingBrace:]...)
+			return updated, true, nil
+		}
+
+		propertyKey, err := scanner.readString()
+		if err != nil {
+			return nil, false, fmt.Errorf("read settings key: %w", err)
+		}
+		if err := scanner.skipTrivia(); err != nil {
+			return nil, false, err
+		}
+		if scanner.i >= len(document) || document[scanner.i] != ':' {
+			return nil, false, errors.New("settings key is missing a colon")
+		}
+		scanner.i++
+		if err := scanner.skipTrivia(); err != nil {
+			return nil, false, err
+		}
+		valueStart := scanner.i
+		valueEnd, err := scanner.skipValue()
+		if err != nil {
+			return nil, false, fmt.Errorf("read %q setting: %w", propertyKey, err)
+		}
+		if propertyKey == key {
+			replacement := strconv.Quote(value)
+			if string(document[valueStart:valueEnd]) == replacement {
+				return document, false, nil
+			}
+			updated := make([]byte, 0, len(document)-valueEnd+valueStart+len(replacement))
+			updated = append(updated, document[:valueStart]...)
+			updated = append(updated, replacement...)
+			updated = append(updated, document[valueEnd:]...)
+			return updated, true, nil
+		}
+
+		propertyCount++
+		lastValueEnd = valueEnd
+		scanner.i = valueEnd
+		if err := scanner.skipTrivia(); err != nil {
+			return nil, false, err
+		}
+		if scanner.i < len(document) && document[scanner.i] == ',' {
+			lastHadComma = true
+			scanner.i++
+			continue
+		}
+		lastHadComma = false
+		if scanner.i >= len(document) || document[scanner.i] != '}' {
+			return nil, false, errors.New("settings properties must be comma-separated")
+		}
+	}
+}
+
+type jsoncScanner struct {
+	data []byte
+	i    int
+}
+
+func (s *jsoncScanner) skipTrivia() error {
+	for s.i < len(s.data) {
+		switch s.data[s.i] {
+		case ' ', '\t', '\r', '\n':
+			s.i++
+		case '/':
+			if s.i+1 >= len(s.data) {
+				return nil
+			}
+			switch s.data[s.i+1] {
+			case '/':
+				s.i += 2
+				for s.i < len(s.data) && s.data[s.i] != '\n' {
+					s.i++
+				}
+			case '*':
+				s.i += 2
+				for s.i+1 < len(s.data) && (s.data[s.i] != '*' || s.data[s.i+1] != '/') {
+					s.i++
+				}
+				if s.i+1 >= len(s.data) {
+					return errors.New("unterminated settings comment")
+				}
+				s.i += 2
+			default:
+				return nil
+			}
+		default:
+			return nil
+		}
+	}
+	return nil
+}
+
+func (s *jsoncScanner) readString() (string, error) {
+	start := s.i
+	end, err := s.skipString()
+	if err != nil {
+		return "", err
+	}
+	var decoded string
+	if err := json.Unmarshal(s.data[start:end], &decoded); err != nil {
+		return "", errors.New("invalid JSON string")
+	}
+	return decoded, nil
+}
+
+func (s *jsoncScanner) skipString() (int, error) {
+	if s.i >= len(s.data) || s.data[s.i] != '"' {
+		return 0, errors.New("expected a quoted string")
+	}
+	s.i++
+	for s.i < len(s.data) {
+		switch s.data[s.i] {
+		case '\\':
+			s.i += 2
+		case '"':
+			s.i++
+			return s.i, nil
+		case '\n', '\r':
+			return 0, errors.New("unterminated JSON string")
+		default:
+			s.i++
+		}
+	}
+	return 0, errors.New("unterminated JSON string")
+}
+
+func (s *jsoncScanner) skipValue() (int, error) {
+	if s.i >= len(s.data) {
+		return 0, errors.New("missing value")
+	}
+	switch s.data[s.i] {
+	case '"':
+		return s.skipString()
+	case '{', '[':
+		return s.skipComposite()
+	}
+
+	start := s.i
+	end := start
+	for s.i < len(s.data) {
+		switch s.data[s.i] {
+		case ',', '}':
+			if end == start {
+				return 0, errors.New("missing value")
+			}
+			return end, nil
+		case ' ', '\t', '\r', '\n':
+			s.i++
+		case '/':
+			if end == start {
+				return 0, errors.New("missing value")
+			}
+			return end, nil
+		default:
+			s.i++
+			end = s.i
+		}
+	}
+	return 0, errors.New("unterminated value")
+}
+
+func (s *jsoncScanner) skipComposite() (int, error) {
+	stack := []byte{matchingDelimiter(s.data[s.i])}
+	s.i++
+	for s.i < len(s.data) && len(stack) > 0 {
+		switch s.data[s.i] {
+		case '"':
+			if _, err := s.skipString(); err != nil {
+				return 0, err
+			}
+		case '/':
+			before := s.i
+			if err := s.skipTrivia(); err != nil {
+				return 0, err
+			}
+			if s.i == before {
+				s.i++
+			}
+		case '{', '[':
+			stack = append(stack, matchingDelimiter(s.data[s.i]))
+			s.i++
+		case '}', ']':
+			if s.data[s.i] != stack[len(stack)-1] {
+				return 0, errors.New("mismatched value delimiter")
+			}
+			stack = stack[:len(stack)-1]
+			s.i++
+		default:
+			s.i++
+		}
+	}
+	if len(stack) != 0 {
+		return 0, errors.New("unterminated composite value")
+	}
+	return s.i, nil
+}
+
+func matchingDelimiter(open byte) byte {
+	if open == '{' {
+		return '}'
+	}
+	return ']'
+}
+
+func lineIndentBefore(document []byte, offset int) []byte {
+	lineStart := offset
+	for lineStart > 0 && document[lineStart-1] != '\n' {
+		lineStart--
+	}
+	for index := lineStart; index < offset; index++ {
+		if document[index] != ' ' && document[index] != '\t' {
+			return nil
+		}
+	}
+	return document[lineStart:offset]
 }
 
 // Delete gracefully interrupts the exact code-server tmux pane, then uses an

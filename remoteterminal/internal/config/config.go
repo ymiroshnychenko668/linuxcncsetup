@@ -23,6 +23,7 @@ const (
 	DefaultMaxCodeServers  = 2
 	DefaultIdleTimeout     = 30 * time.Minute
 	DefaultAbsoluteTimeout = 12 * time.Hour
+	DefaultRememberTimeout = 30 * 24 * time.Hour
 	DefaultAuthConcurrency = 4
 	DefaultLoginAttempts   = 5
 	DefaultLoginWindow     = 10 * time.Minute
@@ -50,6 +51,7 @@ type Config struct {
 	MaxCodeServers    int
 	IdleTimeout       time.Duration
 	AbsoluteTimeout   time.Duration
+	RememberTimeout   time.Duration
 	AuthConcurrency   int
 	LoginAttempts     int
 	LoginWindow       time.Duration
@@ -90,6 +92,7 @@ func Load() (Config, error) {
 		MaxCodeServers:    DefaultMaxCodeServers,
 		IdleTimeout:       DefaultIdleTimeout,
 		AbsoluteTimeout:   DefaultAbsoluteTimeout,
+		RememberTimeout:   DefaultRememberTimeout,
 		AuthConcurrency:   DefaultAuthConcurrency,
 		LoginAttempts:     DefaultLoginAttempts,
 		LoginWindow:       DefaultLoginWindow,
@@ -119,6 +122,9 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	if c.AbsoluteTimeout, err = envDuration("REMOTE_TERMINAL_ABSOLUTE_TIMEOUT", c.AbsoluteTimeout); err != nil {
+		return Config{}, err
+	}
+	if c.RememberTimeout, err = envDuration("REMOTE_TERMINAL_REMEMBER_TIMEOUT", c.RememberTimeout); err != nil {
 		return Config{}, err
 	}
 	if c.LoginWindow, err = envDuration("REMOTE_TERMINAL_LOGIN_WINDOW", c.LoginWindow); err != nil {
@@ -237,6 +243,7 @@ func (c Config) Validate() error {
 	for name, value := range map[string]time.Duration{
 		"REMOTE_TERMINAL_IDLE_TIMEOUT":              c.IdleTimeout,
 		"REMOTE_TERMINAL_ABSOLUTE_TIMEOUT":          c.AbsoluteTimeout,
+		"REMOTE_TERMINAL_REMEMBER_TIMEOUT":          c.RememberTimeout,
 		"REMOTE_TERMINAL_LOGIN_WINDOW":              c.LoginWindow,
 		"REMOTE_TERMINAL_SHUTDOWN_TIMEOUT":          c.ShutdownTimeout,
 		"REMOTE_TERMINAL_START_TIMEOUT":             c.TerminalTimeout,

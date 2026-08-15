@@ -197,6 +197,14 @@
   changed_when: true
   when: not (remoteterminal_release_complete | bool)
 
+- name: Enforce deployed frontend root ownership and mode
+  ansible.builtin.file:
+    path: "{{ remoteterminal_release_dir }}/web"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
 - name: Detect symlinks in deployed frontend tree
   ansible.builtin.find:
     paths: "{{ remoteterminal_release_dir }}/web"

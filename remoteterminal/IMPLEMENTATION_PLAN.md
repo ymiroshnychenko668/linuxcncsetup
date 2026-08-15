@@ -29,12 +29,12 @@ This document is retained as the architecture, security contract, implementation
 - PAM authenticates only that configured account.
 - The Go service, private tmux servers, ttyd processes, terminal shells, and code-server processes all run as that account.
 - Browser disconnection does not destroy tmux sessions.
-- Persistence across a systemd service restart, upgrade restart, or machine reboot is not provided in version 1; the persistence guarantee covers browser disconnects, tab closure, and logout while the service remains running.
+- Managed terminal/editor workload persistence across a systemd service restart, upgrade restart, or machine reboot is not provided in version 1; **Remember me** authentication is the explicit exception and uses private durable state.
 - The production appliance profile defaults to plaintext HTTP on an isolated machine LAN so client certificates are not required. It is never presented as equivalent security: the real system password and all session traffic are observable on that LAN. HTTPS remains selectable when trusted TLS material is available.
 - The default maximum number of sessions is eight.
 - The default maximum number of active code servers is two, configurable from one through eight.
 - The default service port is `8443`.
-- Browser authentication sessions are in-memory, with a 30-minute idle timeout and 12-hour absolute timeout by default.
+- Ordinary browser authentication sessions are in-memory, with a 30-minute idle timeout and 12-hour absolute timeout by default. **Remember me** uses a persistent browser cookie, a fixed 30-day lifetime, and durable server-side token-hash state.
 
 Supporting arbitrary local users with different shell identities is outside version 1. It would require a narrowly scoped privileged broker or separate per-user workers; the web service must not be changed to run as root as a shortcut.
 
@@ -152,7 +152,7 @@ Source installation initially requires network access for APT, npm modules, Go m
 
 ### Login
 
-- The React login screen submits the configured username and password once. HTTPS encrypts it; the default HTTP appliance mode warns that it is plaintext on the network.
+- The React login screen submits the configured username, password, and explicit **Remember me** choice once. HTTPS encrypts it; the default HTTP appliance mode warns that it is plaintext on the network.
 - The backend authenticates through Linux PAM using `/etc/pam.d/remoteterminal`.
 - Both PAM authentication and account-management checks are required so locked or expired accounts are rejected.
 - Only the account selected during installation is accepted.
@@ -166,14 +166,14 @@ After successful PAM authentication, the backend creates a cryptographically ran
 - `HttpOnly`.
 - `Secure` and a `__Host-` name in HTTPS mode; HTTP uses a distinct host-only non-`Secure` cookie because browsers reject the secure cookie on plaintext origins.
 - `SameSite=Strict`.
-- An idle expiration.
-- An absolute expiration.
+- No browser persistence attributes for an ordinary login, or a fixed expiration and `Max-Age` when **Remember me** is selected.
+- Server-side idle and absolute expiration for an ordinary login, or one fixed remembered-session expiration.
 
 State-changing requests require a CSRF token and a valid same-origin `Origin` header. WebSocket upgrades also validate the authenticated session and origin. Logout immediately invalidates the server-side session.
 
 Failed logins are rate-limited by source IP and username. Request bodies and concurrent authentication attempts are bounded.
 
-Browser sessions live only in service memory. Their default idle lifetime is 30 minutes and their non-sliding absolute lifetime is 12 hours. Ansible overrides `remoteterminal_idle_timeout` and `remoteterminal_absolute_timeout` accept Go duration strings and must keep the idle timeout at or below the absolute timeout. A service restart invalidates existing browser logins.
+Ordinary browser sessions live only in service memory and have a default idle lifetime of 30 minutes plus a non-sliding absolute lifetime of 12 hours. Remembered sessions have a fixed 30-day lifetime with no shorter idle deadline; only their SHA-256 token hashes, CSRF state, account/scope binding, and deadlines are atomically stored in a mode-`0600` file beneath `/var/lib/remoteterminal/auth`. The raw cookie token and password are never persisted. Ansible overrides `remoteterminal_idle_timeout`, `remoteterminal_absolute_timeout`, and `remoteterminal_remember_timeout` accept Go duration strings; the idle timeout must stay at or below the ordinary absolute timeout. Service and machine restarts restore unexpired remembered sessions, while logout durably removes the selected token.
 
 ### PAM feasibility checkpoint
 
@@ -217,6 +217,7 @@ The version 1 persistence boundary is intentionally narrow. The manager leaves t
 - Bind each code-server HTTP listener and session IPC endpoint to a private Unix-domain socket below `/run/remoteterminal/code-server/INSTANCE/`.
 - Disable code-server authentication only because the Go proxy authenticates every HTTP and WebSocket request. Disable telemetry, update checks, and code-server's built-in port proxy.
 - Give each canonical folder an isolated persistent user-data and extensions profile under `/var/lib/remoteterminal/code-server/profiles`.
+- Migrate each profile once to the built-in **Dark Modern** color theme while preserving unrelated JSONC settings and respecting later user theme changes.
 - Keep an instance running across tab closure, browser closure, and logout. Stop it only through explicit **Shutdown**, natural process exit, or Remote Terminal service shutdown/restart/upgrade/reboot.
 - On startup and list operations, reconcile private tmux state with runtime sockets so stale processes and entries are not presented as active.
 
@@ -283,7 +284,7 @@ Closing a code-server tab also only detaches the browser view. Shutting down a c
 - Use proper `tab`, `tabpanel`, selected, and controlled relationships.
 - Support Up/Down, Home/End, Enter, and Delete/close keyboard behavior where appropriate.
 - Maintain visible focus indicators and sufficient contrast.
-- Collapse the sidebar cleanly on narrow screens.
+- Keep the desktop sidebar compact and information-dense, and collapse it cleanly on narrow screens.
 
 ### Copy and paste
 
@@ -341,7 +342,7 @@ Application-owned files are removed by default. Four explicit boolean overrides 
 
 - `remoteterminal_uninstall_preserve_installation=true` retains `/opt/remoteterminal`, including the pinned Go, ttyd, and code-server tools.
 - `remoteterminal_uninstall_preserve_config=true` retains `/etc/remoteterminal`, including TLS and the PAM verification marker.
-- `remoteterminal_uninstall_preserve_state=true` retains `/var/lib/remoteterminal`, including isolated code-server profiles.
+- `remoteterminal_uninstall_preserve_state=true` retains `/var/lib/remoteterminal`, including isolated code-server profiles and unexpired remembered-session hashes.
 - `remoteterminal_uninstall_preserve_build_cache=true` retains `/var/lib/remoteterminal-build`.
 
 These flags do not retain live processes or `/run/remoteterminal`; all default to `false`.
@@ -374,7 +375,7 @@ These flags do not retain live processes or `/run/remoteterminal`; all default t
 
 ### Phase 2: Go backend — implemented
 
-- Configuration/startup validation, PAM login, in-memory authentication sessions, CSRF/origin enforcement, throttling, and security headers are implemented.
+- Configuration/startup validation, PAM login, ordinary in-memory and durable hashed remembered sessions, CSRF/origin enforcement, throttling, and security headers are implemented.
 - Concurrency-safe tmux session management, ttyd process/socket lifecycle, authenticated reverse proxying, graceful HTTP shutdown, cleanup, logging, and health checks are implemented.
 - Canonical-folder code-server management, per-instance private sockets and profiles, authenticated HTTP/WebSocket proxying, active limits, reconciliation, and graceful shutdown are implemented.
 
@@ -492,7 +493,7 @@ These remain the release criteria. Source implementation and local automation do
 3. **Port:** `8443` is the default listener port. `remoteterminal_port` overrides it within the validated unprivileged port range.
 4. **Session limit:** Eight managed sessions is the default. `remoteterminal_max_sessions` overrides it from 1 through 64.
 5. **Persistence:** Version 1 preserves tmux sessions across browser disconnect, tab closure, and logout while the service continues running. Service restart, upgrade restart, reboot, and uninstall are outside that guarantee. Durable restart/reboot persistence is a future design choice.
-6. **Authentication lifetime:** Browser sessions default to 30 minutes idle and 12 hours absolute. Both are configurable with validated duration overrides; persistent authentication across service restart is not a version 1 feature.
+6. **Authentication lifetime:** Ordinary browser sessions default to 30 minutes idle and 12 hours absolute. **Remember me** defaults to a fixed 30-day lifetime and survives service/machine restarts through private token-hash state. All three durations are configurable with validated overrides.
 7. **Code-server limit:** Two active code servers is the default. `remoteterminal_max_code_servers` overrides it from 1 through 8; a canonical folder has at most one active instance.
 8. **Code-server lifecycle:** Tab closure, browser closure, and logout detach only. Explicit shutdown, service stop/restart/upgrade, reboot, and uninstall stop active editors; per-folder profiles persist unless application state is removed.
 9. **Code-server proxy:** The built-in port proxy is disabled. Per-instance paths are served only through Remote Terminal's authenticated same-origin proxy.

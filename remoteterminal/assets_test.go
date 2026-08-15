@@ -214,6 +214,70 @@ func TestMaterializedDependenciesRequireTmux32ForTerminalColorQueries(t *testing
 	}
 }
 
+func TestMaterializedDependenciesRefreshAPTOnlyForMissingPackages(t *testing.T) {
+	sourceDirectory, _, cleanup, err := Materialize()
+	if err != nil {
+		t.Fatalf("Materialize() error: %v", err)
+	}
+	t.Cleanup(cleanup)
+
+	contents, err := os.ReadFile(filepath.Join(
+		sourceDirectory,
+		"ansible", "roles", "remoteterminal", "tasks", "dependencies.yml",
+	))
+	if err != nil {
+		t.Fatalf("read materialized dependency tasks: %v", err)
+	}
+	dependencies := string(contents)
+	for _, required := range []string{
+		"ansible.builtin.package_facts:\n",
+		"remoteterminal_missing_apt_packages: >-\n",
+		"difference(ansible_facts.packages.keys() | list)",
+		"- /usr/bin/apt-get\n",
+		"- Acquire::Retries=3\n",
+		"- DPkg::Lock::Timeout=120\n",
+		"register: remoteterminal_apt_cache_refresh\n",
+		"until: remoteterminal_apt_cache_refresh.rc == 0\n",
+		"name: \"{{ remoteterminal_missing_apt_packages }}\"\n",
+		"remoteterminal_missing_apt_packages | length > 0\n",
+	} {
+		if !strings.Contains(dependencies, required) {
+			t.Fatalf("materialized dependency tasks are missing %q", required)
+		}
+	}
+	if strings.Contains(dependencies, "update_cache:") {
+		t.Fatal("dependency installation hides APT refresh diagnostics behind the apt module")
+	}
+}
+
+func TestDeployedFrontendRootIsFrozenBeforeReadabilityProbe(t *testing.T) {
+	contents, err := os.ReadFile(filepath.Join(
+		"ansible", "roles", "remoteterminal", "tasks", "deploy.yml",
+	))
+	if err != nil {
+		t.Fatalf("read deployment tasks: %v", err)
+	}
+	deployment := string(contents)
+	rootContract := `- name: Enforce deployed frontend root ownership and mode
+  ansible.builtin.file:
+    path: "{{ remoteterminal_release_dir }}/web"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"`
+	if !strings.Contains(deployment, rootContract) {
+		t.Fatal("deployment does not normalize the frontend root directory itself")
+	}
+
+	installIndex := strings.Index(deployment, "- name: Install versioned frontend assets")
+	rootIndex := strings.Index(deployment, rootContract)
+	readabilityIndex := strings.Index(deployment, "- name: Verify service account can read deployed frontend entrypoint")
+	if installIndex < 0 || rootIndex < 0 || readabilityIndex < 0 ||
+		!(installIndex < rootIndex && rootIndex < readabilityIndex) {
+		t.Fatal("frontend root must be normalized after rsync and before the service-account probe")
+	}
+}
+
 func TestServiceTemplateSanitizesTerminalColorEnvironment(t *testing.T) {
 	contents, err := os.ReadFile(filepath.Join("ansible", "roles", "remoteterminal", "templates", "remoteterminal.service.j2"))
 	if err != nil {
@@ -260,6 +324,42 @@ func TestCodeServerDependencyIsPinnedAndWiredIntoService(t *testing.T) {
 	}
 	if !strings.Contains(string(unit), "ConditionFileIsExecutable={{ remoteterminal_code_server_tool_dir }}/bin/code-server") {
 		t.Fatal("service unit does not require the managed code-server executable")
+	}
+}
+
+func TestRememberMeTimeoutIsWiredIntoDeployment(t *testing.T) {
+	roleRoot := filepath.Join("ansible", "roles", "remoteterminal")
+	read := func(relative string) string {
+		t.Helper()
+		contents, err := os.ReadFile(filepath.Join(roleRoot, filepath.FromSlash(relative)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(contents)
+	}
+
+	if !strings.Contains(read("defaults/main.yml"), `remoteterminal_remember_timeout: ""`) ||
+		!strings.Contains(read("tasks/preflight.yml"), "remoteterminal_remember_timeout is match") ||
+		!strings.Contains(read("templates/remoteterminal.env.j2"), "REMOTE_TERMINAL_REMEMBER_TIMEOUT={{ remoteterminal_remember_timeout }}") {
+		t.Fatal("Remember me timeout is not validated and rendered by the deployment role")
+	}
+}
+
+func TestWorkspaceSidebarUsesCompactDensity(t *testing.T) {
+	styles, err := os.ReadFile(filepath.Join("web", "src", "styles.css"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	contents := string(styles)
+	for _, contract := range []string{
+		"--sidebar-width: 236px",
+		".sidebar__header { display: flex; height: 56px",
+		".session-tab { display: flex; min-height: 44px",
+		".sidebar__footer { display: flex; min-height: 52px",
+	} {
+		if !strings.Contains(contents, contract) {
+			t.Fatalf("compact sidebar styling is missing %q", contract)
+		}
 	}
 }
 
@@ -429,6 +529,22 @@ func TestPinnedToolCompletionMarkersUseLineBasedComparisons(t *testing.T) {
 	}
 	if strings.Contains(string(codeServerTasks), "completion_prefix | trim) ~ '\\n'") {
 		t.Fatal("code-server reuse check still constructs a literal backslash-n marker")
+	}
+}
+
+func TestCodeServerExtractionRemovesGroupAndOtherWritePermissions(t *testing.T) {
+	codeServerTasks, err := os.ReadFile(filepath.Join("ansible", "roles", "remoteterminal", "tasks", "install_code_server.yml"))
+	if err != nil {
+		t.Fatalf("read code-server tasks: %v", err)
+	}
+
+	contents := string(codeServerTasks)
+	if !strings.Contains(contents, "Remove group and other write permissions from extracted code-server entries") ||
+		!strings.Contains(contents, "stat.S_IMODE(details.st_mode) & ~0o022") {
+		t.Fatal("code-server extraction does not deterministically remove group/other write permissions")
+	}
+	if !strings.Contains(contents, "details.st_mode & 0o022") {
+		t.Fatal("code-server extraction no longer validates group/other write permissions")
 	}
 }
 

@@ -349,12 +349,12 @@ export const api = {
       { suppressUnauthorized: true },
     ).then(adoptAuthSession),
 
-  login: (username: string, password: string, signal?: AbortSignal) =>
+  login: (username: string, password: string, rememberMe = false, signal?: AbortSignal) =>
     request<AuthResponse>(
       '/api/auth/login',
       {
         method: 'POST',
-        body: JSON.stringify({ username, password }),
+        body: JSON.stringify({ username, password, rememberMe }),
         signal,
       },
       { suppressUnauthorized: true },

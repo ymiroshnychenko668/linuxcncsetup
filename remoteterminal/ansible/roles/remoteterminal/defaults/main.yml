@@ -21,6 +21,7 @@ remoteterminal_max_sessions: 8
 remoteterminal_max_code_servers: 2
 remoteterminal_idle_timeout: ""
 remoteterminal_absolute_timeout: ""
+remoteterminal_remember_timeout: ""
 remoteterminal_pam_service: remoteterminal
 remoteterminal_pam_auth_include: common-auth
 remoteterminal_pam_account_include: common-account

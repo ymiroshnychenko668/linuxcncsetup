@@ -230,7 +230,8 @@ func newHarnessWithOptions(t *testing.T, idle, absolute time.Duration, insecureH
 	codeServerManager := &fakeCodeServerManager{}
 	logs := &bytes.Buffer{}
 	server, err := New(Config{
-		AllowedUser: "operator", MachineName: "Workshop Mill", WebDir: web, AbsoluteTimeout: time.Hour, AuthConcurrency: 1,
+		AllowedUser: "operator", MachineName: "Workshop Mill", WebDir: web, AbsoluteTimeout: time.Hour,
+		RememberTimeout: 30 * 24 * time.Hour, AuthConcurrency: 1,
 		InsecureHTTP: insecureHTTP,
 	}, authenticator, auth.NewStore(idle, absolute, 32), auth.NewThrottler(5, time.Minute), manager, codeServerManager,
 		log.New(logs, "", 0))
@@ -291,8 +292,16 @@ type loginResult struct {
 }
 
 func login(t *testing.T, server http.Handler, username, password string) loginResult {
+	return loginWithRemember(t, server, username, password, false)
+}
+
+func loginWithRemember(t *testing.T, server http.Handler, username, password string, rememberMe bool) loginResult {
 	t.Helper()
-	body, _ := json.Marshal(map[string]string{"username": username, "password": password})
+	body, _ := json.Marshal(struct {
+		Username   string `json:"username"`
+		Password   string `json:"password"`
+		RememberMe bool   `json:"rememberMe"`
+	}{Username: username, Password: password, RememberMe: rememberMe})
 	request := httptest.NewRequest(http.MethodPost, "http://example.test/api/auth/login", bytes.NewReader(body))
 	request.Host = "example.test"
 	request.RemoteAddr = "192.0.2.5:12345"
@@ -340,6 +349,9 @@ func TestLoginSetsSecureOpaqueCookieAndUsesConfiguredPAMUser(t *testing.T) {
 		result.cookie.SameSite != http.SameSiteStrictMode || result.cookie.Path != "/" || result.cookie.Value == "" {
 		t.Fatalf("insecure login cookie: %+v", result.cookie)
 	}
+	if result.cookie.MaxAge != 0 || !result.cookie.Expires.IsZero() {
+		t.Fatalf("ordinary login unexpectedly set a persistent cookie: %+v", result.cookie)
+	}
 	if result.csrf == "" || result.csrf == result.cookie.Value {
 		t.Fatalf("invalid independent CSRF token: %q", result.csrf)
 	}
@@ -347,6 +359,22 @@ func TestLoginSetsSecureOpaqueCookieAndUsesConfiguredPAMUser(t *testing.T) {
 	defer h.auth.mu.Unlock()
 	if len(h.auth.users) != 1 || h.auth.users[0] != "operator" || h.auth.passwords[0] != "secret" {
 		t.Fatalf("PAM calls = users %#v passwords %#v", h.auth.users, h.auth.passwords)
+	}
+}
+
+func TestRememberedLoginSetsLongLivedCookie(t *testing.T) {
+	h := newHarness(t)
+	before := time.Now()
+	result := loginWithRemember(t, h.server, "operator", "secret", true)
+	if result.status != http.StatusOK {
+		t.Fatalf("login status = %d: %s", result.status, result.body)
+	}
+	if result.cookie == nil || result.cookie.MaxAge <= 0 || result.cookie.Expires.IsZero() {
+		t.Fatalf("remembered login did not set a persistent cookie: %+v", result.cookie)
+	}
+	wantExpiry := before.Add(30 * 24 * time.Hour)
+	if delta := result.cookie.Expires.Sub(wantExpiry); delta < -2*time.Second || delta > 2*time.Second {
+		t.Fatalf("remembered cookie expiry = %v, want near %v", result.cookie.Expires, wantExpiry)
 	}
 }
 

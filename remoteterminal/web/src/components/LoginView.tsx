@@ -21,6 +21,7 @@ export function isPlainHTTP(location: Pick<Location, 'protocol'> = window.locati
 export function LoginView({ machineName, onAuthenticated, message }: LoginViewProps) {
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
+  const [rememberMe, setRememberMe] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [submitting, setSubmitting] = useState(false)
   const passwordRef = useRef<HTMLInputElement>(null)
@@ -34,7 +35,7 @@ export function LoginView({ machineName, onAuthenticated, message }: LoginViewPr
     setSubmitting(true)
     setError(null)
     try {
-      const session = await api.login(username.trim(), password)
+      const session = await api.login(username.trim(), password, rememberMe)
       if (!session.authenticated || !session.user) {
         throw new ApiError('Authentication failed.', 401, 'authentication_failed')
       }
@@ -133,6 +134,21 @@ export function LoginView({ machineName, onAuthenticated, message }: LoginViewPr
               required
             />
 
+            <label className="remember-option" htmlFor="remember-me">
+              <input
+                id="remember-me"
+                name="rememberMe"
+                type="checkbox"
+                checked={rememberMe}
+                onChange={(event) => setRememberMe(event.target.checked)}
+                disabled={submitting}
+              />
+              <span>
+                <strong>Remember me</strong>
+                <small>Keep me signed in on this browser.</small>
+              </span>
+            </label>
+
             <button className="button button--primary button--large" type="submit" disabled={submitting}>
               {submitting ? <span className="spinner" aria-hidden="true" /> : <TerminalIcon />}
               {submitting ? 'Signing in…' : 'Open terminal workspace'}
@@ -141,8 +157,8 @@ export function LoginView({ machineName, onAuthenticated, message }: LoginViewPr
 
           <p className="login-card__footnote">
             {plaintextTransport
-              ? 'Credentials are sent once over plaintext HTTP and are never stored in this browser.'
-              : 'Credentials are sent once over HTTPS and are never stored in this browser.'}
+              ? 'Your password is sent over plaintext HTTP and is never stored. Remember me keeps only an opaque sign-in token.'
+              : 'Your password is never stored. Remember me keeps only an opaque sign-in token in this browser.'}
           </p>
         </div>
       </section>

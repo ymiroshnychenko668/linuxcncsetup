@@ -16,7 +16,7 @@ Remote Terminal grants the browser the same shell access as the configured Linux
 
 - The service and terminal processes run as one configured non-root account.
 - The account's current password is checked once through PAM and is never stored.
-- Browser authentication uses a server-side session, CSRF protection, and same-origin checks. HTTPS sessions use a `Secure` `__Host-` cookie; HTTP uses a separate host-only cookie.
+- Browser authentication uses a server-side session, CSRF protection, and same-origin checks. HTTPS sessions use a `Secure` `__Host-` cookie; HTTP uses a separate host-only cookie. **Remember me** persists only a hash of the opaque token in the private application state; neither the raw browser token nor the Linux password is written to disk.
 - The production appliance profile defaults to HTTP on an isolated machine LAN so certificates do not have to be provisioned on every workstation. It exposes the PAM password, terminal traffic, files, and editor traffic to observation or modification by anything able to intercept that LAN. HTTPS remains available when a trusted certificate can be deployed.
 - ttyd and code-server listen only on per-instance private Unix-domain sockets.
 - Dedicated terminal and code-server tmux sockets keep application sessions separate from the user's other tmux sessions.
@@ -43,7 +43,7 @@ The default transport is HTTP and the default port is `8443`. After installation
 http://LAN_ADDRESS:8443/
 ```
 
-Log in with the selected system username and its current password.
+Log in with the selected system username and its current password. **Remember me** is enabled by default and keeps that browser signed in for 30 days across browser, service, and machine restarts unless the user signs out, changes authentication transport/account, or removes application state.
 
 ## Direct Ansible invocation
 
@@ -77,11 +77,12 @@ Important variables include:
 | `remoteterminal_generated_tls_renew_before_seconds` | no | `2592000` | Regenerate or reject TLS material within this validity window |
 | `remoteterminal_idle_timeout` | no | `30m` | Browser-session idle timeout; accepts a Go duration |
 | `remoteterminal_absolute_timeout` | no | `12h` | Browser-session maximum lifetime; accepts a Go duration |
+| `remoteterminal_remember_timeout` | no | `720h` | Fixed lifetime for a **Remember me** session; accepts a Go duration |
 | `remoteterminal_require_verified_pam_authentication` | no | `false` | Require a current interactive PAM-verification marker before deployment continues |
 | `remoteterminal_validate_listen_address_is_local` | no | `true` | Require the selected IPv4 address to appear in host facts |
 
 Certificate and key source variables must be supplied together in HTTPS mode and must be empty in HTTP mode. Plain HTTP protects neither the Linux password nor the resulting session from LAN interception. Normal code-server webviews require the exact origin to be allowlisted as secure in each managed Chromium client.
-Leaving the two timeout overrides empty omits them from the installed environment file, so the backend applies the effective defaults shown above: 30 minutes idle and 12 hours absolute.
+Leaving the timeout overrides empty omits them from the installed environment file, so the backend applies the effective defaults shown above: 30 minutes idle, 12 hours absolute, and 30 days for **Remember me**.
 
 ### Browser configuration for HTTP webviews
 
@@ -138,13 +139,13 @@ When `remoteterminal_transport=http`, TLS generation and validation are skipped.
 - Sessions use an application-private tmux socket and do not affect normal tmux usage.
 - Scroll the mouse wheel or trackpad to browse terminal output; tmux copy mode owns the session scrollback.
 
-Persistence in version 1 is limited to browser disconnects, tab closure, and logout while the deployed service remains running. Browser authentication sessions are held in memory, and managed tmux sessions are not guaranteed to survive a systemd service restart, an upgrade that restarts the service, a machine reboot, or uninstall. Save work before those operations; reboot persistence is a future enhancement.
+Managed tmux-session persistence in version 1 is limited to browser disconnects, tab closure, and logout while the deployed service remains running. Ordinary browser logins are held only in memory, while **Remember me** stores a token hash beneath `/var/lib/remoteterminal/auth` and survives service or machine restarts until its fixed deadline. Managed tmux sessions are still not guaranteed to survive a systemd service restart, upgrade, reboot, or uninstall. Save terminal work before those operations; workload restoration remains a future enhancement.
 
 ## Code-server workspaces
 
 Choose **Launch Code Server**, browse from the configured account's home directory, and select a working folder. The picker can open any directory that account can traverse and read. Paths are canonicalized, so aliases and symbolic links that resolve to the same folder reuse and focus the existing instance instead of starting a duplicate. Each active workspace appears in the active-code-server list and in a visually distinct blue/cyan editor tab.
 
-Each workspace runs in its own tmux session on the application-private code-server tmux socket. It uses an isolated persistent profile under `/var/lib/remoteterminal/code-server/profiles`, keyed by the canonical folder, so settings, extensions, and editor state do not leak between projects. The editor itself is served below its authenticated `/code/INSTANCE/` route; no code-server TCP listener or public upstream service is created.
+Each workspace runs in its own tmux session on the application-private code-server tmux socket. It uses an isolated persistent profile under `/var/lib/remoteterminal/code-server/profiles`, keyed by the canonical folder, so settings, extensions, and editor state do not leak between projects. On the first profile launch after this update, Remote Terminal selects code-server's **Dark Modern** theme while preserving unrelated JSONC settings; later manual theme choices are respected. The editor itself is served below its authenticated `/code/INSTANCE/` route; no code-server TCP listener or public upstream service is created.
 
 - Closing an editor tab only detaches the browser view; the code-server keeps running.
 - Logging out or closing the browser also leaves active code servers running.
@@ -224,7 +225,7 @@ Restart the web service:
 sudo systemctl restart remoteterminal.service
 ```
 
-Restarting the service invalidates in-memory browser logins and cleanly stops active code servers; their per-folder profiles remain. It is outside the terminal tmux-persistence guarantee. Re-run the install playbook to upgrade from the current source checkout. The role uses content-addressed application and dependency installs plus durable change markers, so unchanged inputs do not request a restart; target-machine second-run idempotence remains part of manual acceptance.
+Restarting the service invalidates ordinary in-memory browser logins but restores unexpired **Remember me** sessions from hashed private state. It cleanly stops active code servers; their per-folder profiles remain. A restart is still outside the terminal tmux-persistence guarantee. Re-run the install playbook to upgrade from the current source checkout. The role uses content-addressed application and dependency installs plus durable change markers, so unchanged inputs do not request a restart; target-machine second-run idempotence remains part of manual acceptance.
 
 Uninstall with:
 
@@ -247,7 +248,7 @@ The following optional variables preserve otherwise application-owned files:
 | --- | --- |
 | `remoteterminal_uninstall_preserve_installation` | `/opt/remoteterminal` releases and pinned Go/ttyd/code-server tools |
 | `remoteterminal_uninstall_preserve_config` | `/etc/remoteterminal`, including TLS material and the PAM verification marker |
-| `remoteterminal_uninstall_preserve_state` | `/var/lib/remoteterminal`, including per-folder code-server profiles |
+| `remoteterminal_uninstall_preserve_state` | `/var/lib/remoteterminal`, including per-folder code-server profiles and unexpired remembered-session hashes |
 | `remoteterminal_uninstall_preserve_build_cache` | `/var/lib/remoteterminal-build` |
 
 For example, add `--extra-vars 'remoteterminal_uninstall_preserve_config=true'` to preserve configuration and TLS material. All four flags default to `false`.

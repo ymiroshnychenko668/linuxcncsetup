@@ -44,12 +44,17 @@ describe('api security contract', () => {
         },
       }))
 
-    await api.login('operator', 'system-password')
+    await api.login('operator', 'system-password', true)
     await api.createSession('diagnostics')
 
     const [, loginInit] = fetchMock.mock.calls[0]
     const [, createInit] = fetchMock.mock.calls[1]
     expect(loginInit).toMatchObject({ credentials: 'same-origin' })
+    expect(loginInit?.body).toBe(JSON.stringify({
+      username: 'operator',
+      password: 'system-password',
+      rememberMe: true,
+    }))
     expect(createInit).toMatchObject({ credentials: 'same-origin', method: 'POST' })
     expect(new Headers(createInit?.headers).get('X-CSRF-Token')).toBe('csrf-secret')
     expect(localStorage.length).toBe(0)

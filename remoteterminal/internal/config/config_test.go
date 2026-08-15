@@ -27,6 +27,7 @@ func validConfig() Config {
 		MaxCodeServers:    2,
 		IdleTimeout:       time.Minute,
 		AbsoluteTimeout:   time.Hour,
+		RememberTimeout:   30 * 24 * time.Hour,
 		AuthConcurrency:   4,
 		LoginAttempts:     5,
 		LoginWindow:       time.Minute,
@@ -56,6 +57,7 @@ func TestValidateRejectsUnsafeListenAndPaths(t *testing.T) {
 		{"invalid machine name", func(c *Config) { c.MachineName = "Mill #1" }, "MACHINE_NAME"},
 		{"long machine name", func(c *Config) { c.MachineName = strings.Repeat("m", 65) }, "MACHINE_NAME"},
 		{"idle beyond absolute", func(c *Config) { c.IdleTimeout = 2 * time.Hour }, "must not exceed"},
+		{"zero remember timeout", func(c *Config) { c.RememberTimeout = 0 }, "REMEMBER_TIMEOUT"},
 		{"too many sessions", func(c *Config) { c.MaxSessions = 65 }, "between 1 and 64"},
 		{"too many code servers", func(c *Config) { c.MaxCodeServers = 9 }, "between 1 and 8"},
 		{"invalid transport", func(c *Config) { c.Transport = "ftp" }, "TRANSPORT"},
@@ -111,6 +113,7 @@ func TestLoadReadsDurationsAndLimits(t *testing.T) {
 		"REMOTE_TERMINAL_LISTEN_ADDRESS":   "192.0.2.20:9443",
 		"REMOTE_TERMINAL_ALLOWED_USER":     "machine",
 		"REMOTE_TERMINAL_MACHINE_NAME":     "Main CNC Mill",
+		"REMOTE_TERMINAL_TRANSPORT":        "https",
 		"REMOTE_TERMINAL_TLS_CERT_FILE":    "/tmp/cert",
 		"REMOTE_TERMINAL_TLS_KEY_FILE":     "/tmp/key",
 		"REMOTE_TERMINAL_WEB_DIR":          "/tmp/web",
@@ -118,6 +121,7 @@ func TestLoadReadsDurationsAndLimits(t *testing.T) {
 		"REMOTE_TERMINAL_MAX_CODE_SERVERS": "3",
 		"REMOTE_TERMINAL_IDLE_TIMEOUT":     "20m",
 		"REMOTE_TERMINAL_ABSOLUTE_TIMEOUT": "4h",
+		"REMOTE_TERMINAL_REMEMBER_TIMEOUT": "720h",
 	} {
 		t.Setenv(name, value)
 	}
@@ -127,6 +131,7 @@ func TestLoadReadsDurationsAndLimits(t *testing.T) {
 	}
 	if configuration.MachineName != "Main CNC Mill" || configuration.MaxSessions != 12 || configuration.MaxCodeServers != 3 ||
 		configuration.IdleTimeout != 20*time.Minute || configuration.AbsoluteTimeout != 4*time.Hour ||
+		configuration.RememberTimeout != 30*24*time.Hour ||
 		configuration.Transport != TransportHTTPS {
 		t.Fatalf("unexpected loaded config: %+v", configuration)
 	}

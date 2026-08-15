@@ -1,10 +1,41 @@
 ---
-- name: Install Debian build and runtime packages
+- name: Read installed Debian package facts
+  ansible.builtin.package_facts:
+    manager: auto
+
+- name: Determine missing Debian build and runtime packages
+  ansible.builtin.set_fact:
+    remoteterminal_missing_apt_packages: >-
+      {{ remoteterminal_apt_packages |
+         difference(ansible_facts.packages.keys() | list) }}
+
+- name: Refresh APT indexes for missing dependencies
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/apt-get
+      - -o
+      - Acquire::Retries=3
+      - -o
+      - DPkg::Lock::Timeout=120
+      - update
+  environment:
+    DEBIAN_FRONTEND: noninteractive
+    LC_ALL: C
+  register: remoteterminal_apt_cache_refresh
+  changed_when: false
+  retries: 3
+  delay: 5
+  until: remoteterminal_apt_cache_refresh.rc == 0
+  when:
+    - not ansible_check_mode
+    - remoteterminal_missing_apt_packages | length > 0
+
+- name: Install missing Debian build and runtime packages
   ansible.builtin.apt:
-    name: "{{ remoteterminal_apt_packages }}"
+    name: "{{ remoteterminal_missing_apt_packages }}"
     state: present
-    update_cache: true
-    cache_valid_time: 3600
+    lock_timeout: 120
+  when: remoteterminal_missing_apt_packages | length > 0
 
 - name: Read installed tmux version
   ansible.builtin.command:

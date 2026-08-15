@@ -70,12 +70,23 @@ func run(logger *log.Logger) error {
 		return fmt.Errorf("initialize code-server manager: %w", err)
 	}
 
-	authStore := auth.NewStore(settings.IdleTimeout, settings.AbsoluteTimeout, settings.SessionCapacity)
+	authStore, err := auth.NewPersistentStore(
+		settings.IdleTimeout,
+		settings.AbsoluteTimeout,
+		settings.SessionCapacity,
+		filepath.Join(settings.StateDir, "auth", "remembered-sessions.json"),
+		settings.AllowedUser,
+		string(settings.Transport),
+	)
+	if err != nil {
+		return fmt.Errorf("initialize authentication store: %w", err)
+	}
 	handler, err := httpapi.New(httpapi.Config{
 		AllowedUser:     settings.AllowedUser,
 		MachineName:     settings.MachineName,
 		WebDir:          settings.WebDir,
 		AbsoluteTimeout: settings.AbsoluteTimeout,
+		RememberTimeout: settings.RememberTimeout,
 		AuthConcurrency: settings.AuthConcurrency,
 		InsecureHTTP:    settings.Transport == config.TransportHTTP,
 	}, auth.NewPAMAuthenticator(settings.PAMService), authStore,

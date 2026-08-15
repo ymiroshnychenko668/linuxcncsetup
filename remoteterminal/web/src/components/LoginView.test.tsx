@@ -29,11 +29,29 @@ describe('LoginView', () => {
     await user.type(screen.getByLabelText('Password'), 'secret')
     await user.click(screen.getByRole('button', { name: /open terminal workspace/i }))
 
-    expect(mocks.login).toHaveBeenCalledWith('operator', 'secret')
+    expect(screen.getByRole('checkbox', { name: /remember me/i })).toBeChecked()
+    expect(mocks.login).toHaveBeenCalledWith('operator', 'secret', true)
     expect(onAuthenticated).toHaveBeenCalledWith(expect.objectContaining({
       user: { username: 'operator' },
     }))
     expect(localStorage.length).toBe(0)
+  })
+
+  it('allows a browser-session-only sign in', async () => {
+    mocks.login.mockResolvedValue({
+      authenticated: true,
+      user: { username: 'operator' },
+      csrfToken: 'csrf-value',
+    })
+    render(<LoginView machineName="Workshop Mill" onAuthenticated={vi.fn()} />)
+    const user = userEvent.setup()
+
+    await user.type(screen.getByLabelText('Username'), 'operator')
+    await user.type(screen.getByLabelText('Password'), 'secret')
+    await user.click(screen.getByRole('checkbox', { name: /remember me/i }))
+    await user.click(screen.getByRole('button', { name: /open terminal workspace/i }))
+
+    expect(mocks.login).toHaveBeenCalledWith('operator', 'secret', false)
   })
 
   it('uses a generic message for rejected credentials', async () => {
