@@ -1,0 +1,253 @@
+---
+- name: Read fstab for the selected managed SMB mount
+  ansible.builtin.slurp:
+    src: /etc/fstab
+  register: smb_inspected_fstab_file
+
+- name: Derive the selected managed SMB markers
+  ansible.builtin.set_fact:
+    smb_inspected_fstab_text: "{{ smb_inspected_fstab_file.content | b64decode }}"
+    smb_inspected_begin_marker: "# BEGIN {{ smb_inspect_marker_label }}"
+    smb_inspected_end_marker: "# END {{ smb_inspect_marker_label }}"
+
+- name: Locate the exact selected managed SMB block
+  ansible.builtin.set_fact:
+    smb_inspected_begin_count: >-
+      {{
+        smb_inspected_fstab_text
+        | regex_findall('(?m)^' ~ (smb_inspected_begin_marker | regex_escape) ~ '$')
+        | length
+      }}
+    smb_inspected_end_count: >-
+      {{
+        smb_inspected_fstab_text
+        | regex_findall('(?m)^' ~ (smb_inspected_end_marker | regex_escape) ~ '$')
+        | length
+      }}
+    smb_inspected_blocks: >-
+      {{
+        smb_inspected_fstab_text
+        | regex_findall(
+            '(?ms)^' ~ (smb_inspected_begin_marker | regex_escape) ~ '\n'
+            ~ '(.*?)'
+            ~ '^' ~ (smb_inspected_end_marker | regex_escape) ~ '$'
+          )
+      }}
+
+- name: Validate ownership of the selected managed SMB block
+  ansible.builtin.assert:
+    that:
+      - smb_inspected_begin_count == 1
+      - smb_inspected_end_count == 1
+      - smb_inspected_blocks | length == 1
+      - >-
+        smb_inspected_blocks[0] | trim
+        is match(
+          '^'
+          ~ (smb_inspect_source | regex_escape)
+          ~ '[ \t]+'
+          ~ (smb_inspect_mount_point | regex_escape)
+          ~ '[ \t]+cifs[ \t]+\S+[ \t]+0[ \t]+0$'
+        )
+    fail_msg: >-
+      The selected LinuxCNC Setup SMB markers are missing, duplicated,
+      malformed, or no longer contain the expected CIFS entry. Nothing was
+      changed.
+
+- name: Read the selected static fstab entry
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/findmnt
+      - --fstab
+      - --mountpoint
+      - "{{ smb_inspect_mount_point }}"
+      - --noheadings
+      - --raw
+      - --output
+      - SOURCE,FSTYPE,OPTIONS
+  register: smb_inspected_fstab_probe
+  changed_when: false
+  failed_when: smb_inspected_fstab_probe.rc not in [0, 1]
+  check_mode: false
+
+- name: Read every active filesystem at the selected mount directory
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/findmnt
+      - --kernel
+      - --mountpoint
+      - "{{ smb_inspect_mount_point }}"
+      - --noheadings
+      - --raw
+      - --output
+      - SOURCE,FSTYPE
+  register: smb_inspected_kernel_probe
+  changed_when: false
+  failed_when: smb_inspected_kernel_probe.rc not in [0, 1]
+  check_mode: false
+
+- name: Read an active CIFS filesystem at the selected mount directory
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/findmnt
+      - --kernel
+      - --mountpoint
+      - "{{ smb_inspect_mount_point }}"
+      - --types
+      - cifs
+      - --noheadings
+      - --raw
+      - --output
+      - SOURCE,FSTYPE
+  register: smb_inspected_cifs_probe
+  changed_when: false
+  failed_when: smb_inspected_cifs_probe.rc not in [0, 1]
+  check_mode: false
+
+- name: Read an active autofs filesystem at the selected mount directory
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/findmnt
+      - --kernel
+      - --mountpoint
+      - "{{ smb_inspect_mount_point }}"
+      - --types
+      - autofs
+      - --noheadings
+      - --raw
+      - --output
+      - SOURCE,FSTYPE
+  register: smb_inspected_autofs_probe
+  changed_when: false
+  failed_when: smb_inspected_autofs_probe.rc not in [0, 1]
+  check_mode: false
+
+- name: Parse the selected fstab and kernel state
+  ansible.builtin.set_fact:
+    smb_inspected_fstab_fields: >-
+      {{
+        (smb_inspected_fstab_probe.stdout | trim).split()
+        if smb_inspected_fstab_probe.rc == 0
+        else []
+      }}
+    smb_inspected_cifs_fields: >-
+      {{
+        (smb_inspected_cifs_probe.stdout | trim).split()
+        if smb_inspected_cifs_probe.rc == 0
+        else []
+      }}
+    smb_inspected_cifs_active: "{{ smb_inspected_cifs_probe.rc == 0 }}"
+    smb_inspected_autofs_active: "{{ smb_inspected_autofs_probe.rc == 0 }}"
+
+- name: Reject unrelated selected fstab or active filesystem state
+  ansible.builtin.assert:
+    that:
+      - smb_inspected_fstab_probe.stdout_lines | length == 1
+      - smb_inspected_fstab_fields | length >= 3
+      - smb_inspected_fstab_fields[0] == smb_inspect_source
+      - smb_inspected_fstab_fields[1] == "cifs"
+      - >-
+        (smb_inspected_fstab_fields[2].split(",") | sort) ==
+        (smb_mount_options_compact.split(",") | sort)
+      - smb_inspected_kernel_probe.stdout_lines | length <= 2
+      - smb_inspected_cifs_probe.stdout_lines | length <= 1
+      - smb_inspected_autofs_probe.stdout_lines | length <= 1
+      - >-
+        smb_inspected_kernel_probe.stdout_lines | length ==
+        (
+          (smb_inspected_cifs_probe.stdout_lines | length) +
+          (smb_inspected_autofs_probe.stdout_lines | length)
+        )
+      - >-
+        not smb_inspected_cifs_active or
+        (
+          smb_inspected_cifs_fields | length >= 2 and
+          smb_inspected_cifs_fields[0] == smb_inspect_source and
+          smb_inspected_cifs_fields[1] == "cifs"
+        )
+    fail_msg: >-
+      The selected mount directory has unrelated or ambiguous fstab/kernel
+      state. LinuxCNC Setup will not operate on it.
+
+- name: Resolve the selected systemd mount unit names
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/systemd-escape
+      - --path
+      - "{{ smb_inspect_mount_point }}"
+  register: smb_inspected_systemd_escape
+  changed_when: false
+  check_mode: false
+
+- name: Store the selected systemd mount unit names
+  ansible.builtin.set_fact:
+    smb_inspected_mount_unit: "{{ smb_inspected_systemd_escape.stdout | trim }}.mount"
+    smb_inspected_automount_unit: "{{ smb_inspected_systemd_escape.stdout | trim }}.automount"
+
+- name: Refresh fstab-generated systemd units before provenance checks
+  ansible.builtin.systemd_service:
+    daemon_reload: true
+  when: not ansible_check_mode
+
+- name: Inspect selected systemd mount unit provenance
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/systemctl
+      - show
+      - "{{ smb_inspected_mount_unit }}"
+      - --property=LoadState
+      - --property=FragmentPath
+      - --property=SourcePath
+      - --property=DropInPaths
+  register: smb_inspected_mount_unit_provenance
+  changed_when: false
+  check_mode: false
+
+- name: Inspect selected systemd automount unit provenance
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/systemctl
+      - show
+      - "{{ smb_inspected_automount_unit }}"
+      - --property=LoadState
+      - --property=FragmentPath
+      - --property=SourcePath
+      - --property=DropInPaths
+  register: smb_inspected_automount_unit_provenance
+  changed_when: false
+  check_mode: false
+
+- name: Refuse native or overridden selected systemd mount units
+  ansible.builtin.assert:
+    that:
+      - >-
+        smb_inspected_mount_unit_provenance.stdout
+        is search('(?m)^LoadState=loaded$') and
+        smb_inspected_mount_unit_provenance.stdout
+        is search('(?m)^SourcePath=/etc/fstab$') and
+        smb_inspected_mount_unit_provenance.stdout
+        is search(
+          '(?m)^FragmentPath=/run/systemd/generator'
+          ~ '(?:[.](?:early|late))?/'
+          ~ (smb_inspected_mount_unit | regex_escape)
+          ~ '$'
+        ) and
+        smb_inspected_mount_unit_provenance.stdout
+        is search('(?m)^DropInPaths=$')
+      - >-
+        smb_inspected_automount_unit_provenance.stdout
+        is search('(?m)^LoadState=loaded$') and
+        smb_inspected_automount_unit_provenance.stdout
+        is search('(?m)^SourcePath=/etc/fstab$') and
+        smb_inspected_automount_unit_provenance.stdout
+        is search(
+          '(?m)^FragmentPath=/run/systemd/generator'
+          ~ '(?:[.](?:early|late))?/'
+          ~ (smb_inspected_automount_unit | regex_escape)
+          ~ '$'
+        ) and
+        smb_inspected_automount_unit_provenance.stdout
+        is search('(?m)^DropInPaths=$')
+    fail_msg: >-
+      A native, overridden, or non-fstab systemd unit owns the selected mount
+      directory. LinuxCNC Setup will not start or stop it.

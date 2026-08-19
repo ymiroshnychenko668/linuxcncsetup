@@ -44,6 +44,10 @@ func TestMaterialize(t *testing.T) {
 				filepath.Join(directory, "tasks", "irq_affinity_present.yml"),
 				filepath.Join(directory, "tasks", "linuxcnc_autostart.yml"),
 				filepath.Join(directory, "tasks", "linuxcnc_autostart_x11.yml"),
+				filepath.Join(directory, "tasks", "smb_apply.yml"),
+				filepath.Join(directory, "tasks", "smb_existing.yml"),
+				filepath.Join(directory, "tasks", "smb_inspect_managed.yml"),
+				filepath.Join(directory, "tasks", "smb_test.yml"),
 				filepath.Join(directory, "templates", "irq-affinity-policy.yml.j2"),
 				filepath.Join(directory, "templates", "linuxcncsetup-irq-affinity.py.j2"),
 				filepath.Join(directory, "templates", "linuxcncsetup-irq-affinity.service.j2"),
@@ -203,17 +207,37 @@ func TestSMBMountPlaybookUsesGuardedOwnedFstabManagement(t *testing.T) {
 	}
 	t.Cleanup(cleanup)
 
-	data, err := os.ReadFile(playbookPath)
-	if err != nil {
-		t.Fatalf("read SMB mount playbook: %v", err)
+	directory := filepath.Dir(playbookPath)
+	var assets []string
+	for _, assetPath := range []string{
+		playbookPath,
+		filepath.Join(directory, "tasks", "smb_apply.yml"),
+		filepath.Join(directory, "tasks", "smb_existing.yml"),
+		filepath.Join(directory, "tasks", "smb_inspect_managed.yml"),
+		filepath.Join(directory, "tasks", "smb_test.yml"),
+	} {
+		data, err := os.ReadFile(assetPath)
+		if err != nil {
+			t.Fatalf("read SMB mount asset %q: %v", assetPath, err)
+		}
+		assets = append(assets, string(data))
 	}
-	playbook := string(data)
+	playbook := strings.Join(assets, "\n")
 
 	for _, expected := range []string{
-		"//10.0.1.246/share",
-		"/mnt/smb_share",
+		`smb_server | default("")`,
+		`smb_share | default("")`,
 		`smb_operation | default("")`,
-		`["mount", "unmount", "remove"]`,
+		`["apply", "test", "mount", "unmount", "remove"]`,
+		`^/(?:mnt|media)`,
+		`smb_previous_mount_id`,
+		"tasks/smb_test.yml",
+		"tasks/smb_apply.yml",
+		"tasks/smb_existing.yml",
+		"smbclient",
+		"--no-pass",
+		"--user=guest",
+		"--command=ls",
 		"--mountpoint",
 		"--types",
 		"cifs",
@@ -221,28 +245,30 @@ func TestSMBMountPlaybookUsesGuardedOwnedFstabManagement(t *testing.T) {
 		"SourcePath=/etc/fstab",
 		"FragmentPath=/run/systemd/generator",
 		"DropInPaths=",
-		"Refuse native or overridden systemd mount units",
-		"Reinspect the configured systemd mount unit provenance",
-		"Require clean fstab-generated units before starting them",
-		"Roll back a newly-created managed fstab block",
-		"# {mark} LINUXCNCSETUP MANAGED SMB SHARE",
-		"smb_managed_begin_count",
-		"smb_managed_blocks",
-		"Validate ownership of the managed fstab block",
+		"Refuse native or overridden selected systemd mount units",
+		"Inspect the configured requested mount unit provenance",
+		"Require clean fstab-generated requested mount units",
+		"Stop after rolling back the requested SMB mount",
+		`marker: "# {mark} {{ smb_marker_label }}"`,
+		"LINUXCNCSETUP MANAGED SMB MOUNT",
+		"smb_inspected_begin_count",
+		"smb_inspected_blocks",
+		"Validate ownership of the selected managed SMB block",
+		`(smb_mount_options_compact.split(",") | sort)`,
 		"ansible.builtin.blockinfile:",
 		"backup: true",
 		"guest,vers=3.0",
 		"file_mode=0644",
 		"dir_mode=0755",
 		"x-systemd.automount",
-		"Stop the SMB automount unit before unmounting",
-		"Unmount the SMB share normally",
-		"Remove only the managed SMB fstab block",
-		"smb_fstab_probe_after_remove.rc == 1",
-		`select("match", "^uid=")`,
-		`select("match", "^gid=")`,
-		`("uid=" ~ (smb_target_uid | string))`,
-		`("gid=" ~ (smb_target_gid | string))`,
+		"Stop the selected SMB automount unit before unmounting",
+		"Unmount the selected SMB share normally",
+		"Remove only the selected managed SMB fstab block",
+		"smb_existing_fstab_probe_after_remove.rc == 1",
+		"Stop the previous SMB automount unit before updating",
+		"Unmount the previous SMB share normally before updating",
+		"Restore the exact previous managed SMB block",
+		"smb_apply_previous_block",
 	} {
 		if !strings.Contains(playbook, expected) {
 			t.Errorf("SMB mount playbook does not contain %q", expected)
@@ -264,9 +290,9 @@ func TestSMBMountPlaybookUsesGuardedOwnedFstabManagement(t *testing.T) {
 		}
 	}
 
-	stopIndex := strings.Index(playbook, "Stop the SMB automount unit before unmounting")
-	unmountIndex := strings.Index(playbook, "Unmount the SMB share normally")
-	removeIndex := strings.Index(playbook, "Remove only the managed SMB fstab block")
+	stopIndex := strings.Index(playbook, "Stop the selected SMB automount unit before unmounting")
+	unmountIndex := strings.Index(playbook, "Unmount the selected SMB share normally")
+	removeIndex := strings.Index(playbook, "Remove only the selected managed SMB fstab block")
 	if stopIndex < 0 || unmountIndex <= stopIndex || removeIndex <= unmountIndex {
 		t.Fatal("SMB playbook must stop automount before unmounting and remove fstab only afterward")
 	}

@@ -218,23 +218,38 @@ selected.
 
 ## SMB mount management
 
-**Configuration → SMB mounts** manages the existing
-`//10.0.1.246/share` guest share at `/mnt/smb_share` through an embedded
-Ansible playbook:
+**Configuration → SMB mounts** is an interactive manager for guest-access SMB
+mounts. Its inventory is read from the individually marked LinuxCNC Setup
+blocks in `/etc/fstab`; every row shows the server/share, local mount directory,
+and whether it is mounted, waiting as a systemd automount, or inactive.
 
-- **Mount SMB share** installs `cifs-utils` when needed, adds a marked
-  LinuxCNC Setup block to `/etc/fstab`, enables systemd automounting, and mounts
-  the share immediately.
-- **Unmount SMB share** stops the automount unit before performing a normal
-  unmount. It retains the persistent entry, so the share becomes available
-  again after the next reboot.
-- **Remove SMB mount** performs the same safe unmount and removes only the
-  marked fstab block owned by LinuxCNC Setup. It refuses to delete unrelated or
-  legacy entries.
+**Add SMB mount** opens an editable form for:
 
-The workflow never force-unmounts a busy share and does not create a remote
-write-test file. The root-level SMB shell scripts remain compatibility tools;
-the Go TUI does not invoke them.
+- the SMB server's IPv4 address;
+- the remote share/folder name; and
+- a local mount directory below `/mnt` or `/media`.
+
+Use **Ctrl+U** to clear the currently selected field. Press **F5** in the form
+to test the entered endpoint before saving.
+The test installs `smbclient` when needed, opens the exact share as `guest`, and
+requests a directory listing. It does not mount the share, write a remote test
+file, or change `/etc/fstab`. **Enter** reviews the persistent change and, after
+confirmation, installs `cifs-utils` when needed, creates that entry's own
+marked fstab block, enables systemd automounting, and mounts it immediately.
+
+Opening an existing row provides **Mount / reconnect**, **Test connection**,
+**Edit**, **Unmount**, and **Delete** actions. Editing may change any of the
+three connection fields. The playbook validates the old owned block, normally
+unmounts it, activates the replacement, and restores the exact old block and
+active state if replacement activation fails. Delete performs the same safe
+unmount and removes only the selected LinuxCNC Setup marker block; unrelated
+fstab entries and the local directory remain untouched. The older fixed
+`//10.0.1.246/share` marker is discovered as a managed entry and is migrated to
+the per-mount marker format when edited.
+
+The workflow deliberately manages guest shares only and never stores an SMB
+password. It never force-unmounts a busy share. The root-level SMB shell scripts
+remain compatibility tools; the Go TUI does not invoke them.
 
 ## IRQ affinity playbook
 

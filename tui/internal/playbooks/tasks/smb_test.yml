@@ -1,0 +1,40 @@
+---
+- name: Inspect the SMB client executable
+  ansible.builtin.stat:
+    path: /usr/bin/smbclient
+    follow: true
+  register: smb_client_executable
+
+- name: Install the SMB connection-test client
+  ansible.builtin.apt:
+    name: smbclient
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+    lock_timeout: 120
+  when: not smb_client_executable.stat.exists
+
+- name: Open the exact SMB share and request a guest directory listing
+  become_user: "{{ target_user }}"
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/smbclient
+      - "{{ smb_source }}"
+      - --no-pass
+      - --user=guest
+      - --command=ls
+  environment:
+    HOME: "{{ smb_target_home }}"
+    USER: "{{ target_user }}"
+    LOGNAME: "{{ target_user }}"
+  register: smb_connection_test
+  changed_when: false
+
+- name: Confirm the exact SMB guest share is readable
+  ansible.builtin.assert:
+    that:
+      - smb_connection_test.rc == 0
+    fail_msg: >-
+      smbclient could not open the requested guest share and list its root
+      directory. Check the IPv4 address, share/folder name, guest permissions,
+      SMB protocol support, and network path.

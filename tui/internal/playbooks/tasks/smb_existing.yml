@@ -1,0 +1,180 @@
+---
+- name: Inspect the selected LinuxCNC Setup SMB mount
+  ansible.builtin.import_tasks: smb_inspect_managed.yml
+  vars:
+    smb_inspect_marker_label: "{{ smb_marker_label }}"
+    smb_inspect_source: "{{ smb_source }}"
+    smb_inspect_mount_point: "{{ smb_mount_point }}"
+
+- name: Inspect the CIFS mount helper
+  ansible.builtin.stat:
+    path: /usr/sbin/mount.cifs
+    follow: true
+  register: smb_existing_mount_cifs
+  when: smb_operation == "mount"
+
+- name: Install the CIFS mount helper
+  ansible.builtin.apt:
+    name: cifs-utils
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+    lock_timeout: 120
+  when:
+    - smb_operation == "mount"
+    - not smb_existing_mount_cifs.stat.exists
+
+- name: Start the selected SMB automount unit
+  ansible.builtin.systemd_service:
+    name: "{{ smb_inspected_automount_unit }}"
+    state: started
+  when:
+    - smb_operation == "mount"
+    - not ansible_check_mode
+
+- name: Mount the selected SMB share now
+  ansible.builtin.systemd_service:
+    name: "{{ smb_inspected_mount_unit }}"
+    state: started
+  when:
+    - smb_operation == "mount"
+    - not ansible_check_mode
+
+- name: Stop the selected SMB automount unit before unmounting
+  ansible.builtin.systemd_service:
+    name: "{{ smb_inspected_automount_unit }}"
+    state: stopped
+  when:
+    - smb_operation in ["unmount", "remove"]
+    - not ansible_check_mode
+
+- name: Unmount the selected SMB share normally
+  ansible.builtin.systemd_service:
+    name: "{{ smb_inspected_mount_unit }}"
+    state: stopped
+  when:
+    - smb_operation in ["unmount", "remove"]
+    - smb_inspected_cifs_active
+    - not ansible_check_mode
+
+- name: Verify the selected SMB share is inactive
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/findmnt
+      - --kernel
+      - --mountpoint
+      - "{{ smb_mount_point }}"
+      - --noheadings
+      - --raw
+      - --output
+      - SOURCE,FSTYPE
+  register: smb_existing_unmount_verification
+  changed_when: false
+  failed_when: smb_existing_unmount_verification.rc not in [0, 1]
+  check_mode: false
+  when:
+    - smb_operation in ["unmount", "remove"]
+    - not ansible_check_mode
+
+- name: Require the selected SMB share and automount to be inactive
+  ansible.builtin.assert:
+    that:
+      - smb_existing_unmount_verification.rc == 1
+    fail_msg: >-
+      The selected SMB mount is still active. Its persistent configuration
+      was not removed.
+  when:
+    - smb_operation in ["unmount", "remove"]
+    - not ansible_check_mode
+
+- name: Remove only the selected managed SMB fstab block
+  ansible.builtin.blockinfile:
+    path: /etc/fstab
+    marker: "# {mark} {{ smb_marker_label }}"
+    state: absent
+    backup: true
+  when: smb_operation == "remove"
+
+- name: Reload systemd after deleting the selected mount
+  ansible.builtin.systemd_service:
+    daemon_reload: true
+  when:
+    - smb_operation == "remove"
+    - not ansible_check_mode
+
+- name: Verify the selected SMB share is mounted
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/findmnt
+      - --kernel
+      - --mountpoint
+      - "{{ smb_mount_point }}"
+      - --types
+      - cifs
+      - --noheadings
+      - --raw
+      - --output
+      - SOURCE,FSTYPE
+  register: smb_existing_mount_verification
+  changed_when: false
+  failed_when: smb_existing_mount_verification.rc not in [0, 1]
+  check_mode: false
+  when:
+    - smb_operation == "mount"
+    - not ansible_check_mode
+
+- name: Require the selected CIFS share to be mounted
+  ansible.builtin.assert:
+    that:
+      - smb_existing_mount_verification.rc == 0
+      - smb_existing_mount_verification.stdout_lines | length == 1
+      - (smb_existing_mount_verification.stdout | trim).split() | length >= 2
+      - (smb_existing_mount_verification.stdout | trim).split()[0] == smb_source
+      - (smb_existing_mount_verification.stdout | trim).split()[1] == "cifs"
+    fail_msg: >-
+      systemd completed without the selected CIFS share becoming active.
+  when:
+    - smb_operation == "mount"
+    - not ansible_check_mode
+
+- name: Verify the selected managed fstab block was deleted
+  ansible.builtin.slurp:
+    src: /etc/fstab
+  register: smb_existing_fstab_after_remove
+  when:
+    - smb_operation == "remove"
+    - not ansible_check_mode
+
+- name: Verify no selected static entry remains after deletion
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/findmnt
+      - --fstab
+      - --mountpoint
+      - "{{ smb_mount_point }}"
+      - --noheadings
+      - --raw
+      - --output
+      - SOURCE,FSTYPE
+  register: smb_existing_fstab_probe_after_remove
+  changed_when: false
+  failed_when: smb_existing_fstab_probe_after_remove.rc not in [0, 1]
+  check_mode: false
+  when:
+    - smb_operation == "remove"
+    - not ansible_check_mode
+
+- name: Require only the selected managed fstab block to be absent
+  ansible.builtin.assert:
+    that:
+      - >-
+        ('# BEGIN ' ~ smb_marker_label)
+        not in (smb_existing_fstab_after_remove.content | b64decode)
+      - >-
+        ('# END ' ~ smb_marker_label)
+        not in (smb_existing_fstab_after_remove.content | b64decode)
+      - smb_existing_fstab_probe_after_remove.rc == 1
+    fail_msg: The selected LinuxCNC Setup SMB fstab block was not fully deleted.
+  when:
+    - smb_operation == "remove"
+    - not ansible_check_mode

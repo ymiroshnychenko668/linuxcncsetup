@@ -48,9 +48,15 @@ const (
 	actionAutologinSway
 	actionOpenConfiguration
 	actionOpenSMBMounts
+	actionSMBSelect
+	actionSMBAdd
+	actionSMBSave
+	actionSMBEdit
+	actionSMBTest
 	actionSMBMount
 	actionSMBUnmount
 	actionSMBRemove
+	actionSMBRefresh
 	actionOpenGRUBRealtime
 	actionGRUBToggleCPU
 	actionGRUBContinue
@@ -99,6 +105,8 @@ const (
 	menuAutologin
 	menuConfiguration
 	menuSMBMounts
+	menuSMBMountDetail
+	menuSMBMountForm
 	menuGRUBRealtime
 	menuGRUBCPUs
 	menuGRUBReview
@@ -236,7 +244,7 @@ var configurationSections = []section{
 	},
 	{
 		title:       "SMB mounts",
-		description: "Mount, unmount, or remove the configured SMB network share with Ansible.",
+		description: "Create, inspect, test, edit, mount, unmount, or delete managed SMB shares.",
 		action:      actionOpenSMBMounts,
 	},
 	{
@@ -366,6 +374,10 @@ type Model struct {
 	detailPage               int
 	status                   string
 	remoteTerminal           remoteTerminalDraft
+	smbMounts                []smbMount
+	smbSelectedID            string
+	smbDraft                 smbMountDraft
+	smbPendingAction         sectionAction
 	linuxCNCSections         []section
 	linuxCNCDesktop          linuxCNCAutostartDesktop
 	irqSnapshot              IRQSnapshot
@@ -501,6 +513,7 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	case actionFinishedMsg:
 		m.confirming = false
 		m.detailPage = 0
+		m.smbPendingAction = actionNone
 		if message.err != nil {
 			m.status = fmt.Sprintf("%s failed: %v", actionName(message.action), message.err)
 		} else {
@@ -515,11 +528,27 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 				m.refreshIRQDeviceInventory(false)
 			}
 		}
+		if _, smbAction := smbMountOperation(message.action); smbAction {
+			m.finishSMBMountAction(message.action, message.err)
+		}
 
 	case tea.KeyPressMsg:
 		if m.page == menuRemoteTerminal && !m.confirming &&
 			m.updateRemoteTerminalForm(message) {
 			return m, nil
+		}
+		if m.page == menuSMBMountForm && !m.confirming {
+			if message.String() == "f5" {
+				if m.prepareSMBMountAction(actionSMBTest) {
+					m.status = ""
+					m.detailPage = 0
+					m.confirming = true
+				}
+				return m, nil
+			}
+			if m.updateSMBMountForm(message) {
+				return m, nil
+			}
 		}
 
 		key := message.String()
@@ -529,15 +558,24 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 				return m, tea.Quit
 			case "n", "esc":
 				action := m.currentSection().action
+				if m.smbPendingAction != actionNone {
+					action = m.smbPendingAction
+				}
 				m.confirming = false
 				m.detailPage = 0
 				m.status = actionCancelledMessage(action)
+				m.smbPendingAction = actionNone
 			case "y":
 				current := m.currentSection()
+				action := current.action
+				if m.smbPendingAction != actionNone {
+					action = m.smbPendingAction
+				}
 				m.confirming = false
 				m.detailPage = 0
-				m.status = actionRunningMessage(current.action)
-				return m, m.executeAction(current.action, current.value)
+				m.status = actionRunningMessage(action)
+				m.smbPendingAction = actionNone
+				return m, m.executeAction(action, current.value)
 			case "pgup":
 				if m.detailPage <= 1 {
 					m.detailPage = 0
@@ -574,6 +612,9 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		case "r":
 			if m.page == menuIRQDevices {
 				m.refreshIRQDeviceInventory(true)
+			}
+			if m.page == menuSMBMounts {
+				_ = m.refreshSMBMounts(true)
 			}
 		case "pgup":
 			m.scrollIRQDeviceDetail(-1)
@@ -626,6 +667,12 @@ func (m Model) helpText(compact bool) string {
 	if m.page == menuRemoteTerminal {
 		helpText = "Type to edit • ↑/↓/Tab field • ←/→/Space transport • Enter review • Esc back"
 	}
+	if m.page == menuSMBMounts {
+		helpText = "↑/↓ select • Enter open • r refresh • Esc back • q quit"
+	}
+	if m.page == menuSMBMountForm {
+		helpText = "Type to edit • ↑/↓/Tab field • Ctrl+U clear • F5 test • Enter review • Esc back"
+	}
 	if m.confirming {
 		helpText = "PgUp/PgDn details • y confirm • n/Esc cancel • q quit"
 	}
@@ -645,6 +692,12 @@ func (m Model) helpText(compact bool) string {
 	}
 	if m.page == menuRemoteTerminal {
 		helpText = "Tab field • ←/→ transport • type • Enter • Esc"
+	}
+	if m.page == menuSMBMounts {
+		helpText = "↑/↓ • Enter • r refresh • Esc"
+	}
+	if m.page == menuSMBMountForm {
+		helpText = "Tab field • type • Ctrl+U clear • F5 test • Enter • Esc"
 	}
 	if m.confirming {
 		helpText = "Pg details • y yes • n no"
@@ -1121,9 +1174,13 @@ func (m Model) renderDetailWithHeading(showHeading bool) string {
 	case actionOpenConfiguration:
 		lines = append(lines, "Press Enter to open configuration tools.")
 	case actionOpenSMBMounts:
-		lines = append(lines, "Press Enter to manage the configured SMB network share.")
-	case actionSMBMount, actionSMBUnmount, actionSMBRemove:
-		lines = append(lines, renderSMBMountAction(current.action, m.confirming)...)
+		lines = append(lines, "Press Enter to manage persistent SMB network mounts interactively.")
+	case actionSMBSelect, actionSMBAdd, actionSMBRefresh:
+		lines = append(lines, m.renderSMBListAction(current)...)
+	case actionSMBSave:
+		lines = append(lines, m.renderSMBMountForm(m.confirming)...)
+	case actionSMBMount, actionSMBTest, actionSMBEdit, actionSMBUnmount, actionSMBRemove:
+		lines = append(lines, m.renderSMBMountAction(current.action, m.confirming)...)
 	case actionOpenGRUBRealtime:
 		lines = append(lines, renderGRUBIntroduction())
 	case actionGRUBToggleCPU:
@@ -1378,9 +1435,38 @@ func (m *Model) prepareSelectedAction() {
 
 	case actionOpenSMBMounts:
 		m.openPage(menuSMBMounts)
+		_ = m.refreshSMBMounts(false)
 		return
 
-	case actionSMBMount, actionSMBUnmount, actionSMBRemove:
+	case actionSMBSelect:
+		m.smbSelectedID = current.value
+		if _, found := m.selectedSMBMount(); !found {
+			m.status = "The selected managed SMB mount no longer exists. Press r to refresh."
+			return
+		}
+		m.openPage(menuSMBMountDetail)
+		return
+
+	case actionSMBAdd:
+		m.smbDraft = newSMBMountDraft()
+		m.openPage(menuSMBMountForm)
+		return
+
+	case actionSMBEdit:
+		mount, found := m.selectedSMBMount()
+		if !found {
+			m.status = "The selected managed SMB mount no longer exists."
+			return
+		}
+		m.smbDraft = editSMBMountDraft(mount)
+		m.openPage(menuSMBMountForm)
+		return
+
+	case actionSMBRefresh:
+		_ = m.refreshSMBMounts(true)
+		return
+
+	case actionSMBSave, actionSMBTest, actionSMBMount, actionSMBUnmount, actionSMBRemove:
 		if !m.prepareSMBMountAction(current.action) {
 			return
 		}
@@ -1711,7 +1797,11 @@ func (m Model) visibleSections() []section {
 	case menuConfiguration:
 		return configurationSections
 	case menuSMBMounts:
-		return smbMountSections
+		return smbMountListSections(m.smbMounts)
+	case menuSMBMountDetail:
+		return smbMountDetailSections
+	case menuSMBMountForm:
+		return smbMountFormSections
 	case menuGRUBRealtime:
 		return grubRealtimeSections
 	case menuGRUBCPUs:
@@ -1777,7 +1867,14 @@ func (m Model) pageTitle() string {
 	case menuConfiguration:
 		return "Configuration"
 	case menuSMBMounts:
-		return "SMB mounts"
+		return "Managed SMB mounts"
+	case menuSMBMountDetail:
+		return "SMB mount"
+	case menuSMBMountForm:
+		if m.smbDraft.editing() {
+			return "Edit SMB mount"
+		}
+		return "Add SMB mount"
 	case menuGRUBRealtime:
 		return "GRUB real-time setup"
 	case menuGRUBCPUs:
@@ -1807,6 +1904,7 @@ func (m *Model) openPage(page menuPage) {
 	m.page = page
 	m.selected = 0
 	m.confirming = false
+	m.smbPendingAction = actionNone
 	m.detailPage = 0
 	m.status = ""
 	m.irqDeviceDetailOffset = 0
@@ -1858,6 +1956,19 @@ func (m *Model) back() {
 	case menuSMBMounts:
 		m.openPage(menuConfiguration)
 		m.selectAction(actionOpenSMBMounts)
+	case menuSMBMountDetail:
+		selectedID := m.smbSelectedID
+		m.openPage(menuSMBMounts)
+		m.selectSMBMount(selectedID)
+	case menuSMBMountForm:
+		if m.smbDraft.editing() {
+			m.smbSelectedID = m.smbDraft.previousID
+			m.openPage(menuSMBMountDetail)
+			m.selectAction(actionSMBEdit)
+		} else {
+			m.openPage(menuSMBMounts)
+			m.selectAction(actionSMBAdd)
+		}
 	case menuGRUBRealtime:
 		m.openPage(menuConfiguration)
 		m.selectAction(actionOpenGRUBRealtime)
@@ -1940,8 +2051,8 @@ func (m Model) executeAction(action sectionAction, value string) tea.Cmd {
 		return runAutologinPlaybook(action, "lightdm")
 	case actionAutologinSway:
 		return runAutologinPlaybook(action, "sway")
-	case actionSMBMount, actionSMBUnmount, actionSMBRemove:
-		return runSMBMountPlaybook(action)
+	case actionSMBSave, actionSMBTest, actionSMBMount, actionSMBUnmount, actionSMBRemove:
+		return m.runSMBMountPlaybook(action)
 	case actionGRUBApply:
 		return m.runGRUBPlaybook(action)
 	case actionIRQDevicePreview:
