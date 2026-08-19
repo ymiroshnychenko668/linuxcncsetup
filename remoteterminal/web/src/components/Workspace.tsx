@@ -17,6 +17,7 @@ import {
 import {
   AlertIcon,
   CodeServerIcon,
+  EditIcon,
   KeyboardIcon,
   LogOutIcon,
   MenuIcon,
@@ -30,6 +31,7 @@ import { CodeServerPanel, type CodeServerState } from './CodeServerPanel'
 import { CreateSessionModal } from './CreateSessionModal'
 import { DeleteSessionModal } from './DeleteSessionModal'
 import { LaunchCodeServerModal } from './LaunchCodeServerModal'
+import { RenameTabModal } from './RenameTabModal'
 import { ShutdownCodeServerModal } from './ShutdownCodeServerModal'
 import { TerminalPanel, type TerminalState } from './TerminalPanel'
 
@@ -42,6 +44,13 @@ interface WorkspaceProps {
 type WorkspaceTab =
   | { kind: 'terminal'; id: string }
   | { kind: 'codeServer'; id: string }
+
+interface StoredWorkspaceV3 {
+  openTabs: WorkspaceTab[]
+  selectedTab: WorkspaceTab | null
+  tabNames: Record<string, string>
+  sidebarCompact: boolean
+}
 
 interface StoredWorkspaceV2 {
   openTabs: WorkspaceTab[]
@@ -58,10 +67,14 @@ type OpenWorkspaceItem =
   | { tab: Extract<WorkspaceTab, { kind: 'codeServer' }>; session: null; codeServer: CodeServerInstance }
 
 function storageKey(username: string): string {
+  return `remoteterminal.workspace.v3:${username}`
+}
+
+function legacyV2StorageKey(username: string): string {
   return `remoteterminal.workspace.v2:${username}`
 }
 
-function legacyStorageKey(username: string): string {
+function legacyV1StorageKey(username: string): string {
   return `remoteterminal.workspace.v1:${username}`
 }
 
@@ -92,14 +105,43 @@ function deduplicateTabs(tabs: WorkspaceTab[]): WorkspaceTab[] {
   })
 }
 
-function readStoredWorkspace(username: string): StoredWorkspaceV2 {
+function readTabNames(value: unknown): Record<string, string> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {}
+  return Object.fromEntries(Object.entries(value).flatMap(([key, name]) => {
+    if (
+      (!key.startsWith('terminal:') && !key.startsWith('codeServer:'))
+      || typeof name !== 'string'
+    ) return []
+    const normalized = name.trim().slice(0, 48)
+    return normalized ? [[key, normalized]] : []
+  }))
+}
+
+function readStoredWorkspace(username: string): StoredWorkspaceV3 {
   try {
-    const parsed = JSON.parse(localStorage.getItem(storageKey(username)) ?? 'null') as Partial<StoredWorkspaceV2> | null
+    const parsed = JSON.parse(localStorage.getItem(storageKey(username)) ?? 'null') as Partial<StoredWorkspaceV3> | null
     if (parsed) {
       const openTabs = deduplicateTabs(Array.isArray(parsed.openTabs) ? parsed.openTabs.filter(isWorkspaceTab) : [])
       return {
         openTabs,
         selectedTab: isWorkspaceTab(parsed.selectedTab) ? parsed.selectedTab : null,
+        tabNames: readTabNames(parsed.tabNames),
+        sidebarCompact: parsed.sidebarCompact === true,
+      }
+    }
+  } catch {
+    // Fall through to the previous workspace format.
+  }
+
+  try {
+    const parsed = JSON.parse(localStorage.getItem(legacyV2StorageKey(username)) ?? 'null') as Partial<StoredWorkspaceV2> | null
+    if (parsed) {
+      const openTabs = deduplicateTabs(Array.isArray(parsed.openTabs) ? parsed.openTabs.filter(isWorkspaceTab) : [])
+      return {
+        openTabs,
+        selectedTab: isWorkspaceTab(parsed.selectedTab) ? parsed.selectedTab : null,
+        tabNames: {},
+        sidebarCompact: false,
       }
     }
   } catch {
@@ -107,7 +149,7 @@ function readStoredWorkspace(username: string): StoredWorkspaceV2 {
   }
 
   try {
-    const parsed = JSON.parse(localStorage.getItem(legacyStorageKey(username)) ?? 'null') as Partial<StoredWorkspaceV1> | null
+    const parsed = JSON.parse(localStorage.getItem(legacyV1StorageKey(username)) ?? 'null') as Partial<StoredWorkspaceV1> | null
     const openIds = Array.isArray(parsed?.openIds)
       ? parsed.openIds.filter((id): id is string => typeof id === 'string' && id.length > 0)
       : []
@@ -116,9 +158,11 @@ function readStoredWorkspace(username: string): StoredWorkspaceV2 {
       selectedTab: typeof parsed?.selectedId === 'string'
         ? { kind: 'terminal', id: parsed.selectedId }
         : null,
+      tabNames: {},
+      sidebarCompact: false,
     }
   } catch {
-    return { openTabs: [], selectedTab: null }
+    return { openTabs: [], selectedTab: null, tabNames: {}, sidebarCompact: false }
   }
 }
 
@@ -163,7 +207,7 @@ function useMobileNavigation(): boolean {
 }
 
 export function Workspace({ machineName, username, onLogout }: WorkspaceProps) {
-  const initialWorkspaceRef = useRef<StoredWorkspaceV2 | null>(null)
+  const initialWorkspaceRef = useRef<StoredWorkspaceV3 | null>(null)
   if (initialWorkspaceRef.current === null) {
     initialWorkspaceRef.current = readStoredWorkspace(username)
   }
@@ -178,6 +222,8 @@ export function Workspace({ machineName, username, onLogout }: WorkspaceProps) {
   const [codeServers, setCodeServers] = useState<CodeServerInstance[] | null>(null)
   const [openTabs, setOpenTabs] = useState<WorkspaceTab[]>(initialWorkspace.openTabs)
   const [selectedTab, setSelectedTab] = useState<WorkspaceTab | null>(initialTerminalSelection)
+  const [tabNames, setTabNames] = useState<Record<string, string>>(initialWorkspace.tabNames)
+  const [sidebarCompact, setSidebarCompact] = useState(initialWorkspace.sidebarCompact)
   const [activatedKeys, setActivatedKeys] = useState<string[]>(
     initialTerminalSelection ? [tabKey(initialTerminalSelection)] : [],
   )
@@ -194,6 +240,7 @@ export function Workspace({ machineName, username, onLogout }: WorkspaceProps) {
   const [showLaunchCodeServer, setShowLaunchCodeServer] = useState(false)
   const [deleteTarget, setDeleteTarget] = useState<TerminalSession | null>(null)
   const [shutdownTarget, setShutdownTarget] = useState<CodeServerInstance | null>(null)
+  const [renameTarget, setRenameTarget] = useState<WorkspaceTab | null>(null)
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [loggingOut, setLoggingOut] = useState(false)
   const codeServerListGenerationRef = useRef(0)
@@ -217,6 +264,7 @@ export function Workspace({ machineName, username, onLogout }: WorkspaceProps) {
     setShowLaunchCodeServer(false)
     setDeleteTarget(null)
     setShutdownTarget(null)
+    setRenameTarget(null)
     open()
   }, [])
 
@@ -336,6 +384,15 @@ export function Workspace({ machineName, username, onLogout }: WorkspaceProps) {
     () => new Map((codeServers ?? []).map((codeServer) => [codeServer.id, codeServer])),
     [codeServers],
   )
+  const defaultTabName = useCallback((tab: WorkspaceTab): string => {
+    const resourceName = tab.kind === 'terminal'
+      ? sessionById.get(tab.id)?.name
+      : codeServerById.get(tab.id)?.name
+    return resourceName?.trim() || (tab.kind === 'terminal' ? 'Terminal' : 'Code Server')
+  }, [codeServerById, sessionById])
+  const displayTabName = useCallback((tab: WorkspaceTab): string => (
+    tabNames[tabKey(tab)]?.trim() || defaultTabName(tab)
+  ), [defaultTabName, tabNames])
 
   useEffect(() => {
     if (!terminalListReady && !codeServerListReady) return
@@ -364,8 +421,25 @@ export function Workspace({ machineName, username, onLogout }: WorkspaceProps) {
 
   useEffect(() => {
     if (!terminalListReady || !codeServerListReady) return
-    localStorage.setItem(storageKey(username), JSON.stringify({ openTabs, selectedTab }))
-  }, [codeServerListReady, openTabs, selectedTab, terminalListReady, username])
+    const liveKeys = new Set([
+      ...(sessions ?? []).map((session) => tabKey({ kind: 'terminal', id: session.id })),
+      ...(codeServers ?? []).map((codeServer) => tabKey({ kind: 'codeServer', id: codeServer.id })),
+    ])
+    setTabNames((current) => {
+      const next = Object.fromEntries(Object.entries(current).filter(([key]) => liveKeys.has(key)))
+      return Object.keys(next).length === Object.keys(current).length ? current : next
+    })
+  }, [codeServerListReady, codeServers, sessions, terminalListReady])
+
+  useEffect(() => {
+    if (!terminalListReady || !codeServerListReady) return
+    localStorage.setItem(storageKey(username), JSON.stringify({
+      openTabs,
+      selectedTab,
+      tabNames,
+      sidebarCompact,
+    }))
+  }, [codeServerListReady, openTabs, selectedTab, sidebarCompact, tabNames, terminalListReady, username])
 
   const openItems = openTabs.reduce<OpenWorkspaceItem[]>((items, tab) => {
     if (tab.kind === 'terminal') {
@@ -382,6 +456,7 @@ export function Workspace({ machineName, username, onLogout }: WorkspaceProps) {
   const activeTerminal = selectedTab?.kind === 'terminal' ? sessionById.get(selectedTab.id) ?? null : null
   const activeCodeServer = selectedTab?.kind === 'codeServer' ? codeServerById.get(selectedTab.id) ?? null : null
   const hasActiveItem = activeTerminal !== null || activeCodeServer !== null
+  const activeTabName = selectedTab && hasActiveItem ? displayTabName(selectedTab) : 'Workspace'
 
   const activateTab = useCallback((tab: WorkspaceTab, focusTerminal = false) => {
     selectionChangedByUserRef.current = true
@@ -410,9 +485,38 @@ export function Workspace({ machineName, username, onLogout }: WorkspaceProps) {
     setSidebarOpen(true)
   }, [])
 
+  const toggleNavigation = useCallback(() => {
+    if (mobileNavigation) {
+      openSidebar()
+      return
+    }
+    setSidebarCompact((current) => !current)
+  }, [mobileNavigation, openSidebar])
+
   const closeSidebar = useCallback((restoreFocus: boolean) => {
     setSidebarOpen(false)
     if (restoreFocus) sidebarMenuButtonRef.current?.focus()
+  }, [])
+
+  const clearTabName = useCallback((tab: WorkspaceTab) => {
+    setTabNames((current) => {
+      const key = tabKey(tab)
+      if (!(key in current)) return current
+      const next = { ...current }
+      delete next[key]
+      return next
+    })
+  }, [])
+
+  const requestTabRename = useCallback((tab: WorkspaceTab) => {
+    openExclusiveModal(() => setRenameTarget(tab))
+  }, [openExclusiveModal])
+
+  const renameTab = useCallback((tab: WorkspaceTab, name: string) => {
+    const normalized = name.trim().slice(0, 48)
+    if (!normalized) return
+    setTabNames((current) => ({ ...current, [tabKey(tab)]: normalized }))
+    setRenameTarget(null)
   }, [])
 
   useEffect(() => {
@@ -486,6 +590,11 @@ export function Workspace({ machineName, username, onLogout }: WorkspaceProps) {
       closeTab(tab)
       return
     }
+    if (event.key === 'F2') {
+      event.preventDefault()
+      requestTabRename(tab)
+      return
+    }
     if (target) {
       event.preventDefault()
       activateTab(target)
@@ -494,6 +603,7 @@ export function Workspace({ machineName, username, onLogout }: WorkspaceProps) {
   }
 
   const onCreated = (session: TerminalSession) => {
+    clearTabName({ kind: 'terminal', id: session.id })
     setSessions((current) => [...(current ?? []).filter((item) => item.id !== session.id), session])
     setShowCreate(false)
     openSession(session.id)
@@ -506,6 +616,7 @@ export function Workspace({ machineName, username, onLogout }: WorkspaceProps) {
       ...(current ?? []).filter((item) => item.id !== result.codeServer.id),
       result.codeServer,
     ])
+    if (!result.reused) clearTabName({ kind: 'codeServer', id: result.codeServer.id })
     setShowLaunchCodeServer(false)
     openCodeServer(result.codeServer.id)
     if (result.reused) setActionError(null)
@@ -513,6 +624,7 @@ export function Workspace({ machineName, username, onLogout }: WorkspaceProps) {
 
   const onDeleted = (id: string) => {
     setDeleteTarget(null)
+    clearTabName({ kind: 'terminal', id })
     closeTab({ kind: 'terminal', id })
     setSessions((current) => (current ?? []).filter((session) => session.id !== id))
   }
@@ -521,6 +633,7 @@ export function Workspace({ machineName, username, onLogout }: WorkspaceProps) {
     cancelCodeServerList()
     setCodeServerLoadError(null)
     setShutdownTarget(null)
+    clearTabName({ kind: 'codeServer', id })
     closeTab({ kind: 'codeServer', id })
     setCodeServers((current) => (current ?? []).filter((codeServer) => codeServer.id !== id))
   }
@@ -566,12 +679,13 @@ export function Workspace({ machineName, username, onLogout }: WorkspaceProps) {
 
       <aside
         ref={sidebarRef}
-        className={`sidebar ${sidebarOpen ? 'sidebar--open' : ''}`}
+        id="session-navigation"
+        className={`sidebar ${sidebarOpen ? 'sidebar--open' : ''} ${sidebarCompact ? 'sidebar--compact' : ''}`}
         aria-label="Session navigation"
         aria-hidden={mobileNavigation && !sidebarOpen ? true : undefined}
       >
         <div className="sidebar__header">
-          <div className="brand">
+          <div className="brand" title={`Remote Terminal · ${machineName}`}>
             <span className="brand__mark"><TerminalIcon /></span>
             <span className="brand__text">
               <span>Remote Terminal</span>
@@ -590,11 +704,11 @@ export function Workspace({ machineName, username, onLogout }: WorkspaceProps) {
         </div>
 
         <div className="sidebar__launch-actions">
-          <button ref={newSessionButtonRef} className="button button--new-session" type="button" onClick={() => openExclusiveModal(() => setShowCreate(true))}>
-            <PlusIcon /> New terminal session
+          <button ref={newSessionButtonRef} className="button button--new-session" type="button" title="New terminal session" onClick={() => openExclusiveModal(() => setShowCreate(true))}>
+            <PlusIcon /> <span className="sidebar__action-label">New terminal session</span>
           </button>
-          <button className="button button--new-code-server" type="button" onClick={() => openExclusiveModal(() => setShowLaunchCodeServer(true))}>
-            <CodeServerIcon /> Launch Code Server
+          <button className="button button--new-code-server" type="button" title="Launch Code Server" onClick={() => openExclusiveModal(() => setShowLaunchCodeServer(true))}>
+            <CodeServerIcon /> <span className="sidebar__action-label">Launch Code Server</span>
           </button>
         </div>
 
@@ -613,7 +727,7 @@ export function Workspace({ machineName, username, onLogout }: WorkspaceProps) {
                   const state = activatedKeys.includes(key)
                     ? session ? terminalStates[session.id] : codeServerStates[codeServer!.id]
                     : undefined
-                  const name = session?.name ?? codeServer!.name
+                  const name = displayTabName(tab)
                   return (
                     <div
                       className={`session-tab ${codeServer ? 'session-tab--code-server' : ''} ${selected ? 'session-tab--selected' : ''}`}
@@ -627,17 +741,24 @@ export function Workspace({ machineName, username, onLogout }: WorkspaceProps) {
                         aria-selected={selected}
                         aria-controls={`panel-${tab.kind}-${tab.id}`}
                         tabIndex={selected || selectedTab === null ? 0 : -1}
+                        title={`${name} · ${session
+                          ? terminalConnectionLabel(state as TerminalState | undefined)
+                          : codeServerConnectionLabel(state as CodeServerState | undefined)}`}
                         onClick={() => {
                           activateTab(tab, tab.kind === 'terminal')
                           setSidebarOpen(false)
                           if (mobileNavigation) sidebarMenuButtonRef.current?.focus()
                         }}
+                        onDoubleClick={() => requestTabRename(tab)}
                         onKeyDown={(event) => handleTabKeyDown(event, tab)}
                       >
                         {session ? (
-                          <span className={`status-dot status-dot--${state ?? 'idle'}`} aria-hidden="true" />
+                          <span className="terminal-tab-icon" aria-hidden="true">
+                            <TerminalIcon width={16} height={16} />
+                            <span className={`status-dot status-dot--${state ?? 'idle'}`} />
+                          </span>
                         ) : (
-                          <span className={`code-server-tab-icon code-server-tab-icon--${state ?? 'idle'}`}><CodeServerIcon width={16} height={16} /></span>
+                          <span className={`code-server-tab-icon code-server-tab-icon--${state ?? 'idle'}`} aria-hidden="true"><CodeServerIcon width={16} height={16} /></span>
                         )}
                         <span className="session-tab__text">
                           <strong>{name}</strong>
@@ -646,15 +767,26 @@ export function Workspace({ machineName, username, onLogout }: WorkspaceProps) {
                             : codeServerConnectionLabel(state as CodeServerState | undefined)}</small>
                         </span>
                       </button>
-                      <button
-                        className="session-tab__action"
-                        type="button"
-                        aria-label={`Close ${name} browser tab`}
-                        title={`Close browser tab (${session ? 'session' : 'Code Server'} keeps running)`}
-                        onClick={() => closeTab(tab)}
-                      >
-                        <XIcon width={15} height={15} />
-                      </button>
+                      <span className="session-tab__actions">
+                        <button
+                          className="session-tab__action session-tab__action--rename"
+                          type="button"
+                          aria-label={`Rename ${name} browser tab`}
+                          title="Rename browser tab (F2)"
+                          onClick={() => requestTabRename(tab)}
+                        >
+                          <EditIcon width={14} height={14} />
+                        </button>
+                        <button
+                          className="session-tab__action"
+                          type="button"
+                          aria-label={`Close ${name} browser tab`}
+                          title={`Close browser tab (${session ? 'session' : 'Code Server'} keeps running)`}
+                          onClick={() => closeTab(tab)}
+                        >
+                          <XIcon width={15} height={15} />
+                        </button>
+                      </span>
                     </div>
                   )
                 })}
@@ -678,7 +810,7 @@ export function Workspace({ machineName, username, onLogout }: WorkspaceProps) {
               <ul className="available-list">
                 {closedSessions.map((session) => (
                   <li key={session.id}>
-                    <button className="available-session" type="button" onClick={() => openSession(session.id)}>
+                    <button className="available-session" type="button" title={`Open ${session.name || 'terminal'} session`} onClick={() => openSession(session.id)}>
                       <TerminalIcon width={16} height={16} />
                       <span>{session.name}</span>
                       <span className="available-session__open">Open</span>
@@ -720,7 +852,7 @@ export function Workspace({ machineName, username, onLogout }: WorkspaceProps) {
                         className="available-session code-server-list__open"
                         type="button"
                         aria-label={`${isOpen ? 'Focus' : 'Open'} ${codeServer.name} Code Server at ${codeServer.folderPath}`}
-                        title={codeServer.folderPath}
+                        title={`${codeServer.name || 'Code Server'} · ${codeServer.folderPath}`}
                         onClick={() => openCodeServer(codeServer.id)}
                       >
                         <CodeServerIcon width={17} height={17} />
@@ -770,14 +902,21 @@ export function Workspace({ machineName, username, onLogout }: WorkspaceProps) {
               ref={sidebarMenuButtonRef}
               className="icon-button topbar__menu"
               type="button"
-              aria-label="Open session navigation"
-              onClick={openSidebar}
+              aria-label={mobileNavigation
+                ? 'Open session navigation'
+                : sidebarCompact ? 'Expand session navigation' : 'Compact session navigation'}
+              aria-controls="session-navigation"
+              aria-expanded={mobileNavigation ? sidebarOpen : !sidebarCompact}
+              title={mobileNavigation
+                ? 'Open navigation'
+                : sidebarCompact ? 'Expand navigation' : 'Compact navigation'}
+              onClick={toggleNavigation}
             >
               <MenuIcon />
             </button>
             <div>
               <p className="eyebrow">{activeCodeServer ? 'Code Server' : 'Terminal session'}</p>
-              <h1>{machineName} / {activeTerminal?.name ?? activeCodeServer?.name ?? 'Workspace'}</h1>
+              <h1>{machineName} / {activeTabName}</h1>
             </div>
           </div>
         </header>
@@ -870,6 +1009,14 @@ export function Workspace({ machineName, username, onLogout }: WorkspaceProps) {
       {showLaunchCodeServer ? <LaunchCodeServerModal onClose={() => setShowLaunchCodeServer(false)} onLaunched={onCodeServerLaunched} /> : null}
       {deleteTarget ? <DeleteSessionModal session={deleteTarget} onClose={() => setDeleteTarget(null)} onDeleted={onDeleted} /> : null}
       {shutdownTarget ? <ShutdownCodeServerModal codeServer={shutdownTarget} onClose={() => setShutdownTarget(null)} onShutdown={onCodeServerShutdown} /> : null}
+      {renameTarget ? (
+        <RenameTabModal
+          currentName={displayTabName(renameTarget)}
+          defaultName={defaultTabName(renameTarget)}
+          onClose={() => setRenameTarget(null)}
+          onRename={(name) => renameTab(renameTarget, name)}
+        />
+      ) : null}
     </div>
   )
 }

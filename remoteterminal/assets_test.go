@@ -74,6 +74,7 @@ func TestMaterializeProvidesProductionInstallTreeOutsideCheckout(t *testing.T) {
 		"web/vite.config.ts",
 		"web/src/main.tsx",
 		"web/src/components/LoginView.tsx",
+		"web/src/components/RenameTabModal.tsx",
 		"web/src/components/CodeServerPanel.tsx",
 		"web/src/components/CopySelectionModal.tsx",
 		"web/src/components/LaunchCodeServerModal.tsx",

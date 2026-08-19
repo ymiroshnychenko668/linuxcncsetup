@@ -130,6 +130,12 @@ When `remoteterminal_tls_cert_source` and `remoteterminal_tls_key_source` are su
 
 When `remoteterminal_transport=http`, TLS generation and validation are skipped. Existing managed TLS material is retained so switching back to HTTPS is reversible. Changing transport updates the service environment and performs one controlled Remote Terminal restart; it does not delete terminal tmux sessions.
 
+## Workspace tabs and navigation
+
+Open terminal and Code Server tabs can be given a local browser label with the pencil action, a double-click, or `F2`. The rename field is prefilled with a non-empty default, and custom labels are saved per signed-in user across tab closure, page reloads, and later logins. Renaming a browser tab does not rename or restart the underlying tmux session, folder, or Code Server.
+
+On desktop, the hamburger button switches the left navigation between its expanded form and a compact icon-only strip; the preference is saved per user. On mobile, the same button continues to open the navigation drawer.
+
 ## Terminal sessions
 
 - Create or open sessions from the vertical tab bar.

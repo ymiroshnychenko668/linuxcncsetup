@@ -208,6 +208,51 @@ describe('Workspace', () => {
     expect(screen.queryByRole('button', { name: /alpha.*open/i })).not.toBeInTheDocument()
   })
 
+  it('renames a browser tab with a prefilled non-empty name and persists it across close and reload', async () => {
+    const { unmount } = render(<Workspace machineName="Workshop Mill" username="operator" onLogout={vi.fn()} />)
+    const user = userEvent.setup()
+
+    await user.click(await screen.findByRole('button', { name: /alpha.*open/i }))
+    await user.click(screen.getByRole('button', { name: 'Rename alpha browser tab' }))
+
+    const dialog = screen.getByRole('dialog', { name: 'Rename “alpha” tab' })
+    const input = within(dialog).getByRole('textbox', { name: 'Tab name' })
+    const saveButton = within(dialog).getByRole('button', { name: 'Rename tab' })
+    expect(input).toHaveValue('alpha')
+    await user.clear(input)
+    expect(saveButton).toBeDisabled()
+    await user.type(input, 'Machine setup')
+    await user.click(saveButton)
+
+    expect(screen.getByRole('tab', { name: /Machine setup/i })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: 'Workshop Mill / Machine setup' })).toBeInTheDocument()
+    await waitFor(() => {
+      const stored = JSON.parse(localStorage.getItem('remoteterminal.workspace.v3:operator') ?? '{}')
+      expect(stored.tabNames).toEqual({ [`terminal:${alpha.id}`]: 'Machine setup' })
+    })
+
+    await user.click(screen.getByRole('button', { name: 'Close Machine setup browser tab' }))
+    await user.click(screen.getByRole('button', { name: /alpha.*open/i }))
+    expect(screen.getByRole('tab', { name: /Machine setup/i })).toBeInTheDocument()
+
+    unmount()
+    render(<Workspace machineName="Workshop Mill" username="operator" onLogout={vi.fn()} />)
+    expect(await screen.findByRole('tab', { name: /Machine setup/i })).toHaveAttribute('aria-selected', 'true')
+  })
+
+  it('uses a non-empty fallback name for an unnamed terminal tab', async () => {
+    const unnamed = { ...alpha, name: '' }
+    mocks.getSessions.mockResolvedValue([unnamed])
+    mocks.connectSession.mockResolvedValue({ session: unnamed, terminalUrl: `/terminal/${alpha.id}/` })
+    render(<Workspace machineName="Workshop Mill" username="operator" onLogout={vi.fn()} />)
+    const user = userEvent.setup()
+
+    await user.click(await screen.findByTitle('Open terminal session'))
+    expect(screen.getByRole('tab', { name: /Terminal/i })).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Rename Terminal browser tab' }))
+    expect(screen.getByRole('textbox', { name: 'Tab name' })).toHaveValue('Terminal')
+  })
+
   it('restores non-sensitive open tab order and selection for the signed-in user', async () => {
     localStorage.setItem('remoteterminal.workspace.v1:operator', JSON.stringify({
       openIds: [beta.id, alpha.id],
@@ -256,7 +301,7 @@ describe('Workspace', () => {
     expect(screen.getByTitle('beta terminal').closest('[role="tabpanel"]')).toHaveAttribute('hidden')
   })
 
-  it('migrates terminal-only v1 storage into typed v2 tabs without storing remote paths', async () => {
+  it('migrates terminal-only v1 storage into typed v3 tabs without storing remote paths', async () => {
     localStorage.setItem('remoteterminal.workspace.v1:operator', JSON.stringify({
       openIds: [beta.id, alpha.id],
       selectedId: beta.id,
@@ -266,15 +311,17 @@ describe('Workspace', () => {
 
     await screen.findByRole('tab', { name: /beta/i })
     await waitFor(() => {
-      expect(localStorage.getItem('remoteterminal.workspace.v2:operator')).toBe(JSON.stringify({
+      expect(localStorage.getItem('remoteterminal.workspace.v3:operator')).toBe(JSON.stringify({
         openTabs: [
           { kind: 'terminal', id: beta.id },
           { kind: 'terminal', id: alpha.id },
         ],
         selectedTab: { kind: 'terminal', id: beta.id },
+        tabNames: {},
+        sidebarCompact: false,
       }))
     })
-    expect(localStorage.getItem('remoteterminal.workspace.v2:operator')).not.toContain('/home')
+    expect(localStorage.getItem('remoteterminal.workspace.v3:operator')).not.toContain('/home')
   })
 
   it('opens mixed terminal and Code Server tabs with a distinct editor treatment', async () => {
@@ -299,6 +346,26 @@ describe('Workspace', () => {
     expect(topbar.querySelector('.topbar__actions')).not.toBeInTheDocument()
     expect(within(topbar).queryByRole('button', { name: 'Reload Code Server editor' })).not.toBeInTheDocument()
     expect(within(topbar).queryByRole('button', { name: 'Shut down project Code Server' })).not.toBeInTheDocument()
+  })
+
+  it('renames a Code Server browser tab from the keyboard without renaming its workspace', async () => {
+    mocks.getCodeServers.mockResolvedValue([projectCodeServer])
+    render(<Workspace machineName="Workshop Mill" username="operator" onLogout={vi.fn()} />)
+    const user = userEvent.setup()
+
+    await user.click(await screen.findByRole('button', { name: /open project code server/i }))
+    const tab = screen.getByRole('tab', { name: /project/i })
+    tab.focus()
+    await user.keyboard('{F2}')
+    const input = screen.getByRole('textbox', { name: 'Tab name' })
+    expect(input).toHaveValue('project')
+    await user.clear(input)
+    await user.type(input, 'PLC editor')
+    await user.click(screen.getByRole('button', { name: 'Rename tab' }))
+
+    expect(screen.getByRole('tab', { name: /PLC editor/i })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: 'Workshop Mill / PLC editor' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /focus project code server/i })).toBeInTheDocument()
   })
 
   it('keeps restored Code Server frames lazy until first activation and mounted afterward', async () => {
@@ -507,13 +574,37 @@ describe('Workspace', () => {
     await user.click(within(error).getByRole('button', { name: 'Retry' }))
     expect(await screen.findByRole('tab', { name: /project/i })).toBeInTheDocument()
     expect(screen.getByRole('tab', { name: /beta/i })).toHaveAttribute('aria-selected', 'true')
-    await waitFor(() => expect(localStorage.getItem('remoteterminal.workspace.v2:operator')).toContain(projectCodeServer.id))
+    await waitFor(() => expect(localStorage.getItem('remoteterminal.workspace.v3:operator')).toContain(projectCodeServer.id))
   })
 
   it('shows the configured machine name in the terminal page header', async () => {
     render(<Workspace machineName="Workshop Mill" username="operator" onLogout={vi.fn()} />)
 
     expect(await screen.findByRole('heading', { name: 'Workshop Mill / Workspace' })).toBeInTheDocument()
+  })
+
+  it('toggles and restores compact desktop navigation', async () => {
+    const { unmount } = render(<Workspace machineName="Workshop Mill" username="operator" onLogout={vi.fn()} />)
+    const user = userEvent.setup()
+    const sidebar = document.querySelector('.sidebar') as HTMLElement
+
+    const compactButton = screen.getByRole('button', { name: 'Compact session navigation' })
+    expect(compactButton).toHaveAttribute('aria-expanded', 'true')
+    expect(sidebar).not.toHaveClass('sidebar--compact')
+    await user.click(compactButton)
+
+    const expandButton = screen.getByRole('button', { name: 'Expand session navigation' })
+    expect(expandButton).toHaveAttribute('aria-expanded', 'false')
+    expect(sidebar).toHaveClass('sidebar--compact')
+    await waitFor(() => {
+      const stored = JSON.parse(localStorage.getItem('remoteterminal.workspace.v3:operator') ?? '{}')
+      expect(stored.sidebarCompact).toBe(true)
+    })
+
+    unmount()
+    render(<Workspace machineName="Workshop Mill" username="operator" onLogout={vi.fn()} />)
+    expect(document.querySelector('.sidebar')).toHaveClass('sidebar--compact')
+    expect(screen.getByRole('button', { name: 'Expand session navigation' })).toHaveAttribute('aria-expanded', 'false')
   })
 
   it('makes closed mobile navigation inert and restores focus when it is dismissed', async () => {
