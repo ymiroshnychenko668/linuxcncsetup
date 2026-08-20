@@ -79,12 +79,17 @@ type appliedMigration struct {
 	checksum string
 }
 
-func applyMigrations(ctx context.Context, db *sql.DB) error {
+type beforeMigrationUpgrade func(context.Context, int64, int64) error
+
+func applyMigrations(ctx context.Context, db *sql.DB, beforeUpgrade beforeMigrationUpgrade) error {
 	migrations, err := loadMigrations()
 	if err != nil {
 		return err
 	}
+	return applyMigrationSet(ctx, db, migrations, beforeUpgrade)
+}
 
+func applyMigrationSet(ctx context.Context, db *sql.DB, migrations []migration, beforeUpgrade beforeMigrationUpgrade) error {
 	tableExists, err := migrationTableExists(ctx, db)
 	if err != nil {
 		return err
@@ -105,6 +110,19 @@ func applyMigrations(ctx context.Context, db *sql.DB) error {
 	}
 	if err := validateMigrationHistory(applied, migrations); err != nil {
 		return err
+	}
+	if tableExists && len(applied) < len(migrations) {
+		if beforeUpgrade == nil {
+			return errors.New("database migration backup is not configured")
+		}
+		fromVersion := int64(0)
+		if len(applied) > 0 {
+			fromVersion = applied[len(applied)-1].version
+		}
+		toVersion := migrations[len(migrations)-1].version
+		if err := beforeUpgrade(ctx, fromVersion, toVersion); err != nil {
+			return fmt.Errorf("backup database before migration %d to %d: %w", fromVersion, toVersion, err)
+		}
 	}
 
 	for _, item := range migrations[len(applied):] {

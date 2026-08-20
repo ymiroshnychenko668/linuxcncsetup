@@ -9,6 +9,9 @@ import (
 const interruptedErrorCode = "PROCESS_INTERRUPTED"
 
 // RecoveryResult reports rows moved to stable terminal states during startup.
+// Journals is retained for compatibility and is always zero: operation journal
+// recovery needs the managed object store and is performed by the service after
+// database initialization.
 type RecoveryResult struct {
 	Jobs              int64
 	Journals          int64
@@ -17,11 +20,11 @@ type RecoveryResult struct {
 	IdempotencyClaims int64
 }
 
-// RecoverInterrupted atomically makes records that cannot still be running
-// after a process restart terminal. Journals become conflict (rather than
-// completed) so higher layers never mistake a partial filesystem/SQLite
-// operation for a published mutation. It is safe and idempotent to call more
-// than once; Open invokes it at startup.
+// RecoverInterrupted atomically makes database-only records that cannot still
+// be running after a process restart terminal. Active operation journals are
+// deliberately left untouched: the service reconciles them only after the
+// root-anchored managed object store is available. It is safe and idempotent to
+// call more than once; Open invokes it at startup.
 func (d *DB) RecoverInterrupted(ctx context.Context) (_ RecoveryResult, finalErr error) {
 	if d == nil || d.sql == nil {
 		return RecoveryResult{}, sql.ErrConnDone
@@ -46,17 +49,6 @@ func (d *DB) RecoverInterrupted(ctx context.Context) (_ RecoveryResult, finalErr
 		 WHERE state IN ('queued', 'running', 'cancelling')`, interruptedErrorCode)
 	if err != nil {
 		return RecoveryResult{}, fmt.Errorf("recover jobs: %w", err)
-	}
-
-	result.Journals, err = execCount(ctx, tx, `
-		UPDATE operation_journal
-		   SET state = 'conflict',
-		       error_code = ?,
-		       updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
-		       completed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-		 WHERE state IN ('intent', 'storage_applied', 'db_applied')`, interruptedErrorCode)
-	if err != nil {
-		return RecoveryResult{}, fmt.Errorf("recover operation journal: %w", err)
 	}
 
 	result.ValidationRuns, err = execCount(ctx, tx, `

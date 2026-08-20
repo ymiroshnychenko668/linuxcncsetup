@@ -7,8 +7,10 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 
+	"github.com/ymiroshnychenko668/linuxcncsetup/websetupmanager/internal/libraryidentity"
 	"golang.org/x/sys/unix"
 )
 
@@ -166,6 +168,111 @@ func TestProcessLockIsExclusiveAndReleased(t *testing.T) {
 	}
 }
 
+func TestConnectionPoolRemainsAnchoredAfterStateDirectoryReplacement(t *testing.T) {
+	ctx := context.Background()
+	parent := t.TempDir()
+	stateDir := filepath.Join(parent, "state")
+	if err := os.Mkdir(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	db, err := Open(ctx, stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	savedDir := filepath.Join(parent, "original-state")
+	if err := os.Rename(stateDir, savedDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	connections := make([]*sql.Conn, 0, defaultConnections)
+	defer func() {
+		for _, connection := range connections {
+			_ = connection.Close()
+		}
+	}()
+	for range defaultConnections {
+		connection, err := db.SQL().Conn(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		connections = append(connections, connection)
+	}
+	for index, connection := range connections {
+		var migrations int
+		if err := connection.QueryRowContext(ctx, `SELECT count(*) FROM schema_migrations`).Scan(&migrations); err != nil {
+			t.Fatalf("connection %d escaped held state root: %v", index, err)
+		}
+		if migrations == 0 {
+			t.Fatalf("connection %d opened an unmigrated database", index)
+		}
+	}
+	if _, err := os.Lstat(filepath.Join(stateDir, defaultFilename)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("replacement state directory received a database entry: %v", err)
+	}
+}
+
+func TestOpenWithOptionsRejectsReplacedExpectedStateDirectory(t *testing.T) {
+	ctx := context.Background()
+	parent := t.TempDir()
+	stateDir := filepath.Join(parent, "state")
+	if err := os.Mkdir(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	var original unix.Stat_t
+	if err := unix.Stat(stateDir, &original); err != nil {
+		t.Fatal(err)
+	}
+	expected := &StateDirectoryIdentity{Device: uint64(original.Dev), Inode: original.Ino}
+
+	savedDir := filepath.Join(parent, "original-state")
+	if err := os.Rename(stateDir, savedDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := OpenWithOptions(ctx, Options{StateDir: stateDir, ExpectedStateIdentity: expected})
+	if db != nil {
+		_ = db.Close()
+		t.Fatal("OpenWithOptions unexpectedly accepted a replaced state directory")
+	}
+	if !errors.Is(err, ErrInvalidStateDir) {
+		t.Fatalf("OpenWithOptions error = %v, want ErrInvalidStateDir", err)
+	}
+	for _, name := range []string{processLockName, defaultFilename} {
+		if _, statErr := os.Lstat(filepath.Join(stateDir, name)); !errors.Is(statErr, os.ErrNotExist) {
+			t.Fatalf("replacement state directory received %q: %v", name, statErr)
+		}
+	}
+}
+
+func TestOpenWithOptionsAcceptsExpectedStateDirectory(t *testing.T) {
+	stateDir := t.TempDir()
+	var stat unix.Stat_t
+	if err := unix.Stat(stateDir, &stat); err != nil {
+		t.Fatal(err)
+	}
+	db, err := OpenWithOptions(context.Background(), Options{
+		StateDir: stateDir,
+		ExpectedStateIdentity: &StateDirectoryIdentity{
+			Device: uint64(stat.Dev),
+			Inode:  stat.Ino,
+		},
+	})
+	if err != nil {
+		t.Fatalf("OpenWithOptions: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestProcessLockRejectsSymlinkAndSpecialFile(t *testing.T) {
 	t.Run("symlink", func(t *testing.T) {
 		stateDir := t.TempDir()
@@ -192,6 +299,21 @@ func TestProcessLockRejectsSymlinkAndSpecialFile(t *testing.T) {
 	t.Run("fifo", func(t *testing.T) {
 		stateDir := t.TempDir()
 		if err := unix.Mkfifo(filepath.Join(stateDir, processLockName), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		_, err := Open(context.Background(), stateDir)
+		if !errors.Is(err, ErrInvalidStateDir) {
+			t.Fatalf("Open error = %v, want ErrInvalidStateDir", err)
+		}
+	})
+
+	t.Run("shared writable", func(t *testing.T) {
+		stateDir := t.TempDir()
+		lockPath := filepath.Join(stateDir, processLockName)
+		if err := os.WriteFile(lockPath, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(lockPath, 0o666); err != nil {
 			t.Fatal(err)
 		}
 		_, err := Open(context.Background(), stateDir)
@@ -228,6 +350,62 @@ func TestOpenRejectsSymlinkStateDirectoryAndDatabase(t *testing.T) {
 			t.Fatalf("Open error = %v, want ErrInvalidStateDir", err)
 		}
 	})
+
+	t.Run("hard-linked database", func(t *testing.T) {
+		stateDir := t.TempDir()
+		sentinel := filepath.Join(t.TempDir(), "sentinel.sqlite3")
+		if err := os.WriteFile(sentinel, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Link(sentinel, filepath.Join(stateDir, defaultFilename)); err != nil {
+			t.Fatal(err)
+		}
+		_, err := Open(context.Background(), stateDir)
+		if !errors.Is(err, ErrInvalidStateDir) {
+			t.Fatalf("Open error = %v, want ErrInvalidStateDir", err)
+		}
+		contents, err := os.ReadFile(sentinel)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(contents) != 0 {
+			t.Fatalf("external hard-link sentinel was modified: %q", contents)
+		}
+	})
+
+	t.Run("symlink WAL", func(t *testing.T) {
+		stateDir := t.TempDir()
+		sentinel := filepath.Join(t.TempDir(), "sentinel.wal")
+		if err := os.WriteFile(sentinel, []byte("unchanged"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(sentinel, filepath.Join(stateDir, defaultFilename+"-wal")); err != nil {
+			t.Fatal(err)
+		}
+		_, err := Open(context.Background(), stateDir)
+		if !errors.Is(err, ErrInvalidStateDir) {
+			t.Fatalf("Open error = %v, want ErrInvalidStateDir", err)
+		}
+		contents, err := os.ReadFile(sentinel)
+		if err != nil || string(contents) != "unchanged" {
+			t.Fatalf("external WAL sentinel = %q, %v", contents, err)
+		}
+	})
+
+	t.Run("shared writable database", func(t *testing.T) {
+		stateDir := t.TempDir()
+		databasePath := filepath.Join(stateDir, defaultFilename)
+		if err := os.WriteFile(databasePath, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(databasePath, 0o666); err != nil {
+			t.Fatal(err)
+		}
+		_, err := Open(context.Background(), stateDir)
+		if !errors.Is(err, ErrInvalidStateDir) {
+			t.Fatalf("Open error = %v, want ErrInvalidStateDir", err)
+		}
+	})
 }
 
 func TestEnsureLibraryIsStable(t *testing.T) {
@@ -244,5 +422,21 @@ func TestEnsureLibraryIsStable(t *testing.T) {
 	}
 	if err := db.EnsureLibrary(ctx, "library-b", "fingerprint-a"); !errors.Is(err, ErrLibraryFingerprintMismatch) {
 		t.Fatalf("reused fingerprint error = %v", err)
+	}
+}
+
+func TestEnsureLibraryMigratesOnlyToPortableMarkerFingerprint(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	const id = "0123456789abcdef0123456789abcdef"
+	if err := db.EnsureLibrary(ctx, id, strings.Repeat("a", 64)); err != nil {
+		t.Fatal(err)
+	}
+	portable := libraryidentity.Fingerprint(id)
+	if err := db.EnsureLibrary(ctx, id, portable); err != nil {
+		t.Fatalf("portable fingerprint migration: %v", err)
+	}
+	if err := db.EnsureLibrary(ctx, id, portable); err != nil {
+		t.Fatalf("portable fingerprint replay: %v", err)
 	}
 }

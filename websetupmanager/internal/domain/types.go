@@ -225,30 +225,34 @@ type CurrentSetup struct {
 }
 
 type RecentSetup struct {
-	LibraryID      string    `json:"libraryId"`
-	SetupID        string    `json:"setupId"`
-	LastArtifactID string    `json:"lastArtifactId,omitempty"`
-	LastLine       int64     `json:"lastLine,omitempty"`
-	LastOpenedAt   time.Time `json:"lastOpenedAt"`
+	LibraryID      string      `json:"libraryId"`
+	SetupID        string      `json:"setupId"`
+	SetupName      string      `json:"setupName"`
+	SetupStatus    SetupStatus `json:"setupStatus"`
+	LastArtifactID string      `json:"lastArtifactId,omitempty"`
+	LastLine       int64       `json:"lastLine,omitempty"`
+	LastOpenedAt   time.Time   `json:"lastOpenedAt"`
 }
 
 type JobKind string
 
 const (
-	JobKindImport          JobKind = "import"
-	JobKindAddPrograms     JobKind = "addPrograms"
-	JobKindReplaceProgram  JobKind = "replaceProgram"
-	JobKindValidate        JobKind = "validate"
-	JobKindDuplicate       JobKind = "duplicate"
-	JobKindPermanentDelete JobKind = "permanentDelete"
-	JobKindGCodeSearch     JobKind = "gcodeSearch"
-	JobKindReconcile       JobKind = "reconcile"
+	JobKindImport           JobKind = "import"
+	JobKindAddPrograms      JobKind = "addPrograms"
+	JobKindReplaceProgram   JobKind = "replaceProgram"
+	JobKindUpdateSetupSheet JobKind = "updateSetupSheet"
+	JobKindValidate         JobKind = "validate"
+	JobKindDuplicate        JobKind = "duplicate"
+	JobKindRestore          JobKind = "restore"
+	JobKindPermanentDelete  JobKind = "permanentDelete"
+	JobKindGCodeSearch      JobKind = "gcodeSearch"
+	JobKindReconcile        JobKind = "reconcile"
 )
 
 func (k JobKind) Valid() bool {
 	switch k {
-	case JobKindImport, JobKindAddPrograms, JobKindReplaceProgram, JobKindValidate,
-		JobKindDuplicate, JobKindPermanentDelete, JobKindGCodeSearch, JobKindReconcile:
+	case JobKindImport, JobKindAddPrograms, JobKindReplaceProgram, JobKindUpdateSetupSheet, JobKindValidate,
+		JobKindDuplicate, JobKindRestore, JobKindPermanentDelete, JobKindGCodeSearch, JobKindReconcile:
 		return true
 	default:
 		return false
@@ -372,6 +376,7 @@ type ImportArtifact struct {
 
 type ImportSession struct {
 	ID             string           `json:"importSessionId"`
+	JobID          string           `json:"jobId,omitempty"`
 	IdempotencyKey string           `json:"-"`
 	Name           string           `json:"name"`
 	Description    string           `json:"description,omitempty"`
@@ -403,6 +408,7 @@ const (
 	AuditOperationArchive         AuditOperation = "archive"
 	AuditOperationRestore         AuditOperation = "restore"
 	AuditOperationPermanentDelete AuditOperation = "permanentDelete"
+	AuditOperationReconcile       AuditOperation = "reconcile"
 )
 
 func (o AuditOperation) Valid() bool {
@@ -411,7 +417,8 @@ func (o AuditOperation) Valid() bool {
 		AuditOperationSelectCurrent, AuditOperationClearCurrent, AuditOperationAddPrograms,
 		AuditOperationReplaceProgram, AuditOperationRenameProgram, AuditOperationSetPrimary,
 		AuditOperationDeleteProgram, AuditOperationSetupSheet, AuditOperationDuplicate,
-		AuditOperationArchive, AuditOperationRestore, AuditOperationPermanentDelete:
+		AuditOperationArchive, AuditOperationRestore, AuditOperationPermanentDelete,
+		AuditOperationReconcile:
 		return true
 	default:
 		return false

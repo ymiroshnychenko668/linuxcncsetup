@@ -67,9 +67,18 @@ func TestStartupRecoveryMakesInterruptedWorkTerminal(t *testing.T) {
 		}
 	}
 	assertStateAndError("jobs", "id", "job", "failed")
-	assertStateAndError("operation_journal", "id", "journal", "conflict")
 	assertStateAndError("import_sessions", "id", "import", "conflict")
 	assertStateAndError("idempotency_requests", "key", "request-key", "conflict")
+	var journalState string
+	var journalError sql.NullString
+	if err := db.SQL().QueryRowContext(ctx, `
+		SELECT state, error_code FROM operation_journal WHERE id = 'journal'`,
+	).Scan(&journalState, &journalError); err != nil {
+		t.Fatal(err)
+	}
+	if journalState != "storage_applied" || journalError.Valid {
+		t.Errorf("operation journal state/error = %q/%v, want active without error", journalState, journalError)
+	}
 
 	var validationState string
 	var validationFinished sql.NullString
@@ -152,6 +161,49 @@ func TestOnlineBackupIsConsistentAndNeverOverwrites(t *testing.T) {
 		if strings.HasPrefix(entry.Name(), ".sqlite-backup-") {
 			t.Errorf("backup staging entry remains: %s", entry.Name())
 		}
+	}
+}
+
+func TestOpenCleansInterruptedBackupTempsWithoutFollowingLinks(t *testing.T) {
+	stateDir := t.TempDir()
+	stale := backupTempPrefix + strings.Repeat("a", 32) + backupTempSuffix
+	if err := os.WriteFile(filepath.Join(stateDir, stale), []byte("partial"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	journal := backupTempPrefix + strings.Repeat("b", 32) + backupTempSuffix + "-journal"
+	if err := os.WriteFile(filepath.Join(stateDir, journal), []byte("partial journal"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sentinel := filepath.Join(t.TempDir(), "sentinel")
+	if err := os.WriteFile(sentinel, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	linked := backupTempPrefix + strings.Repeat("c", 32) + backupTempSuffix
+	if err := os.Symlink(sentinel, filepath.Join(stateDir, linked)); err != nil {
+		t.Fatal(err)
+	}
+	unrelated := "operator-backup.tmp"
+	if err := os.WriteFile(filepath.Join(stateDir, unrelated), []byte("preserve"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := Open(context.Background(), stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	for _, name := range []string{stale, journal, linked} {
+		if _, err := os.Lstat(filepath.Join(stateDir, name)); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("backup staging entry %q remains: %v", name, err)
+		}
+	}
+	contents, err := os.ReadFile(sentinel)
+	if err != nil || string(contents) != "keep" {
+		t.Fatalf("external sentinel = %q, %v", contents, err)
+	}
+	contents, err = os.ReadFile(filepath.Join(stateDir, unrelated))
+	if err != nil || string(contents) != "preserve" {
+		t.Fatalf("unrelated state file = %q, %v", contents, err)
 	}
 }
 

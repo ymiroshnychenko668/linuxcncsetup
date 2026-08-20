@@ -8,16 +8,31 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"os"
 	"path/filepath"
+	"strings"
 
 	"golang.org/x/sys/unix"
 	"modernc.org/sqlite"
 )
 
-const backupStepPages int32 = 128
+const (
+	backupStepPages  int32 = 128
+	backupTempPrefix       = ".sqlite-backup-"
+	backupTempSuffix       = ".tmp"
+)
 
 type sqliteBackuper interface {
 	NewBackup(destinationURI string) (*sqlite.Backup, error)
+}
+
+func migrationBackupName(fromVersion, toVersion int64) (string, error) {
+	var random [16]byte
+	if _, err := rand.Read(random[:]); err != nil {
+		return "", fmt.Errorf("generate migration backup identity: %w", err)
+	}
+	return fmt.Sprintf("websetupmanager.pre-migration-v%d-to-v%d-%s.sqlite3",
+		fromVersion, toVersion, hex.EncodeToString(random[:])), nil
 }
 
 // Backup creates a consistent online SQLite backup using SQLite's backup API.
@@ -145,7 +160,7 @@ func createBackupTemp(dirFD int) (string, error) {
 		if _, err := rand.Read(random[:]); err != nil {
 			return "", err
 		}
-		name := ".sqlite-backup-" + hex.EncodeToString(random[:]) + ".tmp"
+		name := backupTempPrefix + hex.EncodeToString(random[:]) + backupTempSuffix
 		fd, err := unix.Openat(
 			dirFD,
 			name,
@@ -164,6 +179,44 @@ func createBackupTemp(dirFD int) (string, error) {
 		}
 	}
 	return "", fs.ErrExist
+}
+
+// cleanupBackupTemps removes only names from the private namespace used by
+// Backup. It is called after acquiring the single-process lock, so a leftover
+// file can only belong to an interrupted earlier process. Symlinks and special
+// files are unlinked as directory entries and are never opened or followed.
+func cleanupBackupTemps(dirFD int) error {
+	duplicate, err := unix.Dup(dirFD)
+	if err != nil {
+		return err
+	}
+	directory := os.NewFile(uintptr(duplicate), "database-state")
+	defer directory.Close()
+	entries, err := directory.ReadDir(-1)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !isBackupTempName(entry.Name()) {
+			continue
+		}
+		if err := unix.Unlinkat(dirFD, entry.Name(), 0); err != nil && !errors.Is(err, unix.ENOENT) {
+			return err
+		}
+	}
+	return nil
+}
+
+func isBackupTempName(name string) bool {
+	for _, auxiliary := range []string{"-journal", "-wal", "-shm"} {
+		name = strings.TrimSuffix(name, auxiliary)
+	}
+	if !strings.HasPrefix(name, backupTempPrefix) || !strings.HasSuffix(name, backupTempSuffix) {
+		return false
+	}
+	encoded := strings.TrimSuffix(strings.TrimPrefix(name, backupTempPrefix), backupTempSuffix)
+	decoded, err := hex.DecodeString(encoded)
+	return err == nil && len(decoded) == 16 && encoded == strings.ToLower(encoded)
 }
 
 func syncRegularEntry(dirFD int, name string) error {

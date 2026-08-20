@@ -164,8 +164,8 @@ func (c *Config) Validate() error {
 	if c.ArtifactUploadLimit < 0 || c.ImportTotalLimit < 0 {
 		return errors.New("upload limits cannot be negative")
 	}
-	if c.ArtifactFileMode&0o111 != 0 || c.ArtifactFileMode.Perm() == 0 {
-		return errors.New("WEB_SETUP_MANAGER_ARTIFACT_FILE_MODE must be non-executable and non-zero")
+	if c.ArtifactFileMode&0o111 != 0 || c.ArtifactFileMode&0o022 != 0 || c.ArtifactFileMode&0o400 == 0 {
+		return errors.New("WEB_SETUP_MANAGER_ARTIFACT_FILE_MODE must be owner-readable, non-executable and non-writable by group/others")
 	}
 	if c.MaxHeaderBytes < 8<<10 || c.MaxHeaderBytes > 1<<20 {
 		return errors.New("WEB_SETUP_MANAGER_MAX_HEADER_BYTES must be between 8192 and 1048576")
@@ -180,10 +180,17 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("%s must be positive", name)
 		}
 	}
-	host, _, err := net.SplitHostPort(c.ListenAddress)
+	host, port, err := net.SplitHostPort(c.ListenAddress)
 	if err != nil {
 		return errors.New("WEB_SETUP_MANAGER_LISTEN_ADDRESS must be host:port")
 	}
+	portNumber, err := strconv.ParseUint(port, 10, 16)
+	if err != nil || portNumber == 0 {
+		return errors.New("WEB_SETUP_MANAGER_LISTEN_ADDRESS port must be between 1 and 65535")
+	}
+	// Keep downstream bind and same-origin authority checks on one canonical
+	// numeric representation (for example, :080 becomes :80).
+	c.ListenAddress = net.JoinHostPort(host, strconv.FormatUint(portNumber, 10))
 	ip := net.ParseIP(strings.Trim(host, "[]"))
 	isLoopback := ip != nil && ip.IsLoopback()
 	if host == "localhost" {
@@ -193,6 +200,8 @@ func (c *Config) Validate() error {
 		if !c.RemoteAccess {
 			return errors.New("non-loopback listen requires WEB_SETUP_MANAGER_REMOTE_ACCESS=true")
 		}
+	}
+	if c.RemoteAccess {
 		if len(c.RemoteAuthToken) < 32 {
 			return errors.New("remote access requires an authentication token of at least 32 characters")
 		}
@@ -218,13 +227,10 @@ func (c *Config) Validate() error {
 	return nil
 }
 
-// ValidateRoots canonicalizes and verifies storage roots without widening them.
-// The state directory may be created because it is service-owned; the library
-// must already exist and is never silently replaced by a parent directory.
+// ValidateRoots canonicalizes and verifies existing storage roots without
+// widening or following them. Deployment creates both roots explicitly so a
+// configured symlink can never redirect first-run state creation.
 func (c *Config) ValidateRoots() error {
-	if err := os.MkdirAll(c.StateDir, 0o700); err != nil {
-		return errors.New("state directory is unavailable")
-	}
 	library, err := canonicalDirectory(c.LibraryDir)
 	if err != nil {
 		return errors.New("library directory is unavailable")
@@ -232,6 +238,12 @@ func (c *Config) ValidateRoots() error {
 	state, err := canonicalDirectory(c.StateDir)
 	if err != nil {
 		return errors.New("state directory is unavailable")
+	}
+	for label, directory := range map[string]string{"library": library, "state": state} {
+		info, statErr := os.Stat(directory)
+		if statErr != nil || info.Mode().Perm()&0o022 != 0 {
+			return fmt.Errorf("%s directory permissions are unsafe", label)
+		}
 	}
 	if pathsOverlap(library, state) {
 		return errors.New("library and state directories must be disjoint")
@@ -247,44 +259,74 @@ func (c Config) ValidateFiles() error {
 	if c.TLSCertFile == "" {
 		return nil
 	}
-	for name, filename := range map[string]string{
-		"TLS certificate": c.TLSCertFile,
-		"TLS private key": c.TLSKeyFile,
+	for _, material := range []struct {
+		name       string
+		filename   string
+		privateKey bool
+	}{
+		{name: "TLS certificate", filename: c.TLSCertFile},
+		{name: "TLS private key", filename: c.TLSKeyFile, privateKey: true},
 	} {
+		name, filename := material.name, material.filename
 		if !filepath.IsAbs(filename) {
 			return fmt.Errorf("%s must be an absolute regular file", name)
 		}
+		parent := filepath.Clean(filepath.Dir(filename))
+		resolvedParent, err := filepath.EvalSymlinks(parent)
+		if err != nil || resolvedParent != parent {
+			return fmt.Errorf("%s is unavailable", name)
+		}
 		info, err := os.Lstat(filename)
 		if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("%s is unavailable", name)
+		}
+		permissions := info.Mode().Perm()
+		if permissions&0o133 != 0 || (material.privateKey && permissions&0o007 != 0) {
 			return fmt.Errorf("%s is unavailable", name)
 		}
 		file, err := os.Open(filename)
 		if err != nil {
 			return fmt.Errorf("%s is unreadable", name)
 		}
-		_ = file.Close()
+		openedInfo, statErr := file.Stat()
+		closeErr := file.Close()
+		if statErr != nil || closeErr != nil || !openedInfo.Mode().IsRegular() || !os.SameFile(info, openedInfo) {
+			return fmt.Errorf("%s changed during validation", name)
+		}
 	}
 	return nil
 }
 
 func canonicalDirectory(path string) (string, error) {
-	cleaned, err := filepath.EvalSymlinks(filepath.Clean(path))
+	cleaned, err := filepath.Abs(filepath.Clean(path))
 	if err != nil {
 		return "", err
+	}
+	resolved, err := filepath.EvalSymlinks(cleaned)
+	if err != nil {
+		return "", err
+	}
+	// Any lexical difference means at least one configured path component was
+	// a symlink. Reject it instead of silently changing the configured root.
+	if resolved != cleaned {
+		return "", errors.New("directory path contains a symbolic link")
 	}
 	info, err := os.Lstat(cleaned)
 	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 		return "", errors.New("not a real directory")
 	}
-	return filepath.Abs(cleaned)
+	return cleaned, nil
 }
 
 func pathsOverlap(first, second string) bool {
-	if first == second {
-		return true
+	contains := func(parent, child string) bool {
+		relative, err := filepath.Rel(parent, child)
+		if err != nil || filepath.IsAbs(relative) {
+			return false
+		}
+		return relative == "." || relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator))
 	}
-	separator := string(filepath.Separator)
-	return strings.HasPrefix(first, second+separator) || strings.HasPrefix(second, first+separator)
+	return contains(first, second) || contains(second, first)
 }
 
 func validExtension(value string) bool {

@@ -46,6 +46,9 @@ func TestStagePublishOpenVerifyAndDeduplicate(t *testing.T) {
 	if object.Size != int64(len(contents)) || len(object.Version) != 64 || strings.Contains(object.Key, "G21") {
 		t.Fatalf("unexpected object: %+v", object)
 	}
+	if object.Identity.Inode == 0 || object.Identity.ModTimeNS == 0 || object.Identity.ChangeTimeNS == 0 {
+		t.Fatalf("object identity was not captured: %+v", object.Identity)
+	}
 	opened, err := store.OpenObject(object.Key, object.SHA256, object.Version)
 	if err != nil {
 		t.Fatal(err)
@@ -66,6 +69,40 @@ func TestStagePublishOpenVerifyAndDeduplicate(t *testing.T) {
 	second, err := store.Publish(context.Background(), secondStage)
 	if err != nil || second.Key != object.Key || second.Version != object.Version {
 		t.Fatalf("deduplicate = %+v, %v", second, err)
+	}
+}
+
+func TestReadObjectRangeAndSafeEnumeration(t *testing.T) {
+	store, _, library, _ := testStore(t, 0)
+	contents := []byte("line one\nline two\nline three\n")
+	staged, err := store.Stage(context.Background(), bytes.NewReader(contents), int64(len(contents)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	object, err := store.Publish(context.Background(), staged)
+	if err != nil {
+		t.Fatal(err)
+	}
+	buffer := make([]byte, 8)
+	count, total, err := store.ReadObjectRange(context.Background(), object.Key, object.SHA256, object.Version, 9, buffer)
+	if err != nil || total != int64(len(contents)) || string(buffer[:count]) != "line two" {
+		t.Fatalf("range count=%d total=%d data=%q err=%v", count, total, buffer[:count], err)
+	}
+	objects, err := store.ListObjects(context.Background())
+	if err != nil || len(objects) != 1 || objects[0].Key != object.Key {
+		t.Fatalf("objects = %+v, %v", objects, err)
+	}
+
+	outside := filepath.Join(t.TempDir(), "outside")
+	if err := os.WriteFile(outside, []byte("sentinel"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(library, objectsDirName, object.SHA256[:2], strings.Repeat("f", 64))); err != nil {
+		t.Fatal(err)
+	}
+	objects, err = store.ListObjects(context.Background())
+	if err != nil || len(objects) != 1 {
+		t.Fatalf("enumeration followed or rejected unrelated symlink: %+v, %v", objects, err)
 	}
 }
 
@@ -125,24 +162,31 @@ func TestObjectSubstitutionAndSpecialFilesAreRejected(t *testing.T) {
 }
 
 func TestCleanupStagingUnlinksFIFOAndSymlinkWithoutFollowing(t *testing.T) {
-	store, _, _, state := testStore(t, 0)
-	staging := filepath.Join(state, uploadStageName)
-	if err := unix.Mkfifo(filepath.Join(staging, "leftover.upload"), 0o600); err != nil {
-		t.Fatal(err)
+	store, _, library, state := testStore(t, 0)
+	stagingDirectories := []string{
+		filepath.Join(state, uploadStageName),
+		filepath.Join(library, objectTempDirName),
 	}
 	sentinel := filepath.Join(t.TempDir(), "sentinel")
 	if err := os.WriteFile(sentinel, []byte("keep"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Symlink(sentinel, filepath.Join(staging, "link.upload")); err != nil {
-		t.Fatal(err)
+	for _, staging := range stagingDirectories {
+		if err := unix.Mkfifo(filepath.Join(staging, "leftover.tmp"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(sentinel, filepath.Join(staging, "link.tmp")); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := store.CleanupStaging(); err != nil {
 		t.Fatal(err)
 	}
-	entries, err := os.ReadDir(staging)
-	if err != nil || len(entries) != 0 {
-		t.Fatalf("staging entries = %v, %v", entries, err)
+	for _, staging := range stagingDirectories {
+		entries, err := os.ReadDir(staging)
+		if err != nil || len(entries) != 0 {
+			t.Fatalf("staging entries in %q = %v, %v", filepath.Base(staging), entries, err)
+		}
 	}
 	contents, err := os.ReadFile(sentinel)
 	if err != nil || string(contents) != "keep" {

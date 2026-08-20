@@ -18,10 +18,21 @@ type processLock struct {
 	closeErr  error
 }
 
-func acquireProcessLock(stateDir string) (*processLock, error) {
+func acquireProcessLock(stateDir string, expected *StateDirectoryIdentity) (*processLock, error) {
 	dirFD, err := unix.Open(stateDir, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_DIRECTORY|unix.O_NOFOLLOW, 0)
 	if err != nil {
 		return nil, fmt.Errorf("%w: open directory: %v", ErrInvalidStateDir, err)
+	}
+	var dirStat unix.Stat_t
+	if err := unix.Fstat(dirFD, &dirStat); err != nil ||
+		dirStat.Mode&unix.S_IFMT != unix.S_IFDIR || dirStat.Mode&0o022 != 0 {
+		_ = unix.Close(dirFD)
+		return nil, fmt.Errorf("%w: state directory is unsafe", ErrInvalidStateDir)
+	}
+	if expected != nil &&
+		(expected.Device != uint64(dirStat.Dev) || expected.Inode != dirStat.Ino) {
+		_ = unix.Close(dirFD)
+		return nil, fmt.Errorf("%w: state directory identity changed", ErrInvalidStateDir)
 	}
 
 	fd, err := unix.Openat(
@@ -41,7 +52,7 @@ func acquireProcessLock(stateDir string) (*processLock, error) {
 		_ = lock.Close()
 		return nil, fmt.Errorf("%w: inspect process lock: %v", ErrInvalidStateDir, err)
 	}
-	if stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Nlink != 1 {
+	if stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Nlink != 1 || stat.Mode&0o022 != 0 {
 		_ = lock.Close()
 		return nil, fmt.Errorf("%w: process lock is not a private regular file", ErrInvalidStateDir)
 	}

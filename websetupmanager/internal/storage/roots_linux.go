@@ -5,7 +5,6 @@ package storage
 
 import (
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -16,6 +15,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/ymiroshnychenko668/linuxcncsetup/websetupmanager/internal/libraryidentity"
 	"golang.org/x/sys/unix"
 )
 
@@ -41,8 +41,20 @@ type Roots struct {
 	closeOnce   sync.Once
 }
 
+// RootIdentity identifies one physical directory for security checks between
+// components. It is internal deployment metadata and must never be exposed by
+// the HTTP API.
+type RootIdentity struct {
+	Device uint64
+	Inode  uint64
+}
+
 // NewRoots opens and initializes the configured storage roots.
 func NewRoots(libraryDir, stateDir string, fileMode fs.FileMode) (*Roots, error) {
+	permissions := fileMode.Perm()
+	if permissions&0o400 == 0 || permissions&0o111 != 0 || permissions&0o022 != 0 {
+		return nil, errors.New("managed artifact file mode is unsafe")
+	}
 	libraryFD, err := openRoot(libraryDir)
 	if err != nil {
 		return nil, errors.New("open managed library root")
@@ -52,7 +64,14 @@ func NewRoots(libraryDir, stateDir string, fileMode fs.FileMode) (*Roots, error)
 		_ = unix.Close(libraryFD)
 		return nil, errors.New("open service state root")
 	}
-	roots := &Roots{libraryFD: libraryFD, stateFD: stateFD, fileMode: fileMode.Perm()}
+	var libraryStat, stateStat unix.Stat_t
+	if unix.Fstat(libraryFD, &libraryStat) != nil || unix.Fstat(stateFD, &stateStat) != nil ||
+		libraryStat.Dev == stateStat.Dev && libraryStat.Ino == stateStat.Ino {
+		_ = unix.Close(libraryFD)
+		_ = unix.Close(stateFD)
+		return nil, errors.New("managed storage roots are not physically disjoint")
+	}
+	roots := &Roots{libraryFD: libraryFD, stateFD: stateFD, fileMode: permissions}
 	fail := func(err error) (*Roots, error) {
 		_ = roots.Close()
 		return nil, err
@@ -90,21 +109,62 @@ func NewRoots(libraryDir, stateDir string, fileMode fs.FileMode) (*Roots, error)
 // LibraryID is a stable opaque identifier persisted inside the managed root.
 func (r *Roots) LibraryID() string { return r.libraryID }
 
-// LibraryFingerprint binds state to this physical root without exposing its
-// path, device or inode through the public API.
+// LibraryFingerprint binds state to the persisted random marker. It excludes
+// host identity so a matched state+library backup remains restorable.
 func (r *Roots) LibraryFingerprint() string { return r.fingerprint }
 
-// Check verifies that both held roots still refer to usable directories and
-// that their filesystems report available blocks.
+// StateIdentity returns the identity of the already-opened state root. A
+// caller opening another resource below the configured state path can require
+// that it resolved to this same directory, closing the rename/substitution
+// window between storage and database initialization.
+func (r *Roots) StateIdentity() (RootIdentity, error) {
+	if r == nil || r.stateFD < 0 {
+		return RootIdentity{}, errors.New("service state root is unavailable")
+	}
+	var stat unix.Stat_t
+	if err := unix.Fstat(r.stateFD, &stat); err != nil ||
+		stat.Mode&unix.S_IFMT != unix.S_IFDIR || stat.Mode&0o022 != 0 {
+		return RootIdentity{}, errors.New("service state root is unavailable")
+	}
+	return RootIdentity{Device: uint64(stat.Dev), Inode: stat.Ino}, nil
+}
+
+// Check verifies that both held roots and every security-sensitive managed
+// directory still refer to usable, writable directories. It is intentionally
+// non-mutating so readiness probes never create storage objects.
 func (r *Roots) Check() error {
 	for _, descriptor := range []int{r.libraryFD, r.stateFD} {
 		var stat unix.Stat_t
-		if err := unix.Fstat(descriptor, &stat); err != nil || stat.Mode&unix.S_IFMT != unix.S_IFDIR {
+		if err := unix.Fstat(descriptor, &stat); err != nil || stat.Mode&unix.S_IFMT != unix.S_IFDIR || stat.Mode&0o022 != 0 {
 			return errors.New("storage root is unavailable")
 		}
 		var statfs unix.Statfs_t
-		if err := unix.Fstatfs(descriptor, &statfs); err != nil || statfs.Blocks == 0 {
+		if err := unix.Fstatfs(descriptor, &statfs); err != nil || statfs.Blocks == 0 || statfs.Flags&unix.ST_RDONLY != 0 {
 			return errors.New("storage filesystem is unavailable")
+		}
+	}
+	for _, directory := range []struct {
+		rootFD int
+		name   string
+	}{
+		{r.libraryFD, objectsDirName},
+		{r.libraryFD, objectTempDirName},
+		{r.stateFD, uploadStageName},
+		{r.stateFD, indexesDirName},
+	} {
+		fd, err := openBeneath(directory.rootFD, directory.name, unix.O_RDONLY|unix.O_DIRECTORY, 0)
+		if err != nil {
+			return errors.New("managed storage directory is unavailable")
+		}
+		var stat unix.Stat_t
+		var statfs unix.Statfs_t
+		statErr := unix.Fstat(fd, &stat)
+		statfsErr := unix.Fstatfs(fd, &statfs)
+		accessErr := unix.Faccessat(fd, ".", unix.W_OK|unix.X_OK, unix.AT_EACCESS)
+		closeErr := unix.Close(fd)
+		if statErr != nil || stat.Mode&unix.S_IFMT != unix.S_IFDIR || stat.Mode&0o022 != 0 ||
+			statfsErr != nil || statfs.Blocks == 0 || statfs.Flags&unix.ST_RDONLY != 0 || accessErr != nil || closeErr != nil {
+			return errors.New("managed storage directory is unavailable")
 		}
 	}
 	return nil
@@ -199,24 +259,69 @@ func (r *Roots) checkWritable() error {
 }
 
 func openRoot(path string) (int, error) {
-	return unix.Open(filepath.Clean(path), unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	cleaned := filepath.Clean(path)
+	if !filepath.IsAbs(cleaned) {
+		return -1, errUnsafePath
+	}
+	fd, err := unix.Open("/", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return -1, err
+	}
+	for _, component := range strings.Split(strings.TrimPrefix(cleaned, "/"), "/") {
+		if component == "" {
+			continue
+		}
+		next, openErr := unix.Openat(fd, component, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+		_ = unix.Close(fd)
+		if openErr != nil {
+			return -1, openErr
+		}
+		fd = next
+	}
+	var stat unix.Stat_t
+	if err := unix.Fstat(fd, &stat); err != nil || stat.Mode&unix.S_IFMT != unix.S_IFDIR || stat.Mode&0o022 != 0 {
+		_ = unix.Close(fd)
+		return -1, errors.New("managed storage root permissions are unsafe")
+	}
+	return fd, nil
 }
 
 func ensureDirectory(rootFD int, name string, mode uint32) error {
 	if !validComponent(name) {
 		return errUnsafePath
 	}
-	if err := unix.Mkdirat(rootFD, name, mode); err != nil && !errors.Is(err, unix.EEXIST) {
-		return err
+	created := false
+	if err := unix.Mkdirat(rootFD, name, mode); err != nil {
+		if !errors.Is(err, unix.EEXIST) {
+			return err
+		}
+	} else {
+		created = true
 	}
 	fd, err := openBeneath(rootFD, name, unix.O_RDONLY|unix.O_DIRECTORY, 0)
 	if err != nil {
 		return err
 	}
-	return unix.Close(fd)
+	var stat unix.Stat_t
+	if err := unix.Fstat(fd, &stat); err != nil {
+		_ = unix.Close(fd)
+		return err
+	}
+	if stat.Mode&0o022 != 0 {
+		_ = unix.Close(fd)
+		return errors.New("managed directory is writable by group or others")
+	}
+	if err := unix.Close(fd); err != nil {
+		return err
+	}
+	if created {
+		return unix.Fsync(rootFD)
+	}
+	return nil
 }
 
 func ensureLibraryID(libraryFD int) (string, error) {
+	created := false
 	fd, err := openBeneath(libraryFD, libraryMarkerName, unix.O_RDWR, 0)
 	if errors.Is(err, unix.ENOENT) {
 		fd, err = openBeneath(libraryFD, libraryMarkerName, unix.O_RDWR|unix.O_CREAT|unix.O_EXCL, 0o600)
@@ -236,13 +341,15 @@ func ensureLibraryID(libraryFD int) (string, error) {
 			_ = unix.Close(fd)
 			return "", syncErr
 		}
+		created = true
 	}
 	if err != nil {
 		return "", err
 	}
 	defer unix.Close(fd)
 	var stat unix.Stat_t
-	if err := unix.Fstat(fd, &stat); err != nil || stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Size > 128 {
+	if err := unix.Fstat(fd, &stat); err != nil || stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Nlink != 1 ||
+		stat.Mode&0o022 != 0 || stat.Size > 128 {
 		return "", errors.New("invalid library identity marker")
 	}
 	buffer := make([]byte, 128)
@@ -254,6 +361,11 @@ func ensureLibraryID(libraryFD int) (string, error) {
 	decoded, err := hex.DecodeString(identifier)
 	if err != nil || len(decoded) != 16 {
 		return "", errors.New("invalid library identity marker")
+	}
+	if created {
+		if err := unix.Fsync(libraryFD); err != nil {
+			return "", err
+		}
 	}
 	return identifier, nil
 }
@@ -271,8 +383,7 @@ func rootFingerprint(fd int, libraryID string) (string, error) {
 	if err := unix.Fstat(fd, &stat); err != nil || stat.Mode&unix.S_IFMT != unix.S_IFDIR {
 		return "", errors.New("invalid library root")
 	}
-	digest := sha256.Sum256([]byte(fmt.Sprintf("%s:%d:%d", libraryID, stat.Dev, stat.Ino)))
-	return hex.EncodeToString(digest[:]), nil
+	return libraryidentity.Fingerprint(libraryID), nil
 }
 
 func openBeneath(rootFD int, relative string, flags int, mode uint32) (int, error) {
@@ -333,7 +444,13 @@ func unlinkBeneath(rootFD int, relative string) error {
 	if closeParent {
 		defer unix.Close(parent)
 	}
-	return unix.Unlinkat(parent, components[len(components)-1], 0)
+	if err := unix.Unlinkat(parent, components[len(components)-1], 0); err != nil {
+		return err
+	}
+	// Make the removed directory entry durable before callers commit catalog
+	// metadata that forgets the object. Otherwise a power loss can resurrect an
+	// untracked immutable file after SQLite has committed its GC row deletion.
+	return unix.Fsync(parent)
 }
 
 func safeComponents(relative string) ([]string, error) {

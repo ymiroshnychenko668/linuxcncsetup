@@ -39,14 +39,18 @@ func TestExpectedRevisionConflictIsStableAndActionable(t *testing.T) {
 	}
 }
 
-func TestNextMutationIncrementsAndReturnsDraft(t *testing.T) {
+func TestNextMutationIncrementsAndPreservesAttention(t *testing.T) {
 	for _, status := range []SetupStatus{SetupStatusDraft, SetupStatusReady, SetupStatusAttention} {
 		t.Run(string(status), func(t *testing.T) {
 			nextStatus, nextRevision, err := NextMutation(status, 7, 7)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if nextStatus != SetupStatusDraft || nextRevision != 8 {
+			expectedStatus := SetupStatusDraft
+			if status == SetupStatusAttention {
+				expectedStatus = SetupStatusAttention
+			}
+			if nextStatus != expectedStatus || nextRevision != 8 {
 				t.Fatalf("transition = %s/%d", nextStatus, nextRevision)
 			}
 		})

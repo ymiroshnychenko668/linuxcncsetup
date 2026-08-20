@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
 	"io/fs"
 	"log/slog"
 	"mime"
@@ -17,8 +18,12 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/ymiroshnychenko668/linuxcncsetup/websetupmanager/internal/service"
+	"golang.org/x/net/http/httpguts"
 )
 
 const appCSP = "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'self'; form-action 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; connect-src 'self'; worker-src 'self' blob:; frame-src 'self'"
@@ -42,6 +47,8 @@ type Config struct {
 	LibraryAlias              string
 	GCodeExtensions           []string
 	RequireSetupSheetForReady bool
+	RequestReadIdleTimeout    time.Duration
+	ResponseWriteIdleTimeout  time.Duration
 	RemoteAccess              bool
 	RemoteAuthToken           string
 }
@@ -57,6 +64,15 @@ type Server struct {
 	csrfToken    string
 	allowedHosts map[string]struct{}
 	shuttingDown atomic.Bool
+	service      *service.Service
+	requestsMu   sync.Mutex
+	requests     map[uint64]trackedRequest
+	nextRequest  atomic.Uint64
+}
+
+type trackedRequest struct {
+	cancel context.CancelFunc
+	body   io.ReadCloser
 }
 
 // New constructs a secure same-origin handler.
@@ -78,13 +94,47 @@ func New(configuration Config, database, storage Checker, static fs.FS, logger *
 	server := &Server{
 		config: configuration, database: database, storage: storage, static: static,
 		fileServer: http.FileServer(http.FS(static)), logger: logger,
-		csrfToken: token, allowedHosts: hosts,
+		csrfToken: token, allowedHosts: hosts, requests: make(map[uint64]trackedRequest),
 	}
 	return server, nil
 }
 
-// BeginShutdown rejects new mutations and makes health endpoints fail.
-func (s *Server) BeginShutdown() { s.shuttingDown.Store(true) }
+// NewWithService is New with the setup-domain implementation enabled.
+func NewWithService(configuration Config, database, storage Checker, application *service.Service, static fs.FS, logger *slog.Logger) (*Server, error) {
+	if application == nil {
+		return nil, errors.New("setup service is unavailable")
+	}
+	server, err := New(configuration, database, storage, static, logger)
+	if err != nil {
+		return nil, err
+	}
+	server.service = application
+	return server, nil
+}
+
+// BeginShutdown rejects new mutations, makes health endpoints fail and
+// cooperatively cancels active mutations/content streams so their staging and
+// journal cleanup can finish before process shutdown.
+func (s *Server) BeginShutdown() {
+	if s.shuttingDown.Swap(true) {
+		return
+	}
+	s.requestsMu.Lock()
+	requests := make([]trackedRequest, 0, len(s.requests))
+	for _, request := range s.requests {
+		requests = append(requests, request)
+	}
+	s.requestsMu.Unlock()
+	for _, request := range requests {
+		request.cancel()
+		// Request.Body.Close is required by net/http to unblock a concurrent
+		// Read. Context cancellation alone cannot release a handler waiting for
+		// the next upload byte before the configured read-idle deadline.
+		if request.body != nil {
+			_ = request.body.Close()
+		}
+	}
+}
 
 // ServeHTTP applies security, request identity, recovery and safe structured
 // access logging around the route dispatcher.
@@ -95,21 +145,66 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("X-Request-ID", requestID)
 	setSecurityHeaders(w.Header())
-	recorder := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+	recorder := &statusRecorder{
+		ResponseWriter: w, status: http.StatusOK,
+		writeIdleTimeout: s.config.ResponseWriteIdleTimeout,
+	}
+	var requestBody *idleDeadlineReadCloser
+	if r.Body != nil {
+		controller := http.NewResponseController(recorder)
+		requestBody = &idleDeadlineReadCloser{
+			ReadCloser: r.Body,
+			controller: controller,
+			timeout:    s.config.RequestReadIdleTimeout,
+		}
+		r.Body = requestBody
+		if s.config.RequestReadIdleTimeout > 0 {
+			// Set an initial deadline even for routes that reject a body without
+			// reading it. Leaving it in place until net/http completes its bounded
+			// post-handler drain prevents a slow ignored body from pinning a
+			// connection after ServeHTTP returns; subsequent request parsing resets
+			// the connection deadline through ReadHeaderTimeout.
+			_ = controller.SetReadDeadline(time.Now().Add(s.config.RequestReadIdleTimeout))
+		}
+	}
+	if s.config.ResponseWriteIdleTimeout > 0 {
+		defer func() { _ = http.NewResponseController(recorder).SetWriteDeadline(time.Time{}) }()
+	}
 	started := time.Now()
+	routeName, setupID, artifactID, importID, jobID := safeRouteContext(r.URL.Path)
+	if isCancellableRequest(r) {
+		var done func()
+		r, done = s.trackRequest(r)
+		defer done()
+	}
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			s.logger.Error("http panic recovered", "request_id", requestID, "result", "INTERNAL_ERROR")
+			recorder.setErrorCode("INTERNAL_ERROR")
 			if !recorder.wroteHeader {
 				writeError(recorder, http.StatusInternalServerError, requestID, "INTERNAL_ERROR", "The request could not be completed.", nil, false)
 			}
 		}
+		requestBytes := int64(0)
+		if requestBody != nil {
+			requestBytes = requestBody.bytes
+		}
 		s.logger.Info("http request",
 			"request_id", requestID,
 			"method", safeMethod(r.Method),
+			"route", routeName,
+			"operation", routeName,
+			"setup_id", setupID,
+			"artifact_id", artifactID,
+			"import_id", importID,
+			"job_id", jobID,
 			"status", recorder.status,
 			"duration_ms", time.Since(started).Milliseconds(),
-			"bytes", recorder.bytes,
+			"bytes", requestBytes+recorder.bytes,
+			"request_bytes", requestBytes,
+			"response_bytes", recorder.bytes,
+			"result", recorder.result(),
+			"error_code", recorder.errorCode,
 		)
 	}()
 
@@ -117,13 +212,129 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeError(recorder, http.StatusServiceUnavailable, requestID, "SERVICE_SHUTTING_DOWN", "The service is shutting down.", nil, true)
 		return
 	}
-	if s.config.RemoteAccess && strings.HasPrefix(r.URL.Path, "/api/v1/") && !s.authorizeRemote(r) {
-		recorder.Header().Set("WWW-Authenticate", `Bearer realm="web-setup-manager"`)
+	if s.config.RemoteAccess && r.URL.Path != "/healthz" && r.URL.Path != "/readyz" && !s.authorizeRemote(r) {
+		recorder.Header().Set("WWW-Authenticate", `Basic realm="Web Setup Manager", charset="UTF-8"`)
+		recorder.Header().Add("WWW-Authenticate", `Bearer realm="web-setup-manager"`)
 		writeError(recorder, http.StatusUnauthorized, requestID, "AUTHENTICATION_REQUIRED", "Authentication is required.", nil, false)
 		return
 	}
 
 	s.route(recorder, r, requestID)
+}
+
+func isCancellableRequest(r *http.Request) bool {
+	return isMutation(r.Method) || strings.HasSuffix(r.URL.Path, "/content")
+}
+
+func (s *Server) trackRequest(r *http.Request) (*http.Request, func()) {
+	ctx, cancel := context.WithCancel(r.Context())
+	identifier := s.nextRequest.Add(1)
+	s.requestsMu.Lock()
+	if s.shuttingDown.Load() {
+		cancel()
+		if r.Body != nil {
+			_ = r.Body.Close()
+		}
+	} else {
+		s.requests[identifier] = trackedRequest{cancel: cancel, body: r.Body}
+	}
+	s.requestsMu.Unlock()
+	var once sync.Once
+	done := func() {
+		once.Do(func() {
+			s.requestsMu.Lock()
+			delete(s.requests, identifier)
+			s.requestsMu.Unlock()
+			cancel()
+		})
+	}
+	return r.WithContext(ctx), done
+}
+
+func safeRouteContext(requestPath string) (route, setupID, artifactID, importID, jobID string) {
+	segments := strings.Split(strings.Trim(requestPath, "/"), "/")
+	switch requestPath {
+	case "/healthz":
+		return "healthz", "", "", "", ""
+	case "/readyz":
+		return "readyz", "", "", "", ""
+	case "/api/v1/capabilities":
+		return "capabilities", "", "", "", ""
+	case "/api/v1/setups":
+		return "setups", "", "", "", ""
+	case "/api/v1/setups/name-check":
+		return "setup-name-check", "", "", "", ""
+	case "/api/v1/setup-imports":
+		return "setup-imports", "", "", "", ""
+	case "/api/v1/setup-imports/preflight":
+		return "setup-import-preflight", "", "", "", ""
+	case "/api/v1/current-setup":
+		return "current-setup", "", "", "", ""
+	case "/api/v1/recent-setups":
+		return "recent-setups", "", "", "", ""
+	case "/api/v1/ui-state":
+		return "ui-state", "", "", "", ""
+	case "/api/v1/jobs":
+		return "jobs", "", "", "", ""
+	}
+	if len(segments) >= 4 && segments[0] == "api" && segments[1] == "v1" &&
+		segments[2] == "setup-imports" && safeEntityID(segments[3]) {
+		importID = segments[3]
+		route = "setup-import"
+		if len(segments) >= 5 {
+			switch segments[4] {
+			case "artifacts":
+				route = "setup-import-artifacts"
+				if len(segments) >= 6 && safeEntityID(segments[5]) {
+					artifactID = segments[5]
+				}
+			case "commit":
+				route = "setup-import-commit"
+			}
+		}
+		return route, "", artifactID, importID, ""
+	}
+	if len(segments) >= 4 && segments[0] == "api" && segments[1] == "v1" && segments[2] == "setups" && safeEntityID(segments[3]) {
+		setupID = segments[3]
+		route = "setup"
+		if len(segments) >= 5 {
+			switch segments[4] {
+			case "programs":
+				route = "setup-programs"
+				if len(segments) >= 6 && safeEntityID(segments[5]) {
+					artifactID = segments[5]
+				}
+			case "setup-sheet", "upload-jobs", "validate", "duplicate", "archive", "restore", "delete-plan", "audit", "validations":
+				route = "setup-" + segments[4]
+			}
+		}
+		return route, setupID, artifactID, "", ""
+	}
+	if len(segments) >= 4 && segments[0] == "api" && segments[1] == "v1" && segments[2] == "jobs" && safeEntityID(segments[3]) {
+		if len(segments) == 4 {
+			return "job", "", "", "", segments[3]
+		}
+		if len(segments) == 5 && segments[4] == "upload" {
+			return "job-upload", "", "", "", segments[3]
+		}
+	}
+	if strings.HasPrefix(requestPath, "/api/") {
+		return "unknown-api", "", "", "", ""
+	}
+	return "frontend", "", "", "", ""
+}
+
+func safeEntityID(value string) bool {
+	if len(value) != 32 {
+		return false
+	}
+	for index := range len(value) {
+		character := value[index]
+		if (character < '0' || character > '9') && (character < 'a' || character > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *Server) route(w http.ResponseWriter, r *http.Request, requestID string) {
@@ -135,6 +346,12 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, requestID string)
 	case "/api/v1/capabilities":
 		s.capabilities(w, r, requestID)
 	default:
+		if strings.HasPrefix(r.URL.Path, "/api/v1/setups/") && s.routeContent(w, r, requestID) {
+			return
+		}
+		if s.service != nil && strings.HasPrefix(r.URL.Path, "/api/v1/") && s.routeDomain(w, r, requestID) {
+			return
+		}
 		if strings.HasPrefix(r.URL.Path, "/api/") || r.URL.Path == "/fs" || strings.HasPrefix(r.URL.Path, "/fs/") {
 			writeError(w, http.StatusNotFound, requestID, "NOT_FOUND", "The requested resource was not found.", nil, false)
 			return
@@ -249,16 +466,33 @@ func (s *Server) authorizeMutation(r *http.Request) bool {
 	if !isMutation(r.Method) || s.shuttingDown.Load() {
 		return false
 	}
-	if _, allowed := s.allowedHosts[strings.ToLower(r.Host)]; !allowed {
-		return false
+	requestHost := strings.ToLower(r.Host)
+	if s.config.RemoteAccess {
+		// A wildcard remote listen address cannot enumerate the operator-facing
+		// DNS names. Validate the Host syntax and bind Origin to exactly that
+		// authority; authentication and CSRF are enforced independently.
+		if !httpguts.ValidHostHeader(r.Host) {
+			return false
+		}
+	} else {
+		if _, allowed := s.allowedHosts[requestHost]; !allowed {
+			return false
+		}
 	}
 	if origin := strings.TrimSpace(r.Header.Get("Origin")); origin != "" {
 		parsed, err := url.Parse(origin)
 		if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.User != nil {
 			return false
 		}
-		if _, allowed := s.allowedHosts[strings.ToLower(parsed.Host)]; !allowed {
-			return false
+		originHost := strings.ToLower(parsed.Host)
+		if s.config.RemoteAccess {
+			if originHost != requestHost {
+				return false
+			}
+		} else {
+			if _, allowed := s.allowedHosts[originHost]; !allowed {
+				return false
+			}
 		}
 	}
 	supplied := r.Header.Get("X-CSRF-Token")
@@ -266,6 +500,9 @@ func (s *Server) authorizeMutation(r *http.Request) bool {
 }
 
 func (s *Server) authorizeRemote(r *http.Request) bool {
+	if username, password, ok := r.BasicAuth(); ok && username == "websetup" {
+		return constantTimeEqual(s.config.RemoteAuthToken, password)
+	}
 	prefix := "Bearer "
 	header := r.Header.Get("Authorization")
 	if !strings.HasPrefix(header, prefix) {
@@ -286,15 +523,32 @@ func allowedHosts(listenAddress string) (map[string]struct{}, error) {
 	if err != nil {
 		return nil, err
 	}
+	portNumber, err := strconv.ParseUint(port, 10, 16)
+	if err != nil || portNumber == 0 {
+		return nil, errors.New("invalid listen port")
+	}
+	port = strconv.FormatUint(portNumber, 10)
 	host = strings.Trim(host, "[]")
-	hosts := map[string]struct{}{strings.ToLower(net.JoinHostPort(host, port)): {}}
+	hosts := make(map[string]struct{})
+	addAllowedAuthority(hosts, host, port)
 	ip := net.ParseIP(host)
 	if host == "localhost" || (ip != nil && ip.IsLoopback()) {
 		for _, loopback := range []string{"localhost", "127.0.0.1", "::1"} {
-			hosts[strings.ToLower(net.JoinHostPort(loopback, port))] = struct{}{}
+			addAllowedAuthority(hosts, loopback, port)
 		}
 	}
 	return hosts, nil
+}
+
+func addAllowedAuthority(hosts map[string]struct{}, host, port string) {
+	hosts[strings.ToLower(net.JoinHostPort(host, port))] = struct{}{}
+	if port != "80" && port != "443" {
+		return
+	}
+	if strings.Contains(host, ":") {
+		host = "[" + strings.Trim(host, "[]") + "]"
+	}
+	hosts[strings.ToLower(host)] = struct{}{}
 }
 
 func setSecurityHeaders(header http.Header) {
@@ -363,8 +617,11 @@ func writeJSONForRequest(w http.ResponseWriter, r *http.Request, status int, val
 }
 
 func writeError(w http.ResponseWriter, status int, requestID, code, message string, details any, retryable bool) {
+	if recorder, ok := w.(interface{ setErrorCode(string) }); ok {
+		recorder.setErrorCode(code)
+	}
 	payload := map[string]any{
-		"code": code, "message": message, "requestId": requestID, "retryable": retryable,
+		"code": code, "message": message, "request_id": requestID, "retryable": retryable,
 	}
 	if details != nil {
 		payload["details"] = details
@@ -374,9 +631,51 @@ func writeError(w http.ResponseWriter, status int, requestID, code, message stri
 
 type statusRecorder struct {
 	http.ResponseWriter
-	status      int
-	bytes       int64
-	wroteHeader bool
+	status           int
+	bytes            int64
+	wroteHeader      bool
+	errorCode        string
+	writeIdleTimeout time.Duration
+}
+
+// Unwrap lets http.ResponseController reach the server response writer. This
+// is used to enforce an idle timeout for streaming request bodies without a
+// fixed wall-clock deadline that would reject legitimately large uploads.
+func (r *statusRecorder) Unwrap() http.ResponseWriter { return r.ResponseWriter }
+
+type idleDeadlineReadCloser struct {
+	io.ReadCloser
+	controller *http.ResponseController
+	timeout    time.Duration
+	bytes      int64
+}
+
+func (r *idleDeadlineReadCloser) Read(buffer []byte) (int, error) {
+	if r.timeout > 0 {
+		if err := r.controller.SetReadDeadline(time.Now().Add(r.timeout)); err != nil {
+			return 0, err
+		}
+	}
+	count, err := r.ReadCloser.Read(buffer)
+	r.bytes += int64(count)
+	return count, err
+}
+
+func (r *statusRecorder) setErrorCode(code string) {
+	// Error codes are constants controlled by this process, never arbitrary
+	// request data. Keep a defensive bound so logging cannot be amplified by a
+	// future caller.
+	if len(code) > 64 {
+		code = "INTERNAL_ERROR"
+	}
+	r.errorCode = code
+}
+
+func (r *statusRecorder) result() string {
+	if r.status >= http.StatusBadRequest || r.errorCode != "" {
+		return "failed"
+	}
+	return "succeeded"
 }
 
 func (r *statusRecorder) WriteHeader(status int) {
@@ -385,6 +684,9 @@ func (r *statusRecorder) WriteHeader(status int) {
 	}
 	r.status = status
 	r.wroteHeader = true
+	if r.writeIdleTimeout > 0 {
+		_ = http.NewResponseController(r).SetWriteDeadline(time.Now().Add(r.writeIdleTimeout))
+	}
 	r.ResponseWriter.WriteHeader(status)
 }
 
@@ -392,7 +694,15 @@ func (r *statusRecorder) Write(buffer []byte) (int, error) {
 	if !r.wroteHeader {
 		r.WriteHeader(http.StatusOK)
 	}
+	if r.writeIdleTimeout > 0 {
+		if err := http.NewResponseController(r).SetWriteDeadline(time.Now().Add(r.writeIdleTimeout)); err != nil {
+			return 0, err
+		}
+	}
 	count, err := r.ResponseWriter.Write(buffer)
 	r.bytes += int64(count)
+	if err != nil || count != len(buffer) {
+		r.setErrorCode("RESPONSE_WRITE_FAILED")
+	}
 	return count, err
 }

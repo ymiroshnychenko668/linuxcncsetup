@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+
+	"github.com/ymiroshnychenko668/linuxcncsetup/websetupmanager/internal/libraryidentity"
 )
 
 // EnsureLibrary records the stable identity of a managed library. Reopening
@@ -36,7 +38,28 @@ func (d *DB) EnsureLibrary(ctx context.Context, id, fingerprint string) (finalEr
 	switch {
 	case err == nil:
 		if stored != fingerprint {
-			return ErrLibraryFingerprintMismatch
+			// Pre-production builds derived the fingerprint from device/inode,
+			// which made a matched cold backup impossible to restore elsewhere.
+			// Migrate only to the exact portable derivation of this same random
+			// library marker; arbitrary mismatches remain rejected.
+			if fingerprint != libraryidentity.Fingerprint(id) {
+				return ErrLibraryFingerprintMismatch
+			}
+			var otherID string
+			lookupErr := tx.QueryRowContext(ctx,
+				"SELECT id FROM library_instances WHERE fingerprint = ?", fingerprint,
+			).Scan(&otherID)
+			if lookupErr == nil && otherID != id {
+				return ErrLibraryFingerprintMismatch
+			}
+			if lookupErr != nil && !errors.Is(lookupErr, sql.ErrNoRows) {
+				return fmt.Errorf("check portable library identity: %w", lookupErr)
+			}
+			if _, err := tx.ExecContext(ctx,
+				"UPDATE library_instances SET fingerprint = ? WHERE id = ?", fingerprint, id,
+			); err != nil {
+				return fmt.Errorf("migrate portable library identity: %w", err)
+			}
 		}
 		return tx.Commit()
 	case !errors.Is(err, sql.ErrNoRows):

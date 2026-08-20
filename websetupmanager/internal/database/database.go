@@ -26,10 +26,19 @@ const (
 // exist and must not be a symbolic link. Filename, when set, is a basename;
 // paths are deliberately rejected so callers cannot escape StateDir.
 type Options struct {
-	StateDir     string
-	Filename     string
-	BusyTimeout  time.Duration
-	MaxOpenConns int
+	StateDir              string
+	Filename              string
+	BusyTimeout           time.Duration
+	MaxOpenConns          int
+	ExpectedStateIdentity *StateDirectoryIdentity
+}
+
+// StateDirectoryIdentity pins database startup to a state directory already
+// opened and validated by the storage layer. It prevents a pathname rename or
+// replacement from splitting staged content and SQLite across two roots.
+type StateDirectoryIdentity struct {
+	Device uint64
+	Inode  uint64
 }
 
 // DB owns both the database/sql pool and the single-process state lock.
@@ -79,7 +88,7 @@ func OpenWithOptions(ctx context.Context, opts Options) (_ *DB, finalErr error) 
 	if err != nil {
 		return nil, fmt.Errorf("%w: resolve directory: %v", ErrInvalidStateDir, err)
 	}
-	lock, err := acquireProcessLock(stateDir)
+	lock, err := acquireProcessLock(stateDir, opts.ExpectedStateIdentity)
 	if err != nil {
 		return nil, err
 	}
@@ -88,12 +97,18 @@ func OpenWithOptions(ctx context.Context, opts Options) (_ *DB, finalErr error) 
 			_ = lock.Close()
 		}
 	}()
+	if err := cleanupBackupTemps(lock.dirFD); err != nil {
+		return nil, fmt.Errorf("%w: clean interrupted database backup", ErrInvalidStateDir)
+	}
 
 	if err := inspectDatabaseFile(lock.dirFD, filename); err != nil {
 		return nil, err
 	}
 
-	dsn := sqliteDSN(filepath.Join(stateDir, filename), opts.BusyTimeout)
+	// Keep every lazily opened pool connection anchored to the directory that
+	// was inspected and locked above. Reusing the configured pathname here
+	// would let a rename/replacement make one pool span two physical databases.
+	dsn := sqliteDSN(fmt.Sprintf("/proc/self/fd/%d/%s", lock.dirFD, filename), opts.BusyTimeout)
 	sqldb, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open SQLite database: %w", err)
@@ -116,7 +131,14 @@ func OpenWithOptions(ctx context.Context, opts Options) (_ *DB, finalErr error) 
 	if err := quickCheck(ctx, sqldb); err != nil {
 		return nil, err
 	}
-	if err := applyMigrations(ctx, sqldb); err != nil {
+	startupDB := &DB{sql: sqldb, lock: lock, stateDir: stateDir}
+	if err := applyMigrations(ctx, sqldb, func(ctx context.Context, fromVersion, toVersion int64) error {
+		backupName, err := migrationBackupName(fromVersion, toVersion)
+		if err != nil {
+			return err
+		}
+		return startupDB.Backup(ctx, backupName)
+	}); err != nil {
 		return nil, err
 	}
 	if err := quickCheck(ctx, sqldb); err != nil {
@@ -139,16 +161,18 @@ func validBasename(name string) bool {
 }
 
 func inspectDatabaseFile(dirFD int, filename string) error {
-	var stat unix.Stat_t
-	err := unix.Fstatat(dirFD, filename, &stat, unix.AT_SYMLINK_NOFOLLOW)
-	if errors.Is(err, unix.ENOENT) {
-		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("%w: inspect database file: %v", ErrInvalidStateDir, err)
-	}
-	if stat.Mode&unix.S_IFMT != unix.S_IFREG {
-		return fmt.Errorf("%w: database is not a regular file", ErrInvalidStateDir)
+	for _, name := range []string{filename, filename + "-wal", filename + "-shm", filename + "-journal"} {
+		var stat unix.Stat_t
+		err := unix.Fstatat(dirFD, name, &stat, unix.AT_SYMLINK_NOFOLLOW)
+		if errors.Is(err, unix.ENOENT) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("%w: inspect database control file: %v", ErrInvalidStateDir, err)
+		}
+		if stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Nlink != 1 || stat.Mode&0o022 != 0 {
+			return fmt.Errorf("%w: database control file is not a private regular file", ErrInvalidStateDir)
+		}
 	}
 	return nil
 }

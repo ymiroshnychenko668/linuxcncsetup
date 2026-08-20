@@ -38,8 +38,10 @@ func CheckExpectedRevision(actual, expected Revision) error {
 }
 
 // NextMutation returns the state and revision produced by an atomic successful
-// metadata or composition mutation. Ready and repaired-attention setups become
-// draft and must be validated again. Archived setups cannot be mutated.
+// metadata or composition mutation. Ready setups become draft and must be
+// validated again. Attention is sticky across user mutations: only a storage
+// verification boundary may prove that its external cause has been repaired.
+// Archived setups cannot be mutated.
 func NextMutation(status SetupStatus, actual, expected Revision) (SetupStatus, Revision, error) {
 	if err := CheckExpectedRevision(actual, expected); err != nil {
 		return status, actual, err
@@ -50,6 +52,9 @@ func NextMutation(status SetupStatus, actual, expected Revision) (SetupStatus, R
 	next, err := NextRevision(actual)
 	if err != nil {
 		return status, actual, err
+	}
+	if status == SetupStatusAttention {
+		return SetupStatusAttention, next, nil
 	}
 	return SetupStatusDraft, next, nil
 }
