@@ -6,10 +6,12 @@
 ## D-001: production baseline
 
 Первая сборка поддерживает Linux amd64/arm64, Go 1.26.5+, Node используется
-только при сборке. Базовая целевая ОС — Debian 12/LinuxCNC с ext4 или другой
-локальной POSIX filesystem, поддерживающей atomic rename, fsync, sparse files и
-64-bit offsets. На Linux предпочитается `openat2`; root-anchored `*at` fallback
-покрывается тем же security suite.
+только при сборке. Зафиксированный development/первичный acceptance baseline:
+Debian 13.5 Trixie, kernel `6.12.95+deb13-rt-amd64` PREEMPT_RT, x86_64 и ext4.
+Filesystem должна поддерживать atomic rename, fsync, sparse files и 64-bit
+offsets. `openat2` с требуемыми resolve flags проверен реальным syscall;
+root-anchored `*at` fallback покрывается тем же suite. Linux arm64 production
+binary cross-build проходит, но runtime qualification требует arm64-хост.
 
 ## D-002: storage roots
 
@@ -36,9 +38,9 @@ API field.
 
 Default listener — `127.0.0.1:8080`. Local mode использует same-origin Host /
 Origin checks и случайный CSRF token, читаемый только через same-origin
-capabilities. Не-loopback bind будет разрешён только при явной remote настройке
-с backend authentication и TLS (или явно доверенным TLS proxy); иначе startup
-завершается ошибкой. Детали конфигурации будут закреплены вместе с config tests.
+capabilities. Не-loopback bind разрешён только при явной remote настройке,
+Bearer token длиной не менее 32 символов и TLS 1.3 (или явно доверенном TLS
+proxy); иначе startup завершается ошибкой.
 
 ## D-006: document viewers
 
@@ -54,3 +56,52 @@ absolute path, cookie или API token.
 file behavior в development environment. Числа реального LinuxCNC компьютера
 будут отдельно записаны как target acceptance evidence; код не будет объявлять
 неизмеренное значение подтверждённым.
+
+## D-008: SQLite implementation
+
+Используется pure-Go `modernc.org/sqlite` v1.57.0. Это даёт один статический
+amd64/arm64 binary без системного SQLite/CGO и одновременно предоставляет
+SQLite online backup API для необратимых migrations. Подключение включает WAL,
+foreign keys, busy timeout, synchronous FULL и process lock.
+
+## D-009: names and collisions
+
+Setup name ограничено 200 Unicode code points/800 UTF-8 bytes; artifact basename
+— 255 code points и максимум 255 bytes. NUL/control, separators, volume paths,
+`.`/`..`, trailing dot/space отвергаются. Collision key — NFC + Unicode
+case-fold; display name хранится отдельно от внутреннего object key.
+
+## D-010: TTL and irreversible cancellation
+
+Idempotency result хранится 24 часа. Delete confirmation token живёт 5 минут и
+привязан к setup/revision/name. После atomic DB commit job является terminal;
+поздняя отмена возвращает стабильный terminal result и не выполняет опасную
+компенсацию.
+
+## D-011: current setup after mutation
+
+Пользовательская или внешняя мутация не снимает current автоматически. Ссылка
+остаётся, а UI показывает блокирующий `draft`/`attention`, пока оператор явно не
+снимет current, не выберет другой или не провалидирует новую revision.
+
+## D-012: operation jobs and external reconciliation
+
+Import, add/replace, validation, duplicate и permanent delete всегда имеют job
+record; короткие metadata/state mutations остаются синхронными. Identity
+проверяется при content/validation/mutation, на startup и ограниченным
+периодическим scanner; неизвестный внешний object никогда не наследует artifact
+ID только из-за совпадения display name.
+
+## D-013: UI client identity
+
+Browser создаёт один случайный client ID в localStorage. Содержательное state
+хранится SQLite по `library_id + client_id`; только визуальные размеры могут
+оставаться локальными. Отсутствующий setup восстанавливается как empty selection,
+а не заменяется объектом с тем же именем.
+
+## D-014: large-file fixtures
+
+Sparse 10 GiB real file проверяет 64-bit HEAD/Range/RSS, но holes содержат NUL и
+не являются валидным G-code. Поэтому preview/search отдельно тестируются на
+generator-backed логическом ASCII stream с match у конца; эти сценарии нельзя
+ошибочно объединять.

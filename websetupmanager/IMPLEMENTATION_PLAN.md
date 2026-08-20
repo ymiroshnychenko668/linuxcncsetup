@@ -151,9 +151,9 @@ and artifact version before making the new DB link visible.
 
 | P0 IDs | Implementation / evidence | Status |
 |---|---|---|
-| `FR-DEP-001`–`FR-DEP-006` | process/embed/config/health tests + production smoke | planned |
-| `FR-CFG-001`–`FR-CFG-008` | `internal/config`, startup integration tests | planned |
-| `FR-SET-001`–`FR-SET-009` | schema/service domain suite | planned |
+| `FR-DEP-001`–`FR-DEP-006` | process/embed/config/health tests + production smoke | verified |
+| `FR-CFG-001`–`FR-CFG-008` | `internal/config`, startup integration tests | verified |
+| `FR-SET-001`–`FR-SET-009` | schema/domain types verified; service operations pending | implemented |
 | `FR-STATE-001`–`FR-STATE-007` | transition/reconciliation tests + status UI tests | planned |
 | `FR-CURRENT-001`–`FR-CURRENT-006` | current setup service/API/UI/audit tests | planned |
 | `FR-VAL-001`–`FR-VAL-007` | revision-bound validation job tests + UI disclaimer | planned |
@@ -171,14 +171,27 @@ and artifact version before making the new DB link visible.
 | `SEC-SS-001`–`SEC-SS-007` | sanitizer/CSP/sandbox/PDF link tests | planned |
 | `FR-SEARCH-001`–`FR-SEARCH-003` | SQL query/cursor and library UI tests | planned |
 | `FR-HIS-001`–`FR-HIS-006` | recent/UI-state persistence tests | planned |
-| `SEC-PATH-001`–`SEC-PATH-005`, `SEC-PATH-010`–`SEC-PATH-017` | root-FD path-security suite | planned |
-| `SEC-RACE-001`–`SEC-RACE-005` | version/substitution/concurrent mutation tests | planned |
-| `DATA-001`–`DATA-010` | database/migration/lock/recovery/GC tests | planned |
-| `API-001`–`API-007` | contract/idempotency/cursor/content/job tests | planned |
-| `SEC-NET-001`–`SEC-NET-008` | bind/config/origin/CSRF/CSP/cache tests | planned |
+| `SEC-PATH-001`–`SEC-PATH-005`, `SEC-PATH-010`–`SEC-PATH-017` | root-FD/openat2 base suite verified; domain content attack matrix pending | implemented |
+| `SEC-RACE-001`–`SEC-RACE-005` | object version/substitution base tests pass; mutation races pending | implemented |
+| `DATA-001`–`DATA-006` | database migration/pragma/backup/lock tests | verified |
+| `DATA-007`–`DATA-010` | journal/recovery/ref-safe schema verified; service/GC cases pending | implemented |
+| `API-001`–`API-007` | stable envelope/security scaffold verified; domain contracts pending | implemented |
+| `SEC-NET-001`–`SEC-NET-008` | bind/remote fail-closed/auth/origin/CSRF/CSP/cache tests | verified |
 | `NFR-PERF-001`–`NFR-PERF-008` | benchmark/smoke/10k/sparse resource scenarios | planned |
-| `NFR-REL-001`–`NFR-REL-006` | interruption/restart/attention/current recovery tests | planned |
-| `NFR-LOG-001`–`NFR-LOG-004` | structured logging/audit/redaction tests | planned |
+| `NFR-REL-001`–`NFR-REL-006` | graceful shutdown/startup recovery foundation verified; domain cases pending | implemented |
+| `NFR-LOG-001`–`NFR-LOG-004` | safe structured request logging verified; operation audit pending | implemented |
+
+## Другие обязательства P0 без ID
+
+| Source | Coverage | Status |
+|---|---|---|
+| §4.1 / §4.3 product boundaries | route inventory, domain DTOs, library-only SPA; no file browser/execution API | implemented |
+| §6.1 configuration defaults | config constants and unit tests | verified |
+| §14.1 logical schema | embedded migration with all listed tables plus guarded support tables | verified |
+| §15 recommended domain API | route contract implementation and integration tests | planned |
+| §15.1 minimum error-code list | `domain.RequiredErrorCodes` unit test | verified |
+| §17 empty/error states | React component scenarios | planned |
+| §22 Definition of Done | final quality/acceptance checklist | planned |
 
 ## Покрытие AC-01–AC-20
 
