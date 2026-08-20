@@ -1,0 +1,213 @@
+import { render, screen } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { GCodePreview } from './GCodePreview'
+import type { Artifact, Setup } from '../domain'
+import { tokenizeGCode } from '../gcodeHighlight'
+
+const artifact: Artifact = {
+  artifactId: 'a'.repeat(32), setupId: 'b'.repeat(32), role: 'program',
+  displayName: 'main.ngc', mediaType: 'text/plain', byteSize: 0, version: 'c'.repeat(64),
+  position: 0, primary: true, state: 'available', createdAt: '', updatedAt: '',
+}
+const setup: Setup = {
+  setupId: artifact.setupId, libraryId: 'd'.repeat(32), name: 'Корпус', status: 'draft',
+  revision: 2, source: 'created', artifacts: [artifact], createdAt: '', updatedAt: '',
+}
+
+afterEach(() => vi.unstubAllGlobals())
+
+describe('GCodePreview', () => {
+  it('shows an explicit empty state and setup context', () => {
+    render(<GCodePreview setup={setup} artifact={artifact} />)
+    expect(screen.getByRole('heading', { name: 'main.ngc' })).toBeInTheDocument()
+    expect(screen.getByText('Программа пуста.')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Setup Sheet' })).toBeDisabled()
+  })
+
+  it('highlights domain tokens without HTML injection', () => {
+		const tokens = tokenizeGCode('G1 X12.5 F300 ; move <script>')
+		expect(tokens.some((token) => token.kind === 'command' && token.text === 'G1')).toBe(true)
+		expect(tokens.some((token) => token.kind === 'axis' && token.text === 'X12.5')).toBe(true)
+		expect(tokens.map((token) => token.text).join('')).toContain('<script>')
+  })
+
+  it('uses bounded natural-height rows when wrapping is enabled', async () => {
+    const user = userEvent.setup()
+    const { container } = render(<GCodePreview setup={setup} artifact={artifact} />)
+    await user.click(screen.getByRole('checkbox', { name: 'Перенос строк' }))
+    expect(container.querySelector('.code-viewport')).toHaveClass('code-viewport--wrap')
+    const row = container.querySelector<HTMLElement>('.code-line')!
+    expect(row).toHaveClass('code-line--wrapped')
+    expect(row.style.position).not.toBe('absolute')
+    expect(row.style.height).toBe('')
+  })
+
+	it('pages through the complete virtual line range while wrapped rows use natural heights', async () => {
+		class IndexWorker {
+			private listener?: (event: MessageEvent<unknown>) => void
+			addEventListener(_type: string, listener: EventListener) { this.listener = listener as (event: MessageEvent<unknown>) => void }
+			removeEventListener() { this.listener = undefined }
+			terminate() { this.listener = undefined }
+			postMessage(message: { type: string; requestId: string }) {
+				if (message.type !== 'index') return
+				queueMicrotask(() => this.listener?.({ data: {
+					type: 'indexResult', requestId: message.requestId, lineCount: 100,
+					entries: [{ line: 1, byteOffset: 0 }],
+				} } as MessageEvent<unknown>))
+			}
+		}
+		vi.stubGlobal('Worker', IndexWorker)
+		vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(new Uint8Array([0x0a]), {
+			status: 206, headers: { etag: `"${artifact.version}"` },
+		})))
+		const user = userEvent.setup()
+		render(<GCodePreview setup={setup} artifact={{ ...artifact, byteSize: 1 }} />)
+		await user.click(screen.getByRole('checkbox', { name: 'Перенос строк' }))
+		const next = await screen.findByRole('button', { name: 'Следующие строки' })
+		expect(next).toBeEnabled()
+		await user.click(next)
+		expect(screen.getByText('Строки 21–65 из 100')).toBeInTheDocument()
+		expect(screen.getByRole('button', { name: 'Предыдущие строки' })).toBeEnabled()
+	})
+
+	it('keeps the sparse index Worker alive when a parent supplies a new callback identity', () => {
+		let workerCount = 0
+		let indexCount = 0
+		class StableWorker {
+			constructor() { workerCount += 1 }
+			addEventListener() {}
+			removeEventListener() {}
+			terminate() {}
+			postMessage(message: { type: string }) {
+				if (message.type === 'index') indexCount += 1
+			}
+		}
+		vi.stubGlobal('Worker', StableWorker)
+		vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(new Uint8Array([0x0a]), {
+			status: 206, headers: { etag: `"${artifact.version}"` },
+		})))
+		const view = render(<GCodePreview setup={setup} artifact={{ ...artifact, byteSize: 1 }} onArtifactChanged={() => undefined} />)
+		expect(workerCount).toBe(1)
+		expect(indexCount).toBe(1)
+		view.rerender(<GCodePreview setup={setup} artifact={{ ...artifact, byteSize: 1 }} onArtifactChanged={() => undefined} />)
+		expect(workerCount).toBe(1)
+		expect(indexCount).toBe(1)
+	})
+
+	it('iteratively reaches a target line beyond a one-megabyte thinned-index gap', async () => {
+		const blockBytes = 1 << 20
+		const firstLine = 'X'.repeat(blockBytes + 32)
+		const bytes = new TextEncoder().encode(`${firstLine}\nTARGET\nTAIL`)
+		const targetOffset = firstLine.length + 1
+		const requestedStarts: number[] = []
+		const requestedVersions: string[] = []
+		class ThinnedIndexWorker {
+			private listener?: (event: MessageEvent<unknown>) => void
+			addEventListener(_type: string, listener: EventListener) { this.listener = listener as (event: MessageEvent<unknown>) => void }
+			removeEventListener() { this.listener = undefined }
+			terminate() { this.listener = undefined }
+			postMessage(message: { type: string; requestId: string }) {
+				if (message.type !== 'index') return
+				queueMicrotask(() => this.listener?.({ data: {
+					type: 'indexResult', requestId: message.requestId, lineCount: 3,
+					entries: [{ line: 1, byteOffset: 0 }],
+				} } as MessageEvent<unknown>))
+			}
+		}
+		vi.stubGlobal('Worker', ThinnedIndexWorker)
+		vi.stubGlobal('fetch', vi.fn().mockImplementation((_url: string, init?: RequestInit) => {
+			const headers = init?.headers as Record<string, string> | undefined
+			const range = headers?.Range
+			const match = /^bytes=(\d+)-(\d+)$/.exec(range ?? '')
+			if (!match) throw new Error(`unexpected range ${range}`)
+			const start = Number(match[1])
+			const end = Number(match[2])
+			requestedStarts.push(start)
+			requestedVersions.push(headers?.['If-Match'] ?? '')
+			return Promise.resolve(new Response(bytes.slice(start, end + 1), {
+				status: 206, headers: { etag: `"${artifact.version}"` },
+			}))
+		}))
+		render(<GCodePreview setup={setup} artifact={{ ...artifact, byteSize: bytes.byteLength }} initialLine={2} />)
+		expect(await screen.findByText('TARGET')).toBeInTheDocument()
+		expect(requestedStarts).toContain(blockBytes)
+		expect(requestedStarts).toContain(targetOffset)
+		expect(requestedStarts.every((start) => start === 0 || start === blockBytes || start === targetOffset)).toBe(true)
+		expect(requestedVersions.every((version) => version === `"${artifact.version}"`)).toBe(true)
+	})
+
+	it('maps hundreds of millions of logical lines onto a bounded browser scroll track', async () => {
+		class HugeIndexWorker {
+			private listener?: (event: MessageEvent<unknown>) => void
+			addEventListener(_type: string, listener: EventListener) { this.listener = listener as (event: MessageEvent<unknown>) => void }
+			removeEventListener() { this.listener = undefined }
+			terminate() { this.listener = undefined }
+			postMessage(message: { type: string; requestId: string }) {
+				if (message.type !== 'index') return
+				queueMicrotask(() => this.listener?.({ data: {
+					type: 'indexResult', requestId: message.requestId, lineCount: 500_000_000,
+					entries: [{ line: 1, byteOffset: 0 }],
+				} } as MessageEvent<unknown>))
+			}
+		}
+		vi.stubGlobal('Worker', HugeIndexWorker)
+		vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(new Uint8Array([0x0a]), {
+			status: 206, headers: { etag: `"${artifact.version}"` },
+		})))
+		const user = userEvent.setup()
+		const { container } = render(<GCodePreview setup={setup} artifact={{ ...artifact, byteSize: 1 }} />)
+		const line = screen.getByRole('spinbutton', { name: 'Строка' })
+		await user.clear(line)
+		await user.type(line, '500000000')
+		await user.click(screen.getByRole('button', { name: 'Перейти' }))
+		const spacer = container.querySelector<HTMLElement>('.code-spacer')!
+		expect(spacer.style.height).toBe('8000000px')
+		const last = screen.getByText('500000000').closest<HTMLElement>('.code-line')!
+		expect(Number.parseFloat(last.style.top)).toBeLessThanOrEqual(8_000_000)
+	})
+
+	it('loads a compact result page to navigate beyond the first large search window', async () => {
+		const requestedOffsets: number[] = []
+		class SearchWorker {
+			private listener?: (event: MessageEvent<unknown>) => void
+			addEventListener(_type: string, listener: EventListener) { this.listener = listener as (event: MessageEvent<unknown>) => void }
+			removeEventListener() { this.listener = undefined }
+			terminate() { this.listener = undefined }
+			postMessage(message: { type: string; requestId: string; matchOffset?: number }) {
+				if (message.type === 'index') {
+					queueMicrotask(() => this.listener?.({ data: {
+						type: 'indexResult', requestId: message.requestId, lineCount: 2_000,
+						entries: [{ line: 1, byteOffset: 0 }],
+					} } as MessageEvent<unknown>))
+				}
+				if (message.type === 'search') {
+					const offset = message.matchOffset ?? 0
+					requestedOffsets.push(offset)
+					const length = Math.min(512, 1_001 - offset)
+					const lines = Float64Array.from({ length }, (_, index) => offset + index + 1)
+					queueMicrotask(() => this.listener?.({ data: {
+						type: 'searchResult', requestId: message.requestId, totalMatches: 1_001,
+						lineNumbers: lines, matchOffset: offset, truncated: true,
+					} } as MessageEvent<unknown>))
+				}
+			}
+		}
+		vi.stubGlobal('Worker', SearchWorker)
+		vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(new Uint8Array([0x0a]), {
+			status: 206, headers: { etag: `"${artifact.version}"` },
+		})))
+		const user = userEvent.setup()
+		render(<GCodePreview setup={setup} artifact={{ ...artifact, byteSize: 1 }} />)
+		await user.type(screen.getByRole('searchbox'), 'X')
+		await user.click(screen.getByRole('button', { name: 'Найти' }))
+		expect(await screen.findByText(/1 из 1001 · компактные страницы/)).toBeInTheDocument()
+		const ordinal = screen.getByRole('spinbutton', { name: 'Совпадение №' })
+		await user.clear(ordinal)
+		await user.type(ordinal, '1001')
+		await user.click(screen.getByRole('button', { name: 'Перейти к совпадению' }))
+		expect(await screen.findByText(/1001 из 1001 · компактные страницы/)).toBeInTheDocument()
+		expect(requestedOffsets).toEqual([0, 512])
+		expect(screen.getByRole('button', { name: 'Совпадение 1001, строка 1001' })).toHaveAttribute('aria-current', 'true')
+	})
+})

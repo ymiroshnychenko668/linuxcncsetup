@@ -121,7 +121,17 @@ export function Modal({
       document.removeEventListener('focusin', onFocusIn)
       document.body.style.overflow = previousOverflow
       const returnTarget = explicitReturnTarget ?? previouslyFocused
-      if (returnTarget?.isConnected) returnTarget.focus()
+      if (returnTarget?.isConnected) {
+        returnTarget.focus()
+        return
+      }
+      // A successful mutation may legitimately replace the button that opened
+      // the dialog. Never leave focus attached to the removed portal subtree;
+      // return to the stable application landmark in that case.
+      const applicationMain = document.getElementById('main-content')
+      if (applicationMain instanceof HTMLElement && applicationMain.isConnected) {
+        applicationMain.focus()
+      }
     }
   }, [initialFocusRef, returnFocusRef])
 

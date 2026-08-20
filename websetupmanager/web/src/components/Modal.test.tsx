@@ -60,6 +60,22 @@ describe('Modal', () => {
     returnTarget.remove()
   })
 
+  it('returns focus to the application landmark when a mutation replaces its initiator', () => {
+    const main = document.createElement('main')
+    main.id = 'main-content'
+    main.tabIndex = -1
+    const trigger = document.createElement('button')
+    main.appendChild(trigger)
+    document.body.appendChild(main)
+    trigger.focus()
+    const { unmount } = render(<Modal title="Архивирование" onClose={vi.fn()}><button type="button">Подтвердить</button></Modal>)
+
+    trigger.remove()
+    unmount()
+    expect(main).toHaveFocus()
+    main.remove()
+  })
+
   it('supports Escape and backdrop closing, but blocks both while busy', () => {
     const onClose = vi.fn()
     const { container, rerender } = render(
