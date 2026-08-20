@@ -22,11 +22,14 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/ymiroshnychenko668/linuxcncsetup/websetupmanager/internal/auth"
 	"github.com/ymiroshnychenko668/linuxcncsetup/websetupmanager/internal/service"
 	"golang.org/x/net/http/httpguts"
 )
 
 const appCSP = "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'self'; form-action 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; connect-src 'self'; worker-src 'self' blob:; frame-src 'self'"
+
+const remoteSessionCookieName = "__Host-websetupmanager_session"
 
 // Checker is implemented by the database and managed-root health checks.
 type Checker interface {
@@ -50,24 +53,40 @@ type Config struct {
 	RequestReadIdleTimeout    time.Duration
 	ResponseWriteIdleTimeout  time.Duration
 	RemoteAccess              bool
+	AllowedUser               string
+	AuthRememberTimeout       time.Duration
+	AuthConcurrency           int
 	RemoteAuthToken           string
+}
+
+// AuthDependencies contains the remote-browser authentication dependencies.
+// It is deliberately separate from Config so tests and local-only callers do
+// not need to manufacture authentication state.
+type AuthDependencies struct {
+	Authenticator auth.Authenticator
+	Sessions      *auth.Store
+	Throttler     *auth.Throttler
 }
 
 // Server is the root HTTP handler.
 type Server struct {
-	config       Config
-	database     Checker
-	storage      Checker
-	static       fs.FS
-	fileServer   http.Handler
-	logger       *slog.Logger
-	csrfToken    string
-	allowedHosts map[string]struct{}
-	shuttingDown atomic.Bool
-	service      *service.Service
-	requestsMu   sync.Mutex
-	requests     map[uint64]trackedRequest
-	nextRequest  atomic.Uint64
+	config        Config
+	database      Checker
+	storage       Checker
+	static        fs.FS
+	fileServer    http.Handler
+	logger        *slog.Logger
+	csrfToken     string
+	allowedHosts  map[string]struct{}
+	shuttingDown  atomic.Bool
+	service       *service.Service
+	authenticator auth.Authenticator
+	authSessions  *auth.Store
+	throttler     *auth.Throttler
+	authSlots     chan struct{}
+	requestsMu    sync.Mutex
+	requests      map[uint64]trackedRequest
+	nextRequest   atomic.Uint64
 }
 
 type trackedRequest struct {
@@ -77,8 +96,23 @@ type trackedRequest struct {
 
 // New constructs a secure same-origin handler.
 func New(configuration Config, database, storage Checker, static fs.FS, logger *slog.Logger) (*Server, error) {
+	return newServer(configuration, database, storage, static, AuthDependencies{}, logger)
+}
+
+// NewAuthenticated constructs a handler with remote browser authentication.
+// Remote mode fails closed unless all authentication dependencies are present.
+func NewAuthenticated(configuration Config, database, storage Checker, static fs.FS, authentication AuthDependencies, logger *slog.Logger) (*Server, error) {
+	return newServer(configuration, database, storage, static, authentication, logger)
+}
+
+func newServer(configuration Config, database, storage Checker, static fs.FS, authentication AuthDependencies, logger *slog.Logger) (*Server, error) {
 	if database == nil || storage == nil || static == nil {
 		return nil, errors.New("HTTP dependencies are incomplete")
+	}
+	if configuration.RemoteAccess && (configuration.AllowedUser == "" || configuration.AuthRememberTimeout <= 0 ||
+		configuration.AuthConcurrency <= 0 || authentication.Authenticator == nil ||
+		authentication.Sessions == nil || authentication.Throttler == nil) {
+		return nil, errors.New("remote authentication dependencies are incomplete")
 	}
 	if logger == nil {
 		logger = slog.New(slog.DiscardHandler)
@@ -95,16 +129,31 @@ func New(configuration Config, database, storage Checker, static fs.FS, logger *
 		config: configuration, database: database, storage: storage, static: static,
 		fileServer: http.FileServer(http.FS(static)), logger: logger,
 		csrfToken: token, allowedHosts: hosts, requests: make(map[uint64]trackedRequest),
+		authenticator: authentication.Authenticator, authSessions: authentication.Sessions,
+		throttler: authentication.Throttler,
+	}
+	if configuration.RemoteAccess {
+		server.authSlots = make(chan struct{}, configuration.AuthConcurrency)
 	}
 	return server, nil
 }
 
 // NewWithService is New with the setup-domain implementation enabled.
 func NewWithService(configuration Config, database, storage Checker, application *service.Service, static fs.FS, logger *slog.Logger) (*Server, error) {
+	return newWithService(configuration, database, storage, application, static, AuthDependencies{}, logger)
+}
+
+// NewWithServiceAuthenticated is NewWithService with remote browser
+// authentication enabled.
+func NewWithServiceAuthenticated(configuration Config, database, storage Checker, application *service.Service, static fs.FS, authentication AuthDependencies, logger *slog.Logger) (*Server, error) {
+	return newWithService(configuration, database, storage, application, static, authentication, logger)
+}
+
+func newWithService(configuration Config, database, storage Checker, application *service.Service, static fs.FS, authentication AuthDependencies, logger *slog.Logger) (*Server, error) {
 	if application == nil {
 		return nil, errors.New("setup service is unavailable")
 	}
-	server, err := New(configuration, database, storage, static, logger)
+	server, err := newServer(configuration, database, storage, static, authentication, logger)
 	if err != nil {
 		return nil, err
 	}
@@ -212,11 +261,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeError(recorder, http.StatusServiceUnavailable, requestID, "SERVICE_SHUTTING_DOWN", "The service is shutting down.", nil, true)
 		return
 	}
-	if s.config.RemoteAccess && r.URL.Path != "/healthz" && r.URL.Path != "/readyz" && !s.authorizeRemote(r) {
-		recorder.Header().Set("WWW-Authenticate", `Basic realm="Web Setup Manager", charset="UTF-8"`)
-		recorder.Header().Add("WWW-Authenticate", `Bearer realm="web-setup-manager"`)
-		writeError(recorder, http.StatusUnauthorized, requestID, "AUTHENTICATION_REQUIRED", "Authentication is required.", nil, false)
-		return
+	if s.config.RemoteAccess && !isPublicRemoteRoute(r.URL.Path) {
+		principal, ok := s.authenticateRemote(recorder, r, requestID)
+		if !ok {
+			return
+		}
+		r = r.WithContext(withRequestPrincipal(r.Context(), principal))
 	}
 
 	s.route(recorder, r, requestID)
@@ -260,6 +310,12 @@ func safeRouteContext(requestPath string) (route, setupID, artifactID, importID,
 		return "readyz", "", "", "", ""
 	case "/api/v1/capabilities":
 		return "capabilities", "", "", "", ""
+	case "/api/v1/auth/login":
+		return "auth-login", "", "", "", ""
+	case "/api/v1/auth/session":
+		return "auth-session", "", "", "", ""
+	case "/api/v1/auth/logout":
+		return "auth-logout", "", "", "", ""
 	case "/api/v1/setups":
 		return "setups", "", "", "", ""
 	case "/api/v1/setups/name-check":
@@ -345,6 +401,12 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, requestID string)
 		s.ready(w, r, requestID)
 	case "/api/v1/capabilities":
 		s.capabilities(w, r, requestID)
+	case "/api/v1/auth/login":
+		s.login(w, r, requestID)
+	case "/api/v1/auth/session":
+		s.authenticationSession(w, r, requestID)
+	case "/api/v1/auth/logout":
+		s.logout(w, r, requestID)
 	default:
 		if strings.HasPrefix(r.URL.Path, "/api/v1/setups/") && s.routeContent(w, r, requestID) {
 			return
@@ -402,12 +464,16 @@ func (s *Server) capabilities(w http.ResponseWriter, r *http.Request, requestID 
 		return
 	}
 	w.Header().Set("Cache-Control", "no-store")
+	csrfToken := s.csrfToken
+	if principal, ok := requestPrincipalFrom(r.Context()); ok && principal.kind == principalSession {
+		csrfToken = principal.session.CSRFToken
+	}
 	writeJSONForRequest(w, r, http.StatusOK, map[string]any{
 		"libraryId":                 s.config.LibraryID,
 		"libraryAlias":              s.config.LibraryAlias,
 		"gcodeExtensions":           s.config.GCodeExtensions,
 		"requireSetupSheetForReady": s.config.RequireSetupSheetForReady,
-		"csrfToken":                 s.csrfToken,
+		"csrfToken":                 csrfToken,
 		"features": map[string]bool{
 			"setupLibrary": true,
 			"fileBrowser":  false,
@@ -466,6 +532,9 @@ func (s *Server) authorizeMutation(r *http.Request) bool {
 	if !isMutation(r.Method) || s.shuttingDown.Load() {
 		return false
 	}
+	if principal, ok := requestPrincipalFrom(r.Context()); ok && principal.kind == principalSession {
+		return s.authorizeSessionMutation(r, principal.session)
+	}
 	requestHost := strings.ToLower(r.Host)
 	if s.config.RemoteAccess {
 		// A wildcard remote listen address cannot enumerate the operator-facing
@@ -497,18 +566,6 @@ func (s *Server) authorizeMutation(r *http.Request) bool {
 	}
 	supplied := r.Header.Get("X-CSRF-Token")
 	return constantTimeEqual(s.csrfToken, supplied)
-}
-
-func (s *Server) authorizeRemote(r *http.Request) bool {
-	if username, password, ok := r.BasicAuth(); ok && username == "websetup" {
-		return constantTimeEqual(s.config.RemoteAuthToken, password)
-	}
-	prefix := "Bearer "
-	header := r.Header.Get("Authorization")
-	if !strings.HasPrefix(header, prefix) {
-		return false
-	}
-	return constantTimeEqual(s.config.RemoteAuthToken, strings.TrimPrefix(header, prefix))
 }
 
 func constantTimeEqual(expected, supplied string) bool {

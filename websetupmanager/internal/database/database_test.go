@@ -53,6 +53,7 @@ func TestOpenMigratesFullInitialSchema(t *testing.T) {
 	}
 	want := []string{
 		"audit_events",
+		"auth_sessions",
 		"current_setup",
 		"delete_confirmations",
 		"idempotency_requests",
@@ -80,13 +81,14 @@ func TestOpenMigratesFullInitialSchema(t *testing.T) {
 	var version int64
 	var checksum string
 	if err := db.SQL().QueryRow(
-		"SELECT version, checksum FROM schema_migrations",
+		"SELECT version, checksum FROM schema_migrations ORDER BY version DESC LIMIT 1",
 	).Scan(&version, &checksum); err != nil {
 		t.Fatal(err)
 	}
-	if version != migrations[0].version || checksum != migrations[0].checksum {
+	latest := migrations[len(migrations)-1]
+	if version != latest.version || checksum != latest.checksum {
 		t.Fatalf("migration record = (%d, %q), want (%d, %q)",
-			version, checksum, migrations[0].version, migrations[0].checksum)
+			version, checksum, latest.version, latest.checksum)
 	}
 }
 

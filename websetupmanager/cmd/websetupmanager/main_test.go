@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"testing"
 
+	"github.com/ymiroshnychenko668/linuxcncsetup/websetupmanager/internal/auth"
 	"github.com/ymiroshnychenko668/linuxcncsetup/websetupmanager/internal/config"
 	"github.com/ymiroshnychenko668/linuxcncsetup/websetupmanager/internal/database"
 )
@@ -24,6 +25,44 @@ func TestNewWebServerAppliesResourceTimeouts(t *testing.T) {
 		server.ReadTimeout != 0 || server.IdleTimeout != settings.IdleTimeout ||
 		server.MaxHeaderBytes != settings.MaxHeaderBytes {
 		t.Fatalf("unexpected server config: %+v", server)
+	}
+}
+
+func TestAuthenticationScopeBindsSecurityRelevantDeploymentState(t *testing.T) {
+	settings := config.Config{
+		ListenAddress: "192.0.2.10:443", AllowedUser: "operator",
+		PAMService: "websetupmanager",
+	}
+	baseline := authenticationScope(settings, "library-a")
+	if len(baseline) != 64 || baseline != authenticationScope(settings, "library-a") {
+		t.Fatalf("authentication scope is not a stable SHA-256 digest: %q", baseline)
+	}
+	for name, changed := range map[string]config.Config{
+		"listener": func() config.Config { value := settings; value.ListenAddress = "192.0.2.11:443"; return value }(),
+		"account":  func() config.Config { value := settings; value.AllowedUser = "other"; return value }(),
+		"pam":      func() config.Config { value := settings; value.PAMService = "other"; return value }(),
+		"proxy":    func() config.Config { value := settings; value.TrustedTLSProxy = true; return value }(),
+	} {
+		if authenticationScope(changed, "library-a") == baseline {
+			t.Fatalf("%s change retained remembered-session scope", name)
+		}
+	}
+	if authenticationScope(settings, "library-b") == baseline {
+		t.Fatal("library change retained remembered-session scope")
+	}
+}
+
+func TestRemoteAuthenticationFailsClosedWithoutPAMBuild(t *testing.T) {
+	if auth.PAMAvailable() {
+		t.Skip("PAM-tagged build exercises the enabled runtime path")
+	}
+	err := validateAuthenticationRuntime(config.Config{RemoteAccess: true, AllowedUser: "operator"})
+	var classified *operationalError
+	if !errors.As(err, &classified) || classified.code != "AUTHENTICATION_UNAVAILABLE" {
+		t.Fatalf("non-PAM remote runtime error = %#v", err)
+	}
+	if err := validateAuthenticationRuntime(config.Config{}); err != nil {
+		t.Fatalf("local runtime unexpectedly requires PAM: %v", err)
 	}
 }
 

@@ -3,6 +3,7 @@ package httpapi
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"io/fs"
@@ -14,11 +15,157 @@ import (
 	"testing"
 	"testing/fstest"
 	"time"
+
+	"github.com/ymiroshnychenko668/linuxcncsetup/websetupmanager/internal/auth"
 )
 
 type checkStub struct{ err error }
 
 func (c checkStub) Check(context.Context) error { return c.err }
+
+type fakeAuthenticator struct {
+	mu        sync.Mutex
+	users     []string
+	passwords []string
+	err       error
+	entered   chan struct{}
+	release   chan struct{}
+}
+
+func (f *fakeAuthenticator) Authenticate(ctx context.Context, username, password string) error {
+	f.mu.Lock()
+	f.users = append(f.users, username)
+	f.passwords = append(f.passwords, password)
+	entered, release, result := f.entered, f.release, f.err
+	f.mu.Unlock()
+	if entered != nil {
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+	}
+	if release != nil {
+		select {
+		case <-release:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return result
+}
+
+func (f *fakeAuthenticator) calls() ([]string, []string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.users...), append([]string(nil), f.passwords...)
+}
+
+func newRemoteTestServer(t *testing.T, token string, authenticator *fakeAuthenticator, concurrency, attempts int) *Server {
+	t.Helper()
+	files := fstest.MapFS{
+		"index.html":             &fstest.MapFile{Data: []byte("<!doctype html><h1>Setups</h1>")},
+		"assets/app-deadbeef.js": &fstest.MapFile{Data: []byte("console.log('app')")},
+	}
+	if authenticator == nil {
+		authenticator = &fakeAuthenticator{}
+	}
+	if concurrency == 0 {
+		concurrency = 2
+	}
+	if attempts == 0 {
+		attempts = 5
+	}
+	sessions := auth.NewStore(30*time.Minute, 12*time.Hour, 32)
+	t.Cleanup(func() { _ = sessions.Close() })
+	server, err := NewAuthenticated(Config{
+		ListenAddress: "0.0.0.0:8443", LibraryID: "id", LibraryAlias: "Setups",
+		RemoteAccess: true, AllowedUser: "operator", AuthRememberTimeout: 30 * 24 * time.Hour,
+		AuthConcurrency: concurrency, RemoteAuthToken: token,
+	}, checkStub{}, checkStub{}, files, AuthDependencies{
+		Authenticator: authenticator, Sessions: sessions,
+		Throttler: auth.NewThrottler(attempts, 10*time.Minute),
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return server
+}
+
+type authenticationResult struct {
+	cookie        *http.Cookie
+	csrf          string
+	authenticated bool
+	loginRequired bool
+	username      string
+	status        int
+	body          string
+}
+
+func remoteLogin(t *testing.T, server http.Handler, username, password string, remember bool) authenticationResult {
+	return remoteLoginWithCookie(t, server, username, password, remember, nil)
+}
+
+func remoteLoginWithCookie(t *testing.T, server http.Handler, username, password string, remember bool, cookie *http.Cookie) authenticationResult {
+	t.Helper()
+	body, err := json.Marshal(map[string]any{
+		"username": username, "password": password, "rememberMe": remember,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "https://machine.example:8443/api/v1/auth/login", bytes.NewReader(body))
+	request.Host = "machine.example:8443"
+	request.Header.Set("Origin", "https://machine.example:8443")
+	request.Header.Set("Content-Type", "application/json")
+	if cookie != nil {
+		request.AddCookie(cookie)
+	}
+	response := httptest.NewRecorder()
+	server.ServeHTTP(response, request)
+	return decodeAuthenticationResult(t, response)
+}
+
+func decodeAuthenticationResult(t *testing.T, response *httptest.ResponseRecorder) authenticationResult {
+	t.Helper()
+	result := authenticationResult{status: response.Code, body: response.Body.String()}
+	var payload struct {
+		Authenticated bool   `json:"authenticated"`
+		LoginRequired bool   `json:"loginRequired"`
+		CSRF          string `json:"csrfToken"`
+		User          *struct {
+			Username string `json:"username"`
+		} `json:"user"`
+	}
+	if response.Body.Len() != 0 && json.Unmarshal(response.Body.Bytes(), &payload) == nil {
+		result.authenticated = payload.Authenticated
+		result.loginRequired = payload.LoginRequired
+		result.csrf = payload.CSRF
+		if payload.User != nil {
+			result.username = payload.User.Username
+		}
+	}
+	for _, cookie := range response.Result().Cookies() {
+		if cookie.Name == remoteSessionCookieName {
+			result.cookie = cookie
+		}
+	}
+	return result
+}
+
+func remoteRequest(server http.Handler, method, target string, cookie *http.Cookie, csrf string) *httptest.ResponseRecorder {
+	request := httptest.NewRequest(method, "https://machine.example:8443"+target, nil)
+	request.Host = "machine.example:8443"
+	if cookie != nil {
+		request.AddCookie(cookie)
+	}
+	if isMutation(method) {
+		request.Header.Set("Origin", "https://machine.example:8443")
+		request.Header.Set("X-CSRF-Token", csrf)
+	}
+	response := httptest.NewRecorder()
+	server.ServeHTTP(response, request)
+	return response
+}
 
 func newTestServer(t *testing.T, databaseErr, storageErr error) (*Server, *bytes.Buffer) {
 	t.Helper()
@@ -135,57 +282,377 @@ func TestMutationAuthorizationAcceptsBrowserDefaultPortAuthority(t *testing.T) {
 	}
 }
 
-func TestRemoteAPIRequiresConstantTimeBearerAuthentication(t *testing.T) {
-	files := fstest.MapFS{"index.html": &fstest.MapFile{Data: []byte("app")}}
+func TestRemoteStaticIsPublicAndProtectedAPIUsesBearerWithoutBasic(t *testing.T) {
 	token := strings.Repeat("s", 40)
-	server, err := New(Config{
-		ListenAddress: "0.0.0.0:8443", LibraryID: "id", LibraryAlias: "Setups",
-		RemoteAccess: true, RemoteAuthToken: token,
-	}, checkStub{}, checkStub{}, files, nil)
-	if err != nil {
-		t.Fatal(err)
+	server := newRemoteTestServer(t, token, nil, 0, 0)
+	for _, target := range []string{"/", "/setups/example", "/assets/app-deadbeef.js", "/healthz", "/readyz"} {
+		response := remoteRequest(server, http.MethodGet, target, nil, "")
+		if response.Code != http.StatusOK {
+			t.Fatalf("public remote route %q = %d %s", target, response.Code, response.Body.String())
+		}
 	}
-	response := request(server, http.MethodGet, "/api/v1/capabilities")
-	if response.Code != http.StatusUnauthorized || response.Header().Get("WWW-Authenticate") == "" {
-		t.Fatalf("unauthenticated remote = %d", response.Code)
+
+	response := remoteRequest(server, http.MethodGet, "/api/v1/capabilities", nil, "")
+	if response.Code != http.StatusUnauthorized || strings.Contains(response.Header().Get("WWW-Authenticate"), "Basic") ||
+		response.Header().Get("WWW-Authenticate") != `Bearer realm="web-setup-manager"` {
+		t.Fatalf("unauthenticated remote = %d challenge=%q", response.Code, response.Header().Values("WWW-Authenticate"))
 	}
-	req := httptest.NewRequest(http.MethodGet, "http://example/api/v1/capabilities", nil)
-	req.Header.Set("Authorization", "Bearer "+token)
-	recorder := httptest.NewRecorder()
-	server.ServeHTTP(recorder, req)
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("authenticated remote = %d %s", recorder.Code, recorder.Body.String())
+
+	basic := httptest.NewRequest(http.MethodGet, "https://machine.example:8443/api/v1/capabilities", nil)
+	basic.SetBasicAuth("websetup", token)
+	basicResponse := httptest.NewRecorder()
+	server.ServeHTTP(basicResponse, basic)
+	if basicResponse.Code != http.StatusUnauthorized || strings.Contains(strings.Join(basicResponse.Header().Values("WWW-Authenticate"), " "), "Basic") {
+		t.Fatalf("Basic authentication remained enabled: %d %#v", basicResponse.Code, basicResponse.Header().Values("WWW-Authenticate"))
+	}
+
+	bearer := httptest.NewRequest(http.MethodGet, "https://machine.example:8443/api/v1/capabilities", nil)
+	bearer.Header.Set("Authorization", "Bearer "+token)
+	bearerResponse := httptest.NewRecorder()
+	server.ServeHTTP(bearerResponse, bearer)
+	if bearerResponse.Code != http.StatusOK || !strings.Contains(bearerResponse.Body.String(), server.csrfToken) {
+		t.Fatalf("Bearer authentication = %d %s", bearerResponse.Code, bearerResponse.Body.String())
 	}
 }
 
-func TestRemoteMutationBindsOriginToValidatedRequestHost(t *testing.T) {
+func TestRemoteWithoutOptionalBearerHasNoBearerCredentialPath(t *testing.T) {
+	server := newRemoteTestServer(t, "", nil, 0, 0)
+	response := remoteRequest(server, http.MethodGet, "/api/v1/capabilities", nil, "")
+	if response.Code != http.StatusUnauthorized || response.Header().Get("WWW-Authenticate") != "" {
+		t.Fatalf("optional-Bearer 401 = %d challenge=%q", response.Code, response.Header().Get("WWW-Authenticate"))
+	}
+	request := httptest.NewRequest(http.MethodGet, "https://machine.example:8443/api/v1/capabilities", nil)
+	request.Header.Set("Authorization", "Bearer ")
+	recorder := httptest.NewRecorder()
+	server.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("empty Bearer accepted: %d", recorder.Code)
+	}
+}
+
+func TestAuthenticationSessionSupportsLocalAndRemoteGuestModes(t *testing.T) {
+	local, _ := newTestServer(t, nil, nil)
+	response := request(local, http.MethodGet, "/api/v1/auth/session")
+	result := decodeAuthenticationResult(t, response)
+	if result.status != http.StatusOK || !result.authenticated || result.loginRequired || result.username != "" || result.csrf != local.csrfToken {
+		t.Fatalf("local auth session = %+v", result)
+	}
+
+	remote := newRemoteTestServer(t, "", nil, 0, 0)
+	response = remoteRequest(remote, http.MethodGet, "/api/v1/auth/session", nil, "")
+	result = decodeAuthenticationResult(t, response)
+	if result.status != http.StatusOK || result.authenticated || !result.loginRequired || result.username != "" || result.csrf != "" {
+		t.Fatalf("remote guest session = %+v", result)
+	}
+}
+
+func TestRemoteLoginCreatesSecureOpaqueSessionAndCapabilitiesUseItsCSRF(t *testing.T) {
+	authenticator := &fakeAuthenticator{}
+	server := newRemoteTestServer(t, "", authenticator, 0, 0)
+	result := remoteLogin(t, server, "operator", "correct-password", false)
+	if result.status != http.StatusOK || !result.authenticated || !result.loginRequired || result.username != "operator" || result.csrf == "" {
+		t.Fatalf("login = %+v", result)
+	}
+	if result.cookie == nil || result.cookie.Name != remoteSessionCookieName || result.cookie.Value == "" ||
+		!result.cookie.Secure || !result.cookie.HttpOnly || result.cookie.Path != "/" || result.cookie.Domain != "" ||
+		result.cookie.SameSite != http.SameSiteStrictMode || result.cookie.MaxAge != 0 || !result.cookie.Expires.IsZero() ||
+		result.cookie.Value == result.csrf {
+		t.Fatalf("session cookie/CSRF contract = cookie=%+v csrf=%q", result.cookie, result.csrf)
+	}
+	users, passwords := authenticator.calls()
+	if len(users) != 1 || users[0] != "operator" || passwords[0] != "correct-password" {
+		t.Fatalf("PAM calls = users %#v passwords %#v", users, passwords)
+	}
+
+	sessionResponse := remoteRequest(server, http.MethodGet, "/api/v1/auth/session", result.cookie, "")
+	session := decodeAuthenticationResult(t, sessionResponse)
+	if !session.authenticated || session.csrf != result.csrf || session.username != "operator" {
+		t.Fatalf("restored session = %+v", session)
+	}
+	capabilities := remoteRequest(server, http.MethodGet, "/api/v1/capabilities", result.cookie, "")
+	if capabilities.Code != http.StatusOK || !strings.Contains(capabilities.Body.String(), result.csrf) ||
+		strings.Contains(capabilities.Body.String(), server.csrfToken) {
+		t.Fatalf("session capabilities leaked/replaced CSRF: %d %s", capabilities.Code, capabilities.Body.String())
+	}
+}
+
+func TestRememberedLoginSetsPersistentStrictCookie(t *testing.T) {
+	server := newRemoteTestServer(t, "", nil, 0, 0)
+	before := time.Now().Add(30 * 24 * time.Hour)
+	result := remoteLogin(t, server, "operator", "correct-password", true)
+	if result.status != http.StatusOK || result.cookie == nil || result.cookie.MaxAge <= 0 || result.cookie.Expires.IsZero() {
+		t.Fatalf("remembered cookie = %+v response=%s", result.cookie, result.body)
+	}
+	if delta := result.cookie.Expires.Sub(before); delta < -2*time.Second || delta > 2*time.Second {
+		t.Fatalf("remembered expiry = %s want near %s", result.cookie.Expires, before)
+	}
+}
+
+func TestSuccessfulReloginRotatesExistingBrowserSession(t *testing.T) {
+	server := newRemoteTestServer(t, "", nil, 0, 0)
+	first := remoteLogin(t, server, "operator", "first-password", true)
+	second := remoteLoginWithCookie(t, server, "operator", "second-password", false, first.cookie)
+	if first.status != http.StatusOK || second.status != http.StatusOK || second.cookie == nil ||
+		second.cookie.Value == first.cookie.Value || second.csrf == first.csrf {
+		t.Fatalf("relogin did not rotate credentials: first=%+v second=%+v", first, second)
+	}
+	if stale := remoteRequest(server, http.MethodGet, "/api/v1/capabilities", first.cookie, ""); stale.Code != http.StatusUnauthorized {
+		t.Fatalf("old browser session survived relogin: %d", stale.Code)
+	}
+	if current := remoteRequest(server, http.MethodGet, "/api/v1/capabilities", second.cookie, ""); current.Code != http.StatusOK {
+		t.Fatalf("replacement browser session is unusable: %d %s", current.Code, current.Body.String())
+	}
+}
+
+func TestRemoteLoginRequiresExactHTTPSOriginBeforePAM(t *testing.T) {
+	authenticator := &fakeAuthenticator{}
+	server := newRemoteTestServer(t, "", authenticator, 0, 0)
+	body := `{"username":"operator","password":"secret","rememberMe":false}`
+	for _, test := range []struct {
+		name   string
+		host   string
+		origin []string
+	}{
+		{name: "missing", host: "machine.example:8443"},
+		{name: "plain HTTP", host: "machine.example:8443", origin: []string{"http://machine.example:8443"}},
+		{name: "wrong host", host: "machine.example:8443", origin: []string{"https://evil.example:8443"}},
+		{name: "multiple", host: "machine.example:8443", origin: []string{"https://machine.example:8443", "https://machine.example:8443"}},
+		{name: "origin path", host: "machine.example:8443", origin: []string{"https://machine.example:8443/path"}},
+		{name: "invalid host", host: "machine.example:8443/invalid", origin: []string{"https://machine.example:8443"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPost, "https://machine.example:8443/api/v1/auth/login", strings.NewReader(body))
+			request.Host = test.host
+			request.Header.Set("Content-Type", "application/json")
+			for _, origin := range test.origin {
+				request.Header.Add("Origin", origin)
+			}
+			response := httptest.NewRecorder()
+			server.ServeHTTP(response, request)
+			if response.Code != http.StatusForbidden || !strings.Contains(response.Body.String(), "ORIGIN_REJECTED") {
+				t.Fatalf("origin rejection = %d %s", response.Code, response.Body.String())
+			}
+		})
+	}
+	users, _ := authenticator.calls()
+	if len(users) != 0 {
+		t.Fatalf("rejected origins reached PAM: %#v", users)
+	}
+}
+
+func TestUnknownUsernameStillAuthenticatesOnlyConfiguredPAMAccount(t *testing.T) {
+	authenticator := &fakeAuthenticator{}
+	server := newRemoteTestServer(t, "", authenticator, 0, 0)
+	wrongUser := remoteLogin(t, server, "somebody-else", "guess", false)
+	if wrongUser.status != http.StatusUnauthorized || !strings.Contains(wrongUser.body, `"code":"AUTHENTICATION_FAILED"`) {
+		t.Fatalf("wrong user = %d %s", wrongUser.status, wrongUser.body)
+	}
+	users, passwords := authenticator.calls()
+	if len(users) != 1 || users[0] != "operator" || passwords[0] != "guess" {
+		t.Fatalf("wrong username probed PAM accounts: %#v %#v", users, passwords)
+	}
+}
+
+func TestRemoteLoginThrottlingAndConcurrencyAreBounded(t *testing.T) {
+	t.Run("attempts", func(t *testing.T) {
+		authenticator := &fakeAuthenticator{err: auth.ErrInvalidCredentials}
+		server := newRemoteTestServer(t, "", authenticator, 1, 2)
+		for index := 0; index < 2; index++ {
+			if result := remoteLogin(t, server, "operator", "wrong", false); result.status != http.StatusUnauthorized {
+				t.Fatalf("failed login %d = %d %s", index, result.status, result.body)
+			}
+		}
+		if result := remoteLogin(t, server, "operator", "wrong", false); result.status != http.StatusTooManyRequests {
+			t.Fatalf("rate-limited login = %d %s", result.status, result.body)
+		}
+		users, _ := authenticator.calls()
+		if len(users) != 2 {
+			t.Fatalf("rate-limited login reached PAM: %d calls", len(users))
+		}
+	})
+
+	t.Run("concurrency", func(t *testing.T) {
+		authenticator := &fakeAuthenticator{entered: make(chan struct{}, 1), release: make(chan struct{})}
+		server := newRemoteTestServer(t, "", authenticator, 1, 10)
+		firstDone := make(chan authenticationResult, 1)
+		go func() { firstDone <- remoteLogin(t, server, "operator", "secret", false) }()
+		select {
+		case <-authenticator.entered:
+		case <-time.After(time.Second):
+			t.Fatal("first login did not enter PAM")
+		}
+		second := remoteLogin(t, server, "operator", "secret", false)
+		if second.status != http.StatusTooManyRequests {
+			t.Fatalf("concurrent login = %d %s", second.status, second.body)
+		}
+		close(authenticator.release)
+		if first := <-firstDone; first.status != http.StatusOK {
+			t.Fatalf("first login = %d %s", first.status, first.body)
+		}
+	})
+}
+
+func TestSessionMutationUsesExactOriginAndPerSessionCSRF(t *testing.T) {
+	server := newRemoteTestServer(t, strings.Repeat("b", 40), nil, 0, 0)
+	login := remoteLogin(t, server, "operator", "secret", false)
+	if login.status != http.StatusOK {
+		t.Fatalf("login = %d %s", login.status, login.body)
+	}
+	_, session, ok := server.browserSession(requestWithCookie(login.cookie))
+	if !ok {
+		t.Fatal("created browser session was not retrievable")
+	}
+	base := httptest.NewRequest(http.MethodPost, "https://machine.example:8443/api/v1/setups", nil)
+	base.Host = "machine.example:8443"
+	base.Header.Set("Origin", "https://machine.example:8443")
+	base.Header.Set("X-CSRF-Token", login.csrf)
+	base = base.WithContext(withRequestPrincipal(base.Context(), requestPrincipal{kind: principalSession, session: session}))
+	if !server.authorizeMutation(base) {
+		t.Fatal("valid session mutation rejected")
+	}
+	for name, mutate := range map[string]func(*http.Request){
+		"missing origin": func(r *http.Request) { r.Header.Del("Origin") },
+		"HTTP origin":    func(r *http.Request) { r.Header.Set("Origin", "http://machine.example:8443") },
+		"wrong origin":   func(r *http.Request) { r.Header.Set("Origin", "https://evil.example:8443") },
+		"wrong CSRF":     func(r *http.Request) { r.Header.Set("X-CSRF-Token", server.csrfToken) },
+		"invalid host":   func(r *http.Request) { r.Host = "machine.example/invalid" },
+	} {
+		copyRequest := base.Clone(base.Context())
+		copyRequest.Header = base.Header.Clone()
+		mutate(copyRequest)
+		if server.authorizeMutation(copyRequest) {
+			t.Fatalf("session mutation accepted %s", name)
+		}
+		response := httptest.NewRecorder()
+		if requireMutation(server, response, copyRequest, "request-id") {
+			t.Fatalf("requireMutation accepted %s", name)
+		}
+		wantCode := "ORIGIN_REJECTED"
+		if name == "wrong CSRF" {
+			wantCode = "CSRF_REJECTED"
+		}
+		if response.Code != http.StatusForbidden || !strings.Contains(response.Body.String(), wantCode) {
+			t.Fatalf("session rejection %s = %d %s, want %s", name, response.Code, response.Body.String(), wantCode)
+		}
+	}
+
+	bearer := httptest.NewRequest(http.MethodPost, "https://machine.example:8443/api/v1/setups", nil)
+	bearer.Host = "machine.example:8443"
+	bearer.Header.Set("X-CSRF-Token", server.csrfToken)
+	bearer = bearer.WithContext(withRequestPrincipal(bearer.Context(), requestPrincipal{kind: principalBearer}))
+	if !server.authorizeMutation(bearer) {
+		t.Fatal("Bearer mutation did not preserve global CSRF semantics")
+	}
+}
+
+func TestLogoutRequiresSessionOriginAndCSRFThenRevokesCookie(t *testing.T) {
+	server := newRemoteTestServer(t, "", nil, 0, 0)
+	login := remoteLogin(t, server, "operator", "secret", false)
+	for _, test := range []struct {
+		name      string
+		origin    string
+		csrf      string
+		errorCode string
+	}{
+		{name: "missing origin", csrf: login.csrf, errorCode: "ORIGIN_REJECTED"},
+		{name: "HTTP origin", origin: "http://machine.example:8443", csrf: login.csrf, errorCode: "ORIGIN_REJECTED"},
+		{name: "wrong CSRF", origin: "https://machine.example:8443", csrf: "wrong", errorCode: "CSRF_REJECTED"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPost, "https://machine.example:8443/api/v1/auth/logout", nil)
+			request.Host = "machine.example:8443"
+			request.AddCookie(login.cookie)
+			if test.origin != "" {
+				request.Header.Set("Origin", test.origin)
+			}
+			request.Header.Set("X-CSRF-Token", test.csrf)
+			response := httptest.NewRecorder()
+			server.ServeHTTP(response, request)
+			if response.Code != http.StatusForbidden || !strings.Contains(response.Body.String(), test.errorCode) {
+				t.Fatalf("logout rejection = %d %s", response.Code, response.Body.String())
+			}
+			if stillValid := remoteRequest(server, http.MethodGet, "/api/v1/capabilities", login.cookie, ""); stillValid.Code != http.StatusOK {
+				t.Fatalf("rejected logout revoked session: %d", stillValid.Code)
+			}
+		})
+	}
+
+	response := remoteRequest(server, http.MethodPost, "/api/v1/auth/logout", login.cookie, login.csrf)
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("logout = %d %s", response.Code, response.Body.String())
+	}
+	var cleared *http.Cookie
+	for _, cookie := range response.Result().Cookies() {
+		if cookie.Name == remoteSessionCookieName {
+			cleared = cookie
+		}
+	}
+	if cleared == nil || cleared.MaxAge != -1 || !cleared.Secure || !cleared.HttpOnly || cleared.Path != "/" ||
+		cleared.SameSite != http.SameSiteStrictMode {
+		t.Fatalf("cleared cookie = %+v", cleared)
+	}
+	if after := remoteRequest(server, http.MethodGet, "/api/v1/capabilities", login.cookie, ""); after.Code != http.StatusUnauthorized {
+		t.Fatalf("logged-out cookie remained valid: %d", after.Code)
+	}
+}
+
+func TestExplicitInvalidAuthorizationDoesNotFallBackToValidCookie(t *testing.T) {
+	server := newRemoteTestServer(t, strings.Repeat("b", 40), nil, 0, 0)
+	login := remoteLogin(t, server, "operator", "secret", false)
+	request := httptest.NewRequest(http.MethodGet, "https://machine.example:8443/api/v1/capabilities", nil)
+	request.AddCookie(login.cookie)
+	request.Header.Set("Authorization", "Bearer wrong")
+	response := httptest.NewRecorder()
+	server.ServeHTTP(response, request)
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("invalid explicit Authorization fell back to cookie: %d", response.Code)
+	}
+}
+
+func TestRemoteConstructorFailsClosedWithoutAuthenticationDependencies(t *testing.T) {
 	files := fstest.MapFS{"index.html": &fstest.MapFile{Data: []byte("app")}}
-	server, err := New(Config{
-		ListenAddress: "0.0.0.0:8443", LibraryID: "id", LibraryAlias: "Setups",
-		RemoteAccess: true, RemoteAuthToken: strings.Repeat("s", 40),
+	_, err := New(Config{
+		ListenAddress: "0.0.0.0:8443", RemoteAccess: true, AllowedUser: "operator",
+		AuthRememberTimeout: time.Hour, AuthConcurrency: 1,
 	}, checkStub{}, checkStub{}, files, nil)
-	if err != nil {
-		t.Fatal(err)
+	if err == nil {
+		t.Fatal("remote server without PAM/session dependencies was constructed")
 	}
-	valid := httptest.NewRequest(http.MethodPost, "https://machine.example:8443/api/v1/setups", nil)
-	valid.Host = "machine.example:8443"
-	valid.Header.Set("Origin", "https://machine.example:8443")
-	valid.Header.Set("X-CSRF-Token", server.csrfToken)
-	if !server.authorizeMutation(valid) {
-		t.Fatal("valid authenticated-origin authority was rejected")
+}
+
+func TestAuthenticationEndpointMethodContracts(t *testing.T) {
+	server := newRemoteTestServer(t, "", nil, 0, 0)
+	for _, test := range []struct {
+		method, target, allow string
+	}{
+		{http.MethodGet, "/api/v1/auth/login", http.MethodPost},
+		{http.MethodPost, "/api/v1/auth/session", http.MethodGet},
+		{http.MethodGet, "/api/v1/auth/logout", http.MethodPost},
+	} {
+		response := remoteRequest(server, test.method, test.target, nil, "")
+		if response.Code != http.StatusMethodNotAllowed || response.Header().Get("Allow") != test.allow {
+			t.Fatalf("%s %s = %d Allow=%q", test.method, test.target, response.Code, response.Header().Get("Allow"))
+		}
 	}
-	wrongOrigin := valid.Clone(valid.Context())
-	wrongOrigin.Header = valid.Header.Clone()
-	wrongOrigin.Header.Set("Origin", "https://evil.example:8443")
-	if server.authorizeMutation(wrongOrigin) {
-		t.Fatal("cross-origin remote mutation was accepted")
+}
+
+func TestDuplicateSessionCookiesAreRejectedWithoutAmbiguity(t *testing.T) {
+	server := newRemoteTestServer(t, "", nil, 0, 0)
+	login := remoteLogin(t, server, "operator", "secret", false)
+	request := httptest.NewRequest(http.MethodGet, "https://machine.example:8443/api/v1/capabilities", nil)
+	request.AddCookie(login.cookie)
+	request.AddCookie(&http.Cookie{Name: remoteSessionCookieName, Value: "attacker-controlled"})
+	response := httptest.NewRecorder()
+	server.ServeHTTP(response, request)
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("duplicate session cookies were accepted: %d", response.Code)
 	}
-	invalidHost := valid.Clone(valid.Context())
-	invalidHost.Header = valid.Header.Clone()
-	invalidHost.Host = "machine.example:8443/invalid"
-	if server.authorizeMutation(invalidHost) {
-		t.Fatal("invalid remote Host header was accepted")
-	}
+}
+
+func requestWithCookie(cookie *http.Cookie) *http.Request {
+	request := httptest.NewRequest(http.MethodGet, "https://machine.example:8443/", nil)
+	request.AddCookie(cookie)
+	return request
 }
 
 func TestHeadAndMethodContracts(t *testing.T) {

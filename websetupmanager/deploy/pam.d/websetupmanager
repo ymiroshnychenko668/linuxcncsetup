@@ -1,0 +1,5 @@
+#%PAM-1.0
+# Web Setup Manager authenticates the one Linux account named by
+# WEB_SETUP_MANAGER_ALLOWED_USER and checks that the account is usable.
+@include common-auth
+@include common-account

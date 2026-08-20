@@ -16,6 +16,10 @@ func validTestConfig() Config {
 		IdleTimeout: DefaultIdleTimeout, MaxHeaderBytes: DefaultMaxHeaderBytes,
 		IdempotencyTTL: DefaultIdempotencyTTL, DeleteConfirmationTTL: DefaultDeleteConfirmation,
 		ReconcileInterval: DefaultReconcileInterval, ImportSessionExpiry: DefaultImportSessionExpiry,
+		PAMService: DefaultPAMService, AuthIdleTimeout: DefaultAuthIdleTimeout,
+		AuthAbsoluteTimeout: DefaultAuthAbsoluteTimeout, AuthRememberTimeout: DefaultAuthRememberTimeout,
+		AuthConcurrency: DefaultAuthConcurrency, LoginAttempts: DefaultLoginAttempts,
+		LoginWindow: DefaultLoginWindow, AuthSessionCapacity: DefaultAuthSessionCapacity,
 	}
 }
 
@@ -62,7 +66,7 @@ func TestValidateRejectsUnsafeRemoteAndExecutableMode(t *testing.T) {
 		t.Fatal("unprotected remote listener was accepted")
 	}
 	remote.RemoteAccess = true
-	remote.RemoteAuthToken = strings.Repeat("x", 32)
+	remote.AllowedUser = "operator"
 	remote.TrustedTLSProxy = true
 	if err := remote.Validate(); err != nil {
 		t.Fatalf("protected remote config rejected: %v", err)
@@ -75,13 +79,38 @@ func TestValidateRequiresAuthenticationAndTransportForLoopbackRemoteMode(t *test
 	if err := configuration.Validate(); err == nil {
 		t.Fatal("loopback remote mode without authentication was accepted")
 	}
-	configuration.RemoteAuthToken = strings.Repeat("x", 32)
+	configuration.AllowedUser = "operator"
 	if err := configuration.Validate(); err == nil {
 		t.Fatal("loopback remote mode without protected transport was accepted")
 	}
 	configuration.TrustedTLSProxy = true
 	if err := configuration.Validate(); err != nil {
 		t.Fatalf("protected loopback remote mode rejected: %v", err)
+	}
+	configuration.RemoteAuthToken = "short"
+	if err := configuration.Validate(); err == nil {
+		t.Fatal("short optional bearer token was accepted")
+	}
+}
+
+func TestValidateRemoteAuthenticationPolicy(t *testing.T) {
+	for _, username := range []string{"", "root", "bad:user", "bad/user", "bad user"} {
+		configuration := validTestConfig()
+		configuration.RemoteAccess = true
+		configuration.AllowedUser = username
+		configuration.TrustedTLSProxy = true
+		if err := configuration.Validate(); err == nil {
+			t.Fatalf("remote username %q was accepted", username)
+		}
+	}
+
+	configuration := validTestConfig()
+	configuration.RemoteAccess = true
+	configuration.AllowedUser = "machine_operator"
+	configuration.TrustedTLSProxy = true
+	configuration.RemoteAuthToken = strings.Repeat("x", 32)
+	if err := configuration.Validate(); err != nil {
+		t.Fatalf("PAM login plus optional bearer token rejected: %v", err)
 	}
 }
 

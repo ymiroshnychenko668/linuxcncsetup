@@ -27,6 +27,14 @@ const (
 	DefaultDeleteConfirmation  = 5 * time.Minute
 	DefaultReconcileInterval   = time.Minute
 	DefaultImportSessionExpiry = 24 * time.Hour
+	DefaultAuthIdleTimeout     = 30 * time.Minute
+	DefaultAuthAbsoluteTimeout = 12 * time.Hour
+	DefaultAuthRememberTimeout = 30 * 24 * time.Hour
+	DefaultAuthConcurrency     = 4
+	DefaultLoginAttempts       = 5
+	DefaultLoginWindow         = 10 * time.Minute
+	DefaultAuthSessionCapacity = 128
+	DefaultPAMService          = "websetupmanager"
 )
 
 var defaultGCodeExtensions = []string{".gcode", ".nc", ".ngc", ".tap", ".cnc"}
@@ -55,6 +63,15 @@ type Config struct {
 	ReconcileInterval         time.Duration
 	ImportSessionExpiry       time.Duration
 	RemoteAccess              bool
+	AllowedUser               string
+	PAMService                string
+	AuthIdleTimeout           time.Duration
+	AuthAbsoluteTimeout       time.Duration
+	AuthRememberTimeout       time.Duration
+	AuthConcurrency           int
+	LoginAttempts             int
+	LoginWindow               time.Duration
+	AuthSessionCapacity       int
 	RemoteAuthToken           string
 	TLSCertFile               string
 	TLSKeyFile                string
@@ -85,6 +102,15 @@ func Load() (Config, error) {
 		DeleteConfirmationTTL: DefaultDeleteConfirmation,
 		ReconcileInterval:     DefaultReconcileInterval,
 		ImportSessionExpiry:   DefaultImportSessionExpiry,
+		PAMService:            envOr("WEB_SETUP_MANAGER_PAM_SERVICE", DefaultPAMService),
+		AuthIdleTimeout:       DefaultAuthIdleTimeout,
+		AuthAbsoluteTimeout:   DefaultAuthAbsoluteTimeout,
+		AuthRememberTimeout:   DefaultAuthRememberTimeout,
+		AuthConcurrency:       DefaultAuthConcurrency,
+		LoginAttempts:         DefaultLoginAttempts,
+		LoginWindow:           DefaultLoginWindow,
+		AuthSessionCapacity:   DefaultAuthSessionCapacity,
+		AllowedUser:           strings.TrimSpace(os.Getenv("WEB_SETUP_MANAGER_ALLOWED_USER")),
 		RemoteAuthToken:       strings.TrimSpace(os.Getenv("WEB_SETUP_MANAGER_REMOTE_AUTH_TOKEN")),
 		TLSCertFile:           strings.TrimSpace(os.Getenv("WEB_SETUP_MANAGER_TLS_CERT_FILE")),
 		TLSKeyFile:            strings.TrimSpace(os.Getenv("WEB_SETUP_MANAGER_TLS_KEY_FILE")),
@@ -99,6 +125,15 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	if c.MaxHeaderBytes, err = envInt("WEB_SETUP_MANAGER_MAX_HEADER_BYTES", c.MaxHeaderBytes); err != nil {
+		return Config{}, err
+	}
+	if c.AuthConcurrency, err = envInt("WEB_SETUP_MANAGER_AUTH_CONCURRENCY", c.AuthConcurrency); err != nil {
+		return Config{}, err
+	}
+	if c.LoginAttempts, err = envInt("WEB_SETUP_MANAGER_LOGIN_ATTEMPTS", c.LoginAttempts); err != nil {
+		return Config{}, err
+	}
+	if c.AuthSessionCapacity, err = envInt("WEB_SETUP_MANAGER_AUTH_SESSION_CAPACITY", c.AuthSessionCapacity); err != nil {
 		return Config{}, err
 	}
 	if c.ArtifactUploadLimit, err = envBytes("WEB_SETUP_MANAGER_ARTIFACT_UPLOAD_LIMIT", 0); err != nil {
@@ -128,6 +163,10 @@ func Load() (Config, error) {
 		"WEB_SETUP_MANAGER_DELETE_CONFIRMATION_TTL": &c.DeleteConfirmationTTL,
 		"WEB_SETUP_MANAGER_RECONCILE_INTERVAL":      &c.ReconcileInterval,
 		"WEB_SETUP_MANAGER_IMPORT_SESSION_EXPIRY":   &c.ImportSessionExpiry,
+		"WEB_SETUP_MANAGER_AUTH_IDLE_TIMEOUT":       &c.AuthIdleTimeout,
+		"WEB_SETUP_MANAGER_AUTH_ABSOLUTE_TIMEOUT":   &c.AuthAbsoluteTimeout,
+		"WEB_SETUP_MANAGER_AUTH_REMEMBER_TIMEOUT":   &c.AuthRememberTimeout,
+		"WEB_SETUP_MANAGER_LOGIN_WINDOW":            &c.LoginWindow,
 	} {
 		if *target, err = envDuration(name, *target); err != nil {
 			return Config{}, err
@@ -175,6 +214,8 @@ func (c *Config) Validate() error {
 		"read timeout": c.ReadTimeout, "idle timeout": c.IdleTimeout,
 		"idempotency TTL": c.IdempotencyTTL, "delete confirmation TTL": c.DeleteConfirmationTTL,
 		"reconcile interval": c.ReconcileInterval, "import session expiry": c.ImportSessionExpiry,
+		"authentication idle timeout": c.AuthIdleTimeout, "authentication absolute timeout": c.AuthAbsoluteTimeout,
+		"authentication remember timeout": c.AuthRememberTimeout, "authentication login window": c.LoginWindow,
 	} {
 		if value <= 0 {
 			return fmt.Errorf("%s must be positive", name)
@@ -202,12 +243,30 @@ func (c *Config) Validate() error {
 		}
 	}
 	if c.RemoteAccess {
-		if len(c.RemoteAuthToken) < 32 {
-			return errors.New("remote access requires an authentication token of at least 32 characters")
+		if !validAccountName(c.AllowedUser) || c.AllowedUser == "root" {
+			return errors.New("remote access requires a valid non-root WEB_SETUP_MANAGER_ALLOWED_USER")
 		}
 		if !c.TrustedTLSProxy && (c.TLSCertFile == "" || c.TLSKeyFile == "") {
 			return errors.New("remote access requires TLS certificate/key or a trusted TLS proxy")
 		}
+	}
+	if c.RemoteAuthToken != "" && len(c.RemoteAuthToken) < 32 {
+		return errors.New("WEB_SETUP_MANAGER_REMOTE_AUTH_TOKEN must contain at least 32 characters when configured")
+	}
+	if !validPAMService(c.PAMService) {
+		return errors.New("WEB_SETUP_MANAGER_PAM_SERVICE is invalid")
+	}
+	if c.AuthConcurrency < 1 || c.AuthConcurrency > 64 {
+		return errors.New("WEB_SETUP_MANAGER_AUTH_CONCURRENCY must be between 1 and 64")
+	}
+	if c.LoginAttempts < 1 || c.LoginAttempts > 100 {
+		return errors.New("WEB_SETUP_MANAGER_LOGIN_ATTEMPTS must be between 1 and 100")
+	}
+	if c.AuthSessionCapacity < 1 || c.AuthSessionCapacity > 10000 {
+		return errors.New("WEB_SETUP_MANAGER_AUTH_SESSION_CAPACITY must be between 1 and 10000")
+	}
+	if c.AuthIdleTimeout > c.AuthAbsoluteTimeout {
+		return errors.New("WEB_SETUP_MANAGER_AUTH_IDLE_TIMEOUT must not exceed the absolute timeout")
 	}
 	if (c.TLSCertFile == "") != (c.TLSKeyFile == "") {
 		return errors.New("TLS certificate and key must be configured together")
@@ -341,6 +400,24 @@ func validExtension(value string) bool {
 		}
 	}
 	return true
+}
+
+func validAccountName(value string) bool {
+	if value == "" || len(value) > 256 {
+		return false
+	}
+	for _, character := range value {
+		if character >= 'a' && character <= 'z' || character >= 'A' && character <= 'Z' ||
+			character >= '0' && character <= '9' || character == '_' || character == '-' || character == '.' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func validPAMService(value string) bool {
+	return value != "" && len(value) <= 128 && !strings.ContainsAny(value, "\x00/\\\r\n")
 }
 
 func defaultStateDir() (string, error) {

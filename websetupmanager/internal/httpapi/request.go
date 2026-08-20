@@ -39,6 +39,11 @@ func requireMutation(s *Server, w http.ResponseWriter, r *http.Request, requestI
 	if s.authorizeMutation(r) {
 		return true
 	}
+	if principal, ok := requestPrincipalFrom(r.Context()); ok && principal.kind == principalSession {
+		code, message := s.sessionMutationRejection(r, principal.session)
+		writeError(w, http.StatusForbidden, requestID, code, message, nil, false)
+		return false
+	}
 	writeError(w, http.StatusForbidden, requestID, "REQUEST_FORBIDDEN", "The mutation was rejected by the same-origin security policy.", nil, false)
 	return false
 }

@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -10,10 +12,14 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"os/user"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
 	webassets "github.com/ymiroshnychenko668/linuxcncsetup/websetupmanager"
+	"github.com/ymiroshnychenko668/linuxcncsetup/websetupmanager/internal/auth"
 	"github.com/ymiroshnychenko668/linuxcncsetup/websetupmanager/internal/config"
 	"github.com/ymiroshnychenko668/linuxcncsetup/websetupmanager/internal/database"
 	"github.com/ymiroshnychenko668/linuxcncsetup/websetupmanager/internal/httpapi"
@@ -52,6 +58,9 @@ func run(logger *slog.Logger) error {
 	if err := settings.ValidateFiles(); err != nil {
 		return fmt.Errorf("deployment configuration is invalid: %w", err)
 	}
+	if err := validateAuthenticationRuntime(settings); err != nil {
+		return err
+	}
 	tlsCertificate, err := settings.LoadTLSCertificate()
 	if err != nil {
 		return fmt.Errorf("deployment configuration is invalid: %w", err)
@@ -82,6 +91,23 @@ func run(logger *slog.Logger) error {
 		return classifyDatabaseStartupError(err)
 	}
 	defer db.Close()
+	var authentication httpapi.AuthDependencies
+	if settings.RemoteAccess {
+		sessions, err := auth.NewPersistentStore(
+			db.SQL(), settings.AuthIdleTimeout, settings.AuthAbsoluteTimeout,
+			settings.AuthSessionCapacity, settings.AllowedUser,
+			authenticationScope(settings, roots.LibraryID()),
+		)
+		if err != nil {
+			return newOperationalError("AUTHENTICATION_UNAVAILABLE", "the authentication session store could not be initialized", err)
+		}
+		defer sessions.Close()
+		authentication = httpapi.AuthDependencies{
+			Authenticator: auth.NewPAMAuthenticator(settings.PAMService),
+			Sessions:      sessions,
+			Throttler:     auth.NewThrottler(settings.LoginAttempts, settings.LoginWindow),
+		}
+	}
 	objects, err := storage.NewStore(roots, storage.StoreOptions{UploadLimit: settings.ArtifactUploadLimit})
 	if err != nil {
 		return errors.New("managed object store initialization failed")
@@ -123,13 +149,17 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return errors.New("embedded frontend initialization failed")
 	}
-	handler, err := httpapi.NewWithService(httpapi.Config{
+	handler, err := httpapi.NewWithServiceAuthenticated(httpapi.Config{
 		ListenAddress: settings.ListenAddress, LibraryID: roots.LibraryID(), LibraryAlias: settings.LibraryAlias,
 		GCodeExtensions: settings.GCodeExtensions, RequireSetupSheetForReady: settings.RequireSetupSheetForReady,
 		RequestReadIdleTimeout:   settings.ReadTimeout,
 		ResponseWriteIdleTimeout: settings.ReadTimeout,
-		RemoteAccess:             settings.RemoteAccess, RemoteAuthToken: settings.RemoteAuthToken,
-	}, httpapi.CheckFunc(db.Ping), httpapi.CheckFunc(func(context.Context) error { return roots.Check() }), application, frontend, logger)
+		RemoteAccess:             settings.RemoteAccess,
+		AllowedUser:              settings.AllowedUser,
+		AuthRememberTimeout:      settings.AuthRememberTimeout,
+		AuthConcurrency:          settings.AuthConcurrency,
+		RemoteAuthToken:          settings.RemoteAuthToken,
+	}, httpapi.CheckFunc(db.Ping), httpapi.CheckFunc(func(context.Context) error { return roots.Check() }), application, frontend, authentication, logger)
 	if err != nil {
 		return errors.New("HTTP application initialization failed")
 	}
@@ -187,6 +217,36 @@ func run(logger *slog.Logger) error {
 	logger.Info("service stopped", "operation", "shutdown", "duration_ms", time.Since(shutdownStarted).Milliseconds(),
 		"bytes", 0, "result", "succeeded", "error_code", "")
 	return serveErr
+}
+
+func validateAuthenticationRuntime(settings config.Config) error {
+	if !settings.RemoteAccess {
+		return nil
+	}
+	if !auth.PAMAvailable() {
+		return newOperationalError("AUTHENTICATION_UNAVAILABLE", "remote access requires a production build with PAM support", auth.ErrUnavailable)
+	}
+	configuredAccount, err := user.Lookup(settings.AllowedUser)
+	if err != nil {
+		return newOperationalError("AUTHENTICATION_UNAVAILABLE", "the configured authentication account is unavailable", err)
+	}
+	uid, err := strconv.ParseUint(configuredAccount.Uid, 10, 32)
+	if err != nil || int(uid) != os.Geteuid() {
+		return newOperationalError("AUTHENTICATION_ACCOUNT_MISMATCH", "the service must run as the configured authentication account", err)
+	}
+	return nil
+}
+
+func authenticationScope(settings config.Config, libraryID string) string {
+	// Remembered browser sessions are invalidated if the managed library,
+	// listener, PAM policy or transport termination mode changes. Store only a
+	// digest so the durable session table remains a small opaque security index.
+	material := strings.Join([]string{
+		"websetupmanager-auth-v1", libraryID, settings.ListenAddress,
+		settings.AllowedUser, settings.PAMService, strconv.FormatBool(settings.TrustedTLSProxy),
+	}, "\x00")
+	digest := sha256.Sum256([]byte(material))
+	return hex.EncodeToString(digest[:])
 }
 
 type operationalError struct {
