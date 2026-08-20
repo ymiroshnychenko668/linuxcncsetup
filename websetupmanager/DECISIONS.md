@@ -86,11 +86,13 @@ Idempotency result хранится 24 часа. Delete confirmation token жи�
 
 ## D-012: operation jobs and external reconciliation
 
-Import, add/replace, validation, duplicate и permanent delete всегда имеют job
-record; короткие metadata/state mutations остаются синхронными. Identity
-проверяется при content/validation/mutation, на startup и ограниченным
-периодическим scanner; неизвестный внешний object никогда не наследует artifact
-ID только из-за совпадения display name.
+Import, prepared add/replace/Setup-Sheet upload, validation, duplicate и restore
+имеют persistent job record; короткие metadata/state mutations остаются
+синхронными. Permanent delete атомарно удаляет только доменные ссылки, а
+физическую очистку выполняет reference-safe GC. Identity проверяется при
+content/validation/mutation, на startup и ограниченным периодическим scanner;
+неизвестный внешний object никогда не наследует artifact ID только из-за
+совпадения display name.
 
 ## D-013: UI client identity
 
@@ -105,3 +107,97 @@ Sparse 10 GiB real file проверяет 64-bit HEAD/Range/RSS, но holes с�
 не являются валидным G-code. Поэтому preview/search отдельно тестируются на
 generator-backed логическом ASCII stream с match у конца; эти сценарии нельзя
 ошибочно объединять.
+
+## D-015: sliding network I/O idle timeout
+
+`WEB_SETUP_MANAGER_READ_TIMEOUT` исторически назван read timeout, но в P0
+трактуется как общий sliding timeout отсутствия network I/O progress: для чтения
+request body и записи response. Перед каждым body `Read` и response `Write`
+Backend устанавливает новый соответствующий connection deadline; каждый
+успешный блок сдвигает его дальше. Поэтому многогигабайтная загрузка или Range
+response с постоянным прогрессом может длиться дольше значения настройки, а
+зависший upload или slow/non-reading client освобождается после одного интервала.
+`http.Server.ReadTimeout` намеренно равен нулю: его абсолютная семантика
+конфликтует с потоковыми операциями. `ReadHeaderTimeout` остаётся отдельным;
+также действуют connection `IdleTimeout`, header limit, upload/import limits и
+лимит тяжёлых jobs.
+
+## D-016: durable journal checkpoints are collapsed around the DB commit
+
+Схема допускает состояния `intent`, `storage_applied`, `database_applied` и
+terminal states. Публикация immutable storage object и reservation фиксируются
+до доменной транзакции (`intent → storage_applied`). Логическая мутация,
+audit-событие и перевод journal в terminal state выполняются одной SQLite
+transaction. Поэтому обычный успешный путь не обязан оставлять наблюдаемую
+durable запись `database_applied`: crash до commit не публикует revision, crash
+после commit уже видит terminal row. Startup recovery принимает также legacy и
+искусственно восстановленные промежуточные состояния и переводит неоднозначный
+остаток в `conflict`; GC учитывает любую незавершённую reservation. Это безопасное
+схлопывание DB step, а не утверждение атомарности SQLite с filesystem.
+
+## D-017: development evidence is not target qualification
+
+Development evidence получено на Debian 13.5, Linux
+`6.12.95+deb13-rt-amd64` PREEMPT_RT, ext4, Go 1.26.5, Node 20.19.2. amd64 binary
+запускался локально; arm64 проверен cross-build, но не runtime. Headless Firefox
+выполнил только same-origin asset/API smoke и screenshot loading-state; в
+окружении нет подходящей controlled browser automation и реального
+LinuxCNC-станка. Поэтому численные NFR, полный keyboard/visual walkthrough,
+измерение браузерной памяти/DOM на
+10 GiB, активное содержимое PDF/HTML под наблюдением сети, TLS/reverse-proxy
+Deployment и повторяемый import/replace/duplicate power-loss остаются отдельными
+target scenarios; actual SIGKILL для archive/delete/current уже проверен в
+development environment.
+Автоматические unit/integration tests подтверждают инварианты и отказоустойчивые
+состояния, но документация не называет эти внешние проверки пройденными.
+
+## D-018: operator backup, recovery and GC boundaries
+
+Публичный API и UI не предоставляют произвольные backup/restore/GC операции.
+Согласованная операторская резервная копия P0 — cold copy одновременно
+`state_dir` и `library_dir` при остановленном процессе. Восстановление выполняется
+только при остановленном Backend в подготовленные disjoint roots с тем же
+владельцем; ручная замена отдельных SQLite/object-файлов запрещена. Reconcile,
+очистка expired sessions и reference-safe GC запускаются в background сразу
+после открытия listener и затем периодически; до listener выполняются только
+обязательная recovery и bounded identity-проверка ссылок. Частая проверка
+identity не хэширует гигабайтные объекты; полная SHA-256 сверка выполняется при
+первом background-проходе и раз в сутки. Оператор может безопасно инициировать
+полный цикл рестартом и дождаться successful reconcile log;
+`/readyz` не ожидает этот background-проход. Внутренние объекты нельзя
+удалять вручную.
+Cold copy может изменить inode/ctime. Такой объект rebind-ится к новой физической
+версии только после полного совпадения ожидаемого SHA-256. Первый rebind-проход
+оставляет Setup `attention`; в любом случае Setup не возвращается в `ready`
+без явной повторной validation.
+
+## D-019: HTML streaming and structural complexity
+
+Общий размер самостоятельного HTML не ограничивается константой приложения:
+upload/staging и sanitized response потоковые. Чтобы один незавершённый text или
+attribute token не нарушил memory budget, один HTML token ограничен 1 MiB.
+Тот же tokenizer и limit выполняются до публикации и при показе; неподдерживаемая
+структура получает `INVALID_CONTENT`. Sanitized response читает accepted
+неизменную версию 512 KiB Range-блоками и не буферизует целый input/output.
+Документы произвольного общего размера поддерживаются при bounded tokens и в
+пределах configured/storage limits.
+
+## D-020: asynchronous domain result and terminal job are one commit
+
+Успешная доменная часть prepared upload, validation, duplicate и restore не
+фиксируется отдельно от terminal job. Setup/revision или validation result,
+journal/audit, terminal job state/result/progress и применимая внутренняя
+idempotency запись выполняются одной SQLite transaction. Для streaming upload
+та же transaction завершает внешний `runUploadJob` claim и сохраняет точные
+content digests; error/cancel terminal job и внешний claim также фиксируются
+вместе. Import изначально применяет тот же принцип к setup, session, job,
+journal, audit и commit-idempotency.
+
+Поэтому startup не пытается эвристически повышать прерванный job до success:
+до commit доменная мутация невидима и активный job получает
+`PROCESS_INTERRUPTED`, после commit job уже имеет неизменяемый terminal result.
+Поздняя отмена не маскирует commit, который успел победить; если terminal job
+невозможно сериализовать или записать, вся доменная transaction откатывается.
+Это проверяют `TestCommittedJobResultsAndUploadClaimsSurviveRestart`,
+`TestAtomicJobMarshalFailureRollsBackDomainTransaction` и queued-validation
+cancellation regression.
