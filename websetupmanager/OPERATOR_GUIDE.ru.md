@@ -53,21 +53,43 @@ G-code и Setup Sheet → явно подтвердить current. После и
 ## 2. Установка
 
 Production target — 64-bit Linux amd64/arm64 с filesystem, поддерживающей
-atomic rename, `fsync`, sparse files и 64-bit offsets. Binary статический; Node
-и внешний сервер БД не нужны.
+atomic rename, `fsync`, sparse files и 64-bit offsets. Production binary
+собирается с cgo/PAM и использует системный PAM runtime; Node и внешний сервер
+БД на станке не нужны. Для Debian/Ubuntu build host установите C toolchain и
+`libpam0g-dev`, а на target — `libpam0g`.
 
 1. Получите release binary из доверенного источника и проверьте опубликованный
    checksum/signature.
-2. Установите binary, создайте отдельного системного пользователя и два
-   существующих непересекающихся каталога. Команды установки выполняются
-   администратором; сам сервис root-права отвергает.
+2. Установите binary, выберите отдельного non-root Linux-пользователя оператора
+   с PAM-паролем и создайте два существующих непересекающихся каталога. В
+   примере это `cncoperator`; в remote mode процесс обязан работать от того же
+   пользователя, который задан как `WEB_SETUP_MANAGER_ALLOWED_USER`.
+   Встроенного логина/пароля Web Setup Manager не существует. Команды установки
+   выполняются администратором; сам сервис root-права отвергает.
 
 ```bash
 sudo install -o root -g root -m 0755 websetupmanager /usr/local/bin/websetupmanager
-sudo useradd --system --home-dir /var/lib/websetupmanager --shell /usr/sbin/nologin websetupmanager
-sudo install -d -o websetupmanager -g websetupmanager -m 0750 /var/lib/websetupmanager
-sudo install -d -o websetupmanager -g websetupmanager -m 0750 /srv/websetupmanager/library
+sudo useradd --create-home --shell /bin/bash cncoperator
+sudo passwd cncoperator
+sudo install -d -o cncoperator -g cncoperator -m 0750 /var/lib/websetupmanager
+sudo install -d -o cncoperator -g cncoperator -m 0750 /srv/websetupmanager/library
+sudo install -o root -g root -m 0644 deploy/pam.d/websetupmanager /etc/pam.d/websetupmanager
 ```
+
+Если учётная запись уже существует, `useradd` не выполняйте; задайте/смените её
+пароль штатным `passwd` и проверьте локальную политику блокировки/срока действия.
+Не передавайте пароль через env, unit, командную строку или config-файл.
+Поставляемая PAM policy содержит `common-auth` и `common-account`:
+
+```text
+#%PAM-1.0
+@include common-auth
+@include common-account
+```
+
+На дистрибутивах без Debian-style `common-*` администратор должен создать
+эквивалентную policy по правилам этого дистрибутива; ослаблять account checks
+нельзя.
 
 `library_dir` и `state_dir` обязаны быть absolute real directories, writable
 пользователем сервиса, не symlink, не совпадать и не быть вложенными друг в
@@ -84,6 +106,10 @@ WEB_SETUP_MANAGER_ARTIFACT_UPLOAD_LIMIT=0
 WEB_SETUP_MANAGER_IMPORT_TOTAL_LIMIT=0
 ```
 
+Это loopback local mode: UI считается локально доверенным и отдельный login не
+показывается. Для remote mode используйте пример из раздела 4 и добавьте
+`ALLOWED_USER`; один лишь non-loopback bind не включает небезопасный доступ.
+
 Пример `/etc/systemd/system/websetupmanager.service`:
 
 ```ini
@@ -94,14 +120,13 @@ RequiresMountsFor=/srv/websetupmanager/library /var/lib/websetupmanager
 
 [Service]
 Type=simple
-User=websetupmanager
-Group=websetupmanager
+User=cncoperator
+Group=cncoperator
 EnvironmentFile=/etc/websetupmanager.env
 ExecStart=/usr/local/bin/websetupmanager
 Restart=on-failure
 RestartSec=3s
 TimeoutStopSec=30s
-NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
@@ -110,6 +135,11 @@ ReadWritePaths=/srv/websetupmanager/library /var/lib/websetupmanager
 [Install]
 WantedBy=multi-user.target
 ```
+
+`NoNewPrivileges=true` намеренно отсутствует: распространённый `pam_unix`
+использует привилегированный helper для безопасной проверки shadow password.
+Не добавляйте hardening option без повторного интерактивного PAM smoke от имени
+service user.
 
 После изменения unit/env:
 
@@ -154,8 +184,17 @@ roots. Byte limits задаются целым числом байт (`107374182
 | `WEB_SETUP_MANAGER_DELETE_CONFIRMATION_TTL` | `5m` | irreversible-delete token |
 | `WEB_SETUP_MANAGER_RECONCILE_INTERVAL` | `1m` | identity scan/cleanup/GC cadence; full SHA scrub также после старта и раз в сутки |
 | `WEB_SETUP_MANAGER_IMPORT_SESSION_EXPIRY` | `24h` | abandoned staging lifetime |
-| `WEB_SETUP_MANAGER_REMOTE_ACCESS` | `false` | explicit non-loopback enable |
-| `WEB_SETUP_MANAGER_REMOTE_AUTH_TOKEN` | нет | secret, минимум 32 символа |
+| `WEB_SETUP_MANAGER_REMOTE_ACCESS` | `false` | включает browser login/auth policy; обязателен для non-loopback |
+| `WEB_SETUP_MANAGER_ALLOWED_USER` | нет | обязательный non-root Linux user remote mode; должен совпадать с process user |
+| `WEB_SETUP_MANAGER_PAM_SERVICE` | `websetupmanager` | имя root-owned policy в `/etc/pam.d` |
+| `WEB_SETUP_MANAGER_AUTH_IDLE_TIMEOUT` | `30m` | idle lifetime обычной browser session |
+| `WEB_SETUP_MANAGER_AUTH_ABSOLUTE_TIMEOUT` | `12h` | максимальная lifetime обычной browser session; не меньше idle |
+| `WEB_SETUP_MANAGER_AUTH_REMEMBER_TIMEOUT` | `720h` | fixed lifetime «Запомнить меня» |
+| `WEB_SETUP_MANAGER_AUTH_CONCURRENCY` | `4` | максимум одновременных PAM exchanges, `1..64` |
+| `WEB_SETUP_MANAGER_LOGIN_ATTEMPTS` | `5` | лимит ошибок на IP и submitted username, `1..100` |
+| `WEB_SETUP_MANAGER_LOGIN_WINDOW` | `10m` | окно login throttling |
+| `WEB_SETUP_MANAGER_AUTH_SESSION_CAPACITY` | `128` | общий лимит sessions, `1..10000` |
+| `WEB_SETUP_MANAGER_REMOTE_AUTH_TOKEN` | нет | optional Bearer для automation; если задан, минимум 32 символа |
 | `WEB_SETUP_MANAGER_TLS_CERT_FILE` | нет | real regular PEM file, не symlink |
 | `WEB_SETUP_MANAGER_TLS_KEY_FILE` | нет | real regular PEM file, не symlink |
 | `WEB_SETUP_MANAGER_TRUSTED_TLS_PROXY` | `false` | proxy termination acknowledgment |
@@ -172,33 +211,61 @@ Loopback — рекомендуемый kiosk mode. Для любого non-loop
 fail-closed, если одновременно не настроены:
 
 1. `WEB_SETUP_MANAGER_REMOTE_ACCESS=true`;
-2. случайный token длиной минимум 32 символа;
-3. пара TLS cert/key либо `WEB_SETUP_MANAGER_TRUSTED_TLS_PROXY=true`.
+2. существующий non-root `WEB_SETUP_MANAGER_ALLOWED_USER`, совпадающий с
+   effective process user;
+3. PAM-capable production binary и рабочая policy
+   `/etc/pam.d/websetupmanager` (либо имя из `PAM_SERVICE`);
+4. пара TLS cert/key либо `WEB_SETUP_MANAGER_TRUSTED_TLS_PROXY=true`.
 
 Прямой TLS:
 
 ```text
 WEB_SETUP_MANAGER_LISTEN_ADDRESS=192.0.2.10:8443
 WEB_SETUP_MANAGER_REMOTE_ACCESS=true
-WEB_SETUP_MANAGER_REMOTE_AUTH_TOKEN=<long-random-secret>
+WEB_SETUP_MANAGER_ALLOWED_USER=cncoperator
+WEB_SETUP_MANAGER_PAM_SERVICE=websetupmanager
 WEB_SETUP_MANAGER_TLS_CERT_FILE=/etc/websetupmanager/tls.crt
 WEB_SETUP_MANAGER_TLS_KEY_FILE=/etc/websetupmanager/tls.key
 ```
 
 Backend принимает только TLS 1.3+. Cert/key должны быть regular files и не
-symlink; key ограничьте `0640` и группой сервиса. Интерактивный браузер может
-использовать HTTP Basic: username `websetup`, password — configured token.
-API-клиент может отправить `Authorization: Bearer <token>`. Не помещайте token в
-URL, shell history, proxy access log или frontend bundle; ротация требует
-рестарта и повторной аутентификации.
+symlink; key ограничьте `0640` и группой сервиса. Откройте HTTPS URL: публичные
+SPA assets и `GET /api/v1/auth/session` позволят показать форму входа. Введите
+точно `ALLOWED_USER` и его Linux/PAM password. Backend всегда выполняет PAM
+authentication и account-management check только для настроенной учётной
+записи; неизвестное имя получает ту же общую ошибку и не выбирает другой OS
+account. Login защищён лимитами по client IP и submitted username.
+
+Успешный login создаёт opaque cookie
+`__Host-websetupmanager_session` с `Secure`, `HttpOnly`, `SameSite=Strict` и
+`Path=/`. Обычная session ограничена idle и absolute timeout. Флажок
+«Запомнить меня» задаёт fixed remember deadline и сохраняет в SQLite только
+SHA-256 hash случайного cookie token, CSRF token, username, timestamps и
+deployment scope; password и raw cookie token не сохраняются. Logout отзывает
+эту session. Каждая browser mutation требует точные HTTPS `Host`/`Origin` и
+индивидуальный session CSRF token. Local loopback mode остаётся implicit и
+использует startup CSRF без login.
+
+HTTP Basic не поддерживается и browser password prompt не используется. Для
+неинтерактивной automation можно отдельно задать случайный
+`WEB_SETUP_MANAGER_REMOTE_AUTH_TOKEN` длиной минимум 32 символа и отправлять
+`Authorization: Bearer <token>`; это необязательный второй credential path, а
+не пароль формы. Не помещайте Bearer secret в URL, shell history, proxy access
+log или frontend bundle; ротация требует рестарта.
+
+Self-signed certificate шифрует transport, но browser не считает его доверенным
+автоматически. Установите certificate/его CA в доверенное хранилище управляемых
+clients либо используйте certificate от принятой локальной/public CA; не
+приучайте оператора постоянно обходить TLS warning.
 
 При TLS termination proxy оставьте Backend по возможности на отдельном
 loopback/Unix-isolated network и ограничьте доступ firewall. Trusted flag лишь
 подтверждает deployment policy: он не проверяет proxy сам. Proxy обязан
-отбрасывать client-supplied forwarding/auth headers, передавать Basic/Bearer и
-переписывать `Host` и `Origin` к exact configured Backend authority для
-same-origin mutation checks. Сначала проверьте GET и тестовую draft mutation;
-не отключайте Host/Origin/CSRF проверки.
+отбрасывать client-supplied forwarding/auth headers, передавать session cookie
+и optional Bearer, сохранять внешний `Host` и обеспечивать точное совпадение
+HTTPS `Origin` с ним для login/logout/mutation checks. Сначала проверьте guest
+session response, login, capabilities, тестовую draft mutation и logout; не
+отключайте Host/Origin/CSRF проверки.
 
 ## 5. Резервное копирование
 
@@ -225,6 +292,9 @@ curl --fail --silent http://127.0.0.1:8080/readyz
 SQLite online backup используется самим migration layer перед необратимой
 миграцией, но отдельного публичного operator CLI для online full-library backup
 нет; поэтому hot copy не документируется как согласованная процедура.
+State backup содержит hash-only remembered-session rows. Защищайте его как
+authentication state: password/raw cookie там нет, но matching browser token и
+тот же deployment scope могут восстановить session после cold restore.
 
 ## 6. Восстановление
 
@@ -247,10 +317,10 @@ SQLite online backup используется самим migration layer пер�
 sudo systemctl stop websetupmanager
 sudo mv /var/lib/websetupmanager /var/lib/websetupmanager.failed
 sudo mv /srv/websetupmanager/library /srv/websetupmanager/library.failed
-sudo install -d -o websetupmanager -g websetupmanager -m 0750 /var/lib/websetupmanager /srv/websetupmanager/library
+sudo install -d -o cncoperator -g cncoperator -m 0750 /var/lib/websetupmanager /srv/websetupmanager/library
 sudo rsync -aHAX --numeric-ids /backup/wsm-2026-08-20/state/ /var/lib/websetupmanager/
 sudo rsync -aHAX --numeric-ids /backup/wsm-2026-08-20/library/ /srv/websetupmanager/library/
-sudo chown -R websetupmanager:websetupmanager /var/lib/websetupmanager /srv/websetupmanager/library
+sudo chown -R cncoperator:cncoperator /var/lib/websetupmanager /srv/websetupmanager/library
 sudo systemctl start websetupmanager
 ```
 
@@ -300,7 +370,8 @@ journalctl -u websetupmanager -f --output=cat
 HTTP записи содержат безопасные request/entity/job IDs, route, status,
 duration, bytes и stable error code. Доменные create/import/validate/current/
 replace/duplicate/archive/restore/permanent-delete имеют audit events в SQLite.
-Логи не должны содержать token, G-code, SQL, storage key или absolute path.
+Логи не должны содержать password, raw session cookie, Bearer token, G-code,
+SQL, storage key или absolute path.
 Если это обнаружено, ограничьте доступ к журналу, сохраните forensic copy и
 ротируйте secret. Не вставляйте пользовательское содержимое в командную строку.
 
@@ -332,6 +403,9 @@ notes явно подтверждают schema compatibility.
 |---|---|
 | `/healthz` недоступен | `systemctl status`, logs, unit/env, порт; не удалять данные |
 | health 200, ready не 200 | проверить mount/права/free space/SQLite logs; остановить при повторе |
+| remote startup сообщает `AUTHENTICATION_UNAVAILABLE` | проверить PAM production build/libpam, `/etc/pam.d/websetupmanager` и account status; не включать обход login |
+| startup сообщает account mismatch | сделать `User=`/`Group=` unit равными `ALLOWED_USER`; не запускать от root или другого account |
+| login отклонён/ограничен | проверить точное имя `ALLOWED_USER`, Linux password/account policy, HTTPS Origin и дождаться throttle window; не логировать password |
 | startup сообщает второй процесс | найти владельца unit/lock; не удалять lock при живом процессе |
 | import/download завис | проверить network/disk; отменить job; sliding I/O idle timeout завершит stall/slow client |
 | `INSUFFICIENT_STORAGE` | освободить место вне managed roots или расширить FS; повторить operation |
@@ -341,7 +415,8 @@ notes явно подтверждают schema compatibility.
 | corrupt/migration checksum | остановить, сохранить roots, восстановить matching backup; не пересоздавать DB |
 | после crash job имеет `PROCESS_INTERRUPTED`/`conflict` | сверить setup revision, terminal job и audit; повторить с новым key только незавершённую operation; при сомнении остановить сервис и restore backup |
 | подозрение на symlink/FIFO/socket | остановить, сохранить forensic copy; не открывать объект shell-инструментом от root |
-| token раскрыт | сменить secret, рестарт, очистить proxy/journal exposure, проверить audit |
+| optional Bearer раскрыт | сменить secret в root-only env, рестарт, очистить proxy/journal exposure, проверить audit |
+| browser session скомпрометирована | выполнить logout в доступной session; при недоступности временно остановить remote endpoint и провести credential/session incident procedure до возобновления |
 | TLS certificate истекает | установить новую regular-file пару, проверить ownership, controlled restart |
 
 После любого восстановления запишите время, версию binary, backup generation,
@@ -358,12 +433,31 @@ Development suite также проверил durable pre-commit recovery, post-
 terminal job/replay для replace/duplicate/validation/restore и настоящий
 subprocess SIGKILL rollback для archive/delete/current. Это не заменяет
 повторяемый power-loss drill import/replace/duplicate на target filesystem.
-До production rollout отдельно выполните:
+
+После PAM integration обычные и PAM-tagged Go suites/race/vet прошли; отдельный
+non-PAM remote binary подтвердил fail-closed
+`AUTHENTICATION_UNAVAILABLE`. Frontend lint/typecheck, 12 files/83 tests и Vite
+production build прошли; `scripts/build.sh` прошёл целиком. Production binary
+собран с tags `production,pam`. На текущем amd64 host (2026-08-20)
+`websetupmanager.service` enabled/active от Linux-пользователя `user` и слушает
+`https://microb.int:443`. Live direct-TLS проверка зафиксировала health/ready
+200, guest session и закрытые capabilities, обычный PAM login/logout, затем
+remembered PAM login, только SHA-256 cookie-token hash в SQLite, graceful
+restart, восстановленную authenticated session и logout с удалением remembered
+row. SHA-256 установленного binary:
+`5df67ec084ec30e0f253f6fd38f565adbe9e4eb8656edc180f3fa2454be8469d`.
+Текущий certificate self-signed с SAN `microb.int` и `10.0.1.136`; его доверие
+на управляемом browser/client остаётся отдельным deployment действием.
+
+До признания target qualification завершённой отдельно выполните:
 
 - arm64 runtime, если целевая архитектура arm64;
 - cold start/RSS/CPU/stream memory/10k-library/first-viewport measurements;
 - controlled-browser visual, keyboard, 10 GiB preview/search and malicious
   PDF/HTML network/console walkthrough;
-- direct TLS или trusted reverse-proxy deployment drill;
+- trusted reverse-proxy variant, если он будет использоваться, и provisioning
+  доверия к выбранному production certificate на browser clients;
+- полный controlled-browser PAM walkthrough, включая expiry/throttling и
+  optional Bearer deployment только если automation credential будет включён;
 - cold backup/restore/upgrade drill на target filesystem;
 - SIGKILL/power-loss fault drill с последующей recovery-проверкой.

@@ -6,6 +6,11 @@
 непроведённой target qualification. Статусы требований и точное evidence
 находятся в [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md).
 
+Важно: результаты этапов 1–7 ниже относятся к baseline до добавления
+PAM/browser-session auth. Они сохраняются как история, но не считаются
+самостоятельным evidence новой auth-версии; повторный integrated прогон и live
+deployment записаны в этапе 8.
+
 ## Discovery и этап 1 — каркас приложения
 
 - Полностью прочитан `functional-requirements.ru.md`; извлечено ровно 221 P0 ID.
@@ -13,9 +18,9 @@
 - Созданы Go module, embedded migrations/SPA, config, storage roots,
   `/healthz`, `/readyz`, security middleware, build/dev/test commands.
 - Созданы базовые domain DTO/error/name/revision validators и React shell.
-- Evidence: backend unit/integration, frontend baseline, production amd64 build,
-  arm64 cross-build и local health/readiness smoke были зелёными. arm64 runtime
-  не выполнялся.
+- Evidence baseline: backend unit/integration, frontend, local amd64
+  health/readiness smoke были зелёными. Текущая arm64 PAM build/runtime
+  qualification не выполнялась.
 
 ## Этап 2 — домен и хранение данных
 
@@ -74,7 +79,7 @@
   conflict/offline/error/empty states и recent/UI-state recovery.
 - Modal trap/initial/return focus; actions are visible buttons and statuses are
   textual. Current selection requires explicit no-execution confirmation.
-- Evidence on the current tree: App 16, API client 11, ImportWizard 10,
+- Evidence на pre-auth baseline: App 16, API client 11, ImportWizard 10,
   program/setup operation dialogs 5, Modal 5, create-name preflight 1 and
   client-state 2 tests (50 stage-5 component/client tests).
 - Проверки после финальной интеграции: весь frontend Vitest — 68/68;
@@ -122,7 +127,7 @@
 - Full SHA reconcile безопасно rebind-ит идентичные bytes после cold copy к
   новой physical version, но оставляет setup не-ready до validation;
   `TestFullReconcileRebindsIdenticalColdCopyWithoutClearingAttention` passed.
-- Финальный tree: `gofmt -l` empty, `git diff --check` passed,
+- Pre-auth baseline tree: `gofmt -l` empty, `git diff --check` passed,
   `go mod tidy -diff` empty, `go vet ./...` passed.
 - `go test ./... -count=1 -timeout=3m` passed (`internal/httpapi` 2.577 s,
   `internal/service` 3.490 s); final JSON-count rerun recorded 7 packages,
@@ -133,17 +138,59 @@
 - A clean `git archive` checkout completed `scripts/build.sh` from a missing
   `web/dist`, `node_modules` and `build` tree: npm restore, lint, typecheck,
   68/68 tests, Vite build, Go tests/vet and embedded production build passed.
-- Static amd64 production SHA-256
-  `f79750f8e8cf06313e76cddb6cffb0898badd9ce50f9c8092a8538064a486f67`;
-  arm64 `CGO_ENABLED=0` cross-build SHA-256
-  `fd8a4f2d086ca1f86dc2bcf8495804ff0fe87a30e72575692512065ef0e39008`.
-- Production smoke passed healthz/readyz, embedded index/current asset, `/fs`
+- Pre-auth production smoke passed healthz/readyz, embedded index/current asset, `/fs`
   404, CSRF create+library list, HEAD and graceful signal exit code 0.
 - Headless Firefox loaded same-origin API/assets and captured a loading-state
   screenshot; this is only a smoke and does not close visual/keyboard/viewer ACs.
 - Mechanical matrix check found exactly 221 unique P0 IDs and 20 unique AC IDs,
   with no missing/extra P0 identifier in `IMPLEMENTATION_PLAN.md`.
 - Не закрыты внешние target gates: arm64 runtime, численные NFR на LinuxCNC
-  workstation, controlled-browser AC-12/16/20, direct TLS/proxy deployment и
-  repeated import/replace/duplicate power-loss AC-19. Они перечислены отдельно
-  в plan/operator docs и не названы пройденными.
+  workstation, controlled-browser AC-12/16/20, conditional trusted-proxy/client
+  certificate-trust deployment и repeated import/replace/duplicate power-loss
+  AC-19. Они перечислены отдельно в plan/operator docs и не названы пройденными.
+
+## Этап 8 — PAM login и browser sessions
+
+- Добавлена fail-closed remote policy: configured non-root allowed user должен
+  совпасть с process EUID; production remote требует Linux/cgo PAM adapter и
+  TLS 1.3 либо явно trusted TLS proxy. Сборка без PAM остаётся только local-dev
+  вариантом и remote mode не запускает.
+- Добавлены публичные SPA/auth session/login/logout routes без HTTP Basic;
+  domain API защищён opaque `__Host-` Secure/HttpOnly/SameSite-Strict cookie или
+  optional Bearer automation secret. Session mutations используют exact HTTPS
+  Host/Origin и отдельный CSRF; login ограничен по IP/имени, concurrency и
+  общей session capacity.
+- PAM проверяет только configured Linux account (`authenticate` +
+  `account management`) и не хранит password. Обычные sessions memory-only;
+  «Запомнить меня» в migration 002 сохраняет только SHA-256 token hash, CSRF,
+  username, timestamps и deployment scope. Raw cookie token/password в SQLite
+  отсутствуют.
+- Frontend начинает с session discovery, показывает доступную русскую форму
+  входа, очищает/refocus password при общей ошибке, обрабатывает expiry/401 для
+  fetch и streaming XHR и предоставляет явный logout.
+- Добавлены PAM policy template и обновлён operator deployment contract:
+  service account равен `ALLOWED_USER`; build использует
+  `CGO_ENABLED=1 -tags "production pam"` и системный libpam.
+- Untagged `go test ./... -count=1` и race suite прошли; в race run
+  `internal/service` завершился за 53.682 s. Полные PAM-tagged Go test/race/vet
+  также прошли. Отдельный non-PAM remote binary ожидаемо завершился с exit 1 и
+  stable `AUTHENTICATION_UNAVAILABLE`.
+- Frontend lint/typecheck прошли; Vitest — 12 files/83 tests; TypeScript/Vite
+  production build прошёл. Полный `scripts/build.sh` и
+  `CGO_ENABLED=1 -tags "production pam"` Go build прошли.
+- Build и установленный `/opt/websetupmanager/current/bin/websetupmanager`
+  совпадают: SHA-256
+  `5df67ec084ec30e0f253f6fd38f565adbe9e4eb8656edc180f3fa2454be8469d`;
+  metadata подтверждает Go 1.26.5/cgo/`production,pam`, runtime — `libpam.so.0`.
+- `/etc/pam.d/websetupmanager` root-owned `0644`, env root-owned `0600`, TLS key
+  root:`user` `0640`; systemd unit enabled/active от `user` и слушает
+  `10.0.1.136:443`. Live health/readiness вернули 200, TLS 1.2 отклонён.
+- Live auth sequence: guest session 200 при capabilities 401; normal PAM login,
+  authenticated session/capabilities и logout; remembered PAM login с только
+  SHA-256 token hash в SQLite, graceful service restart, восстановленная
+  authenticated session и logout с удалением row — passed.
+  HTTP logs содержали только безопасные route/status/size fields, без password,
+  raw cookie или username.
+- Current certificate self-signed для `microb.int`/`10.0.1.136`; client trust,
+  controlled-browser walkthrough и optional trusted-proxy deployment остаются
+  отдельными operational/target gates.

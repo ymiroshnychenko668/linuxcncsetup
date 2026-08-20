@@ -17,17 +17,23 @@ LinuxCNC-станка. Основная сущность — **Setup**: одна
 - journal, audit, idempotency, startup recovery, reconcile и reference-safe GC;
 - атомарный commit доменного результата вместе с terminal persistent job; для
   upload в тот же commit входит run-idempotency result и content digest.
+- в remote mode — Linux PAM login, защищённые browser sessions, logout,
+  «Запомнить меня», per-session CSRF и ограничение попыток входа; встроенного
+  логина или пароля нет.
 
-Production targets: Linux amd64/arm64. Development baseline зафиксирован в
-[DECISIONS.md](DECISIONS.md); arm64 runtime и численные target NFR требуют
-проверки на целевом станке.
+Production targets: Linux amd64/arm64. Production build использует cgo и PAM;
+на build host нужны PAM headers/library, на target — совместимый PAM runtime.
+Development baseline зафиксирован в [DECISIONS.md](DECISIONS.md); arm64 PAM
+build/runtime и численные target NFR требуют проверки на целевом станке.
 
 ## Быстрый старт разработки
 
-Требуются Go 1.26.5+ и Node.js 18–22 с npm. Из этого каталога:
+Требуются Go 1.26.5+, Node.js 18–22 с npm, C toolchain и PAM development files
+(`libpam0g-dev` в Debian/Ubuntu). Из этого каталога:
 
 ```bash
 make test
+make test-pam
 make test-race
 make lint
 make typecheck
@@ -35,10 +41,13 @@ make vet
 make build
 ```
 
-`make build` сначала создаёт Vite bundle, затем встраивает `web/dist` в один
-binary `build/websetupmanager`. `./scripts/build.sh` выполняет обычную полную
-последовательность проверок и сборки. Makefile также обнаруживает закреплённый
-toolchain репозитория, если `go` отсутствует в `PATH`.
+`make build` сначала создаёт Vite bundle, затем выполняет
+`CGO_ENABLED=1 go build -tags "production pam"` и встраивает `web/dist` в
+`build/websetupmanager`. `./scripts/build.sh` выполняет полную
+последовательность проверок и PAM production-сборку. Makefile также обнаруживает
+закреплённый toolchain репозитория, если `go` отсутствует в `PATH`. Сборка без
+PAM допустима для локальной разработки, но намеренно отказывается запускать
+remote mode.
 
 Для разработки в двух терминалах используйте только disposable roots:
 
@@ -77,21 +86,39 @@ PDF/HTML Setup Sheet загружаются потоково. Общий раз�
 незавершённый HTML token ограничен 1 MiB и проверяется до публикации,
 чтобы sanitizer имел bounded memory.
 
-## Проверенный development build
+## Проверенная PAM-сборка и текущий host
 
-На финальном tree прошли `gofmt`, `git diff --check`, `go mod tidy -diff`,
-`go vet ./...`, обычный и race Go suites, frontend lint/typecheck, 68/68 Vitest,
-Vite production build, статические amd64/arm64 builds и production smoke с
-health/readiness, embedded assets, CSRF mutation, HEAD, отсутствием `/fs` и
-graceful signal shutdown. SHA-256 binaries:
+После интеграции прошли обычные и PAM-tagged backend-команды:
 
-- amd64: `f79750f8e8cf06313e76cddb6cffb0898badd9ce50f9c8092a8538064a486f67`;
-- arm64 cross-build: `fd8a4f2d086ca1f86dc2bcf8495804ff0fe87a30e72575692512065ef0e39008`.
+```bash
+go test ./... -count=1
+go test -race ./... -count=1 -timeout=10m
+CGO_ENABLED=1 go test -tags pam ./...
+CGO_ENABLED=1 go test -race -tags pam ./...
+CGO_ENABLED=1 go vet -tags pam ./...
+CGO_ENABLED=1 go build -tags "production pam" ./cmd/websetupmanager
+```
 
-Arm64 runtime, численные NFR на целевом LinuxCNC-компьютере, controlled-browser
-viewer/keyboard walkthrough, real TLS/proxy deployment и repeated target
-power-loss остаются отдельной qualification; cross-build и headless smoke их не
-заменяют.
+Frontend lint и typecheck прошли; Vitest — 12 files/83 tests; Vite production
+build прошёл и встроен в Go binary. Полный `scripts/build.sh` также прошёл.
+Отдельная non-PAM сборка в remote mode ожидаемо завершилась с exit 1 и
+`AUTHENTICATION_UNAVAILABLE`. Установленный amd64 artifact собран Go 1.26.5 с
+`CGO_ENABLED=1`, tags `production,pam`, использует системный `libpam.so.0` и
+имеет SHA-256
+`5df67ec084ec30e0f253f6fd38f565adbe9e4eb8656edc180f3fa2454be8469d`.
+
+На текущем host (2026-08-20) `websetupmanager.service` установлен как enabled и active от
+пользователя `user`, слушает `https://microb.int:443`; `/healthz` и `/readyz`
+возвращают 200. Live direct-TLS flow подтвердил guest session, защищённые
+capabilities, реальный PAM login/logout и «Запомнить меня» через graceful
+service restart с последующим logout. Сертификат текущего host self-signed для
+`microb.int`/`10.0.1.136`, поэтому client должен явно доверять ему; это не
+заменяет развёртывание доверенного PKI certificate.
+
+Arm64 PAM build/runtime, численные NFR на целевом LinuxCNC-компьютере,
+controlled-browser viewer/keyboard walkthrough, trusted-proxy variant и
+repeated target power-loss остаются отдельной qualification; live host smoke их
+не заменяет.
 
 ## Основная конфигурация
 
@@ -121,13 +148,28 @@ symlink, не совпадать и не быть вложенными друг 
 | `WEB_SETUP_MANAGER_DELETE_CONFIRMATION_TTL` | `5m` |
 | `WEB_SETUP_MANAGER_IMPORT_SESSION_EXPIRY` | `24h` |
 | `WEB_SETUP_MANAGER_RECONCILE_INTERVAL` | `1m` |
+| `WEB_SETUP_MANAGER_REMOTE_ACCESS` | `false`; включает защищённый remote mode |
+| `WEB_SETUP_MANAGER_ALLOWED_USER` | нет; обязательный non-root Linux user для remote mode |
+| `WEB_SETUP_MANAGER_PAM_SERVICE` | `websetupmanager` |
+| `WEB_SETUP_MANAGER_AUTH_IDLE_TIMEOUT` | `30m` |
+| `WEB_SETUP_MANAGER_AUTH_ABSOLUTE_TIMEOUT` | `12h` |
+| `WEB_SETUP_MANAGER_AUTH_REMEMBER_TIMEOUT` | `720h` (30 суток) |
+| `WEB_SETUP_MANAGER_AUTH_CONCURRENCY` | `4` |
+| `WEB_SETUP_MANAGER_LOGIN_ATTEMPTS` | `5` на окно/IP и имя |
+| `WEB_SETUP_MANAGER_LOGIN_WINDOW` | `10m` |
+| `WEB_SETUP_MANAGER_AUTH_SESSION_CAPACITY` | `128` |
+| `WEB_SETUP_MANAGER_REMOTE_AUTH_TOKEN` | нет; optional Bearer для automation, минимум 32 символа |
+| `WEB_SETUP_MANAGER_TLS_CERT_FILE`, `WEB_SETUP_MANAGER_TLS_KEY_FILE` | нет; direct TLS pair |
+| `WEB_SETUP_MANAGER_TRUSTED_TLS_PROXY` | `false` |
 
-Не-loopback bind разрешён только при явном
-`WEB_SETUP_MANAGER_REMOTE_ACCESS=true`, token длиной не менее 32 символов и
-TLS certificate/key либо явно доверенном TLS proxy. Небезопасного remote mode
-нет. Полный список, systemd example, TLS/auth, backup/restore, upgrade, recovery,
-GC и incident runbook находятся в
-[OPERATOR_GUIDE.ru.md](OPERATOR_GUIDE.ru.md).
+Remote mode требует `WEB_SETUP_MANAGER_REMOTE_ACCESS=true`, настроенный
+`WEB_SETUP_MANAGER_ALLOWED_USER`, PAM-capable production binary и TLS
+certificate/key либо явно доверенный TLS proxy. Процесс обязан работать именно
+от `ALLOWED_USER`. Браузер показывает обычную форму входа и использует Linux
+пароль этого пользователя; optional Bearer secret нужен только API automation.
+В loopback local mode вход не требуется. Полный список, PAM policy, systemd
+example, TLS/auth, backup/restore, upgrade, recovery, GC и incident runbook
+находятся в [OPERATOR_GUIDE.ru.md](OPERATOR_GUIDE.ru.md).
 
 ## Документы
 

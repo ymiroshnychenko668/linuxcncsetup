@@ -11,7 +11,9 @@ Debian 13.5 Trixie, kernel `6.12.95+deb13-rt-amd64` PREEMPT_RT, x86_64 и ext4.
 Filesystem должна поддерживать atomic rename, fsync, sparse files и 64-bit
 offsets. `openat2` с требуемыми resolve flags проверен реальным syscall;
 root-anchored `*at` fallback покрывается тем же suite. Linux arm64 production
-binary cross-build проходит, но runtime qualification требует arm64-хост.
+поддерживается как target, но новая cgo/PAM-сборка и runtime qualification
+требуют arm64 toolchain/sysroot с libpam либо нативный arm64-хост; прежний
+non-PAM cross-build не является evidence для текущей production-сборки.
 
 ## D-002: storage roots
 
@@ -38,9 +40,23 @@ API field.
 
 Default listener — `127.0.0.1:8080`. Local mode использует same-origin Host /
 Origin checks и случайный CSRF token, читаемый только через same-origin
-capabilities. Не-loopback bind разрешён только при явной remote настройке,
-Bearer token длиной не менее 32 символов и TLS 1.3 (или явно доверенном TLS
-proxy); иначе startup завершается ошибкой.
+capabilities; login в этом режиме implicit. Remote mode разрешён только при
+явной настройке, Linux PAM-capable production binary, одном настроенном non-root
+`AllowedUser`, совпадающем с effective process user, и TLS 1.3 (или явно
+доверенном TLS proxy); иначе startup завершается ошибкой.
+
+SPA и узкие auth endpoints доступны до входа, чтобы показать собственную форму
+вместо HTTP Basic prompt. PAM выполняет authentication и account-management
+check только настроенного аккаунта и возвращает одинаковую внешнюю ошибку для
+неверного имени/пароля. Успешный вход выдаёт случайную opaque
+`__Host-websetupmanager_session` cookie (`Secure`, `HttpOnly`,
+`SameSite=Strict`, `Path=/`); browser mutation требует точный HTTPS
+Host/Origin и отдельный session CSRF. Обычные sessions живут только в памяти с
+idle/absolute deadline. «Запомнить меня» имеет fixed deadline и сохраняет в
+SQLite только SHA-256 token hash, CSRF, имя, времена и deployment scope — не
+password и не raw token. Login ограничен по IP/имени, PAM concurrency и общей
+session capacity. Случайный Bearer token длиной не менее 32 символов остаётся
+необязательным credential для automation; HTTP Basic отсутствует.
 
 ## D-006: document viewers
 
@@ -59,10 +75,19 @@ file behavior в development environment. Числа реального LinuxCNC
 
 ## D-008: SQLite implementation
 
-Используется pure-Go `modernc.org/sqlite` v1.57.0. Это даёт один статический
-amd64/arm64 binary без системного SQLite/CGO и одновременно предоставляет
-SQLite online backup API для необратимых migrations. Подключение включает WAL,
-foreign keys, busy timeout, synchronous FULL и process lock.
+SQLite реализован pure-Go `modernc.org/sqlite` v1.57.0 и не требует системной
+SQLite library; он предоставляет online backup API для необратимых migrations.
+Подключение включает WAL, foreign keys, busy timeout, synchronous FULL и process
+lock. Однако production binary в целом намеренно собирается с
+`CGO_ENABLED=1 -tags "production pam"` и зависит от системного libpam: это
+необходимо для нормальной OS-аутентификации remote mode. Сборка без PAM может
+использоваться для local development, но remote startup fail-closed.
+
+Migration `002_auth_sessions.sql` добавляет только remembered browser-session
+index. Первичный ключ — hex SHA-256 от opaque cookie token; raw token и password
+никогда не попадают в SQLite. Username, CSRF, creation/expiry и deployment scope
+нужны для проверки, logout и invalidation при изменении security-relevant
+deployment state.
 
 ## D-009: names and collisions
 
@@ -138,18 +163,25 @@ durable запись `database_applied`: crash до commit не публикуе
 ## D-017: development evidence is not target qualification
 
 Development evidence получено на Debian 13.5, Linux
-`6.12.95+deb13-rt-amd64` PREEMPT_RT, ext4, Go 1.26.5, Node 20.19.2. amd64 binary
-запускался локально; arm64 проверен cross-build, но не runtime. Headless Firefox
-выполнил только same-origin asset/API smoke и screenshot loading-state; в
-окружении нет подходящей controlled browser automation и реального
-LinuxCNC-станка. Поэтому численные NFR, полный keyboard/visual walkthrough,
-измерение браузерной памяти/DOM на
-10 GiB, активное содержимое PDF/HTML под наблюдением сети, TLS/reverse-proxy
-Deployment и повторяемый import/replace/duplicate power-loss остаются отдельными
-target scenarios; actual SIGKILL для archive/delete/current уже проверен в
-development environment.
-Автоматические unit/integration tests подтверждают инварианты и отказоустойчивые
-состояния, но документация не называет эти внешние проверки пройденными.
+`6.12.95+deb13-rt-amd64` PREEMPT_RT, ext4, Go 1.26.5, Node 20.19.2. После auth
+integration полный Go test/race/vet прошёл с `CGO_ENABLED=1 -tags pam`, frontend
+lint/typecheck и 12 files/83 tests прошли, а production amd64 artifact собран с
+tags `production,pam`; untagged Go/race и полный `scripts/build.sh` также прошли.
+Non-PAM remote binary отдельно подтвердил fail-closed startup. На этом же host
+direct TLS 1.3 проверен с реальным PAM login/logout и hash-only remembered
+session через graceful restart; systemd service enabled/active. Это закрывает
+конкретный integrated development/host gate, но не переносится автоматически на
+другую машину или transport termination mode.
+
+Headless Firefox ранее выполнил только same-origin asset/API smoke и screenshot
+loading-state; подходящей controlled browser automation и реального
+LinuxCNC-станка нет. Поэтому численные NFR, полный keyboard/visual walkthrough,
+измерение browser memory/DOM на 10 GiB, активное содержимое PDF/HTML под
+наблюдением сети, client trust для production certificate, trusted-proxy
+variant, arm64 PAM build/runtime и повторяемый import/replace/duplicate
+power-loss остаются отдельными target scenarios. Actual SIGKILL для
+archive/delete/current уже проверен в development environment. Документация не
+называет эти внешние проверки пройденными.
 
 ## D-018: operator backup, recovery and GC boundaries
 
@@ -158,8 +190,9 @@ development environment.
 `state_dir` и `library_dir` при остановленном процессе. Восстановление выполняется
 только при остановленном Backend в подготовленные disjoint roots с тем же
 владельцем; ручная замена отдельных SQLite/object-файлов запрещена. Reconcile,
-очистка expired sessions и reference-safe GC запускаются в background сразу
-после открытия listener и затем периодически; до listener выполняются только
+очистка expired import/idempotency/delete-confirmation records и reference-safe
+GC запускаются в background сразу после открытия listener и затем периодически;
+до listener выполняются только
 обязательная recovery и bounded identity-проверка ссылок. Частая проверка
 identity не хэширует гигабайтные объекты; полная SHA-256 сверка выполняется при
 первом background-проходе и раз в сутки. Оператор может безопасно инициировать

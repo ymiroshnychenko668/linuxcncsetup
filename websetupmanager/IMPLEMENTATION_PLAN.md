@@ -25,18 +25,23 @@ physical layout не входят в public DTO/error. Endpoint для испо�
 ```text
 React SPA + PDF.js + G-code Web Worker
                     |
-       same-origin /api/v1 + CSRF/auth
+       same-origin /api/v1 + session CSRF
                     v
-Go HTTP API -> Service transactions -> SQLite/WAL
-                    |                 journal/audit/jobs/UI state
-                    v
-      root-FD managed immutable object store
+Go HTTP API -------- login --------> Linux PAM (configured account)
+      |
+      v
+Service transactions -------------> SQLite/WAL
+      |                              journal/audit/jobs/UI state
+      |                              remembered token hashes
+      v
+root-FD managed immutable object store
 ```
 
 | Package | Ответственность |
 |---|---|
 | `cmd/websetupmanager` | config/startup, non-root guard, TLS, signals, maintenance, embedded SPA |
 | `internal/config` | defaults/env, fail-closed remote policy, canonical disjoint roots/TLS files |
+| `internal/auth` | Linux PAM adapter, opaque memory/remembered SQLite sessions and bounded login throttling |
 | `internal/database` | process lock, quick-check, WAL/FK/FULL, embedded checked migrations, backup/recovery |
 | `internal/domain` | stable IDs/DTO/errors, names, states/revisions, streaming G-code validation |
 | `internal/storage` | held root FDs, openat2/*at resolver, staging/publish/read/version/GC primitives |
@@ -53,13 +58,16 @@ Go HTTP API -> Service transactions -> SQLite/WAL
 5. Setup library/card/import/current/jobs/accessibility baseline.
 6. Range/ETag virtualized G-code preview and PDF/HTML viewers.
 7. Acceptance/path/race/sparse/recovery suites and operator documentation.
+8. PAM login/browser-session implementation, remembered-session migration and
+   accessible login/logout UI; PAM-tagged test/race/vet/build, 83 frontend tests
+   and live direct-TLS login/remember/restart/logout verified.
 
 Фактический progress/gate log: [PROGRESS_LOG.md](PROGRESS_LOG.md). Решения
 неоднозначностей: [DECISIONS.md](DECISIONS.md).
 
 ## Модель данных
 
-SQLite хранит metadata, но не большие bytes. Initial checked migration создаёт:
+SQLite хранит metadata, но не большие bytes. Checked migrations создают:
 
 | Table | Назначение и ключевые инварианты |
 |---|---|
@@ -76,6 +84,7 @@ SQLite хранит metadata, но не большие bytes. Initial checked mi
 | `audit_events` | safe operation/entity/revision/result history |
 | `idempotency_requests` | key + canonical request hash + typed result + TTL |
 | `delete_confirmations` | setup/revision/name-bound short-lived irreversible token |
+| `auth_sessions` | только remembered session: SHA-256 token hash, username, CSRF, creation/expiry и deployment scope |
 
 IDs — random canonical 128-bit hex. `setups.revision` increments once in the same
 SQLite transaction as a successful logical mutation. Ready requires at least one
@@ -86,6 +95,11 @@ Object reference truth is DB FK/ref rows plus journal reservations, not filename
 Duplicate gets new setup/artifact IDs but may share immutable object; future
 replacement changes only one link. See journal checkpoint collapse in D-016.
 
+Обычные browser sessions живут только в bounded memory store. Remembered row не
+содержит Linux password или raw cookie token; смена configured user/deployment
+scope инвалидирует несовместимые rows. Session cookie остаётся недоступной
+JavaScript, а CSRF выдаётся только уже аутентифицированной same-origin session.
+
 ## Public API
 
 JSON uses camelCase. Errors contain stable `code`, `message`, `requestId`, optional
@@ -95,6 +109,7 @@ JSON uses camelCase. Errors contain stable `code`, `message`, `requestId`, optio
 | Area | Routes |
 |---|---|
 | Runtime | `GET /healthz`, `GET /readyz`, `GET /api/v1/capabilities` |
+| Authentication | `GET /api/v1/auth/session`, `POST /api/v1/auth/login`, `POST /api/v1/auth/logout` |
 | Library/detail | `GET/POST /api/v1/setups`, `GET/PATCH /api/v1/setups/{setupId}` |
 | Import | `POST /api/v1/setup-imports`, `GET/POST/DELETE .../{importId}`, `POST .../artifacts`, `POST .../commit` |
 | Programs | `POST .../{setupId}/programs`, `PUT/PATCH/DELETE .../programs/{artifactId}`, `HEAD/GET .../content` |
@@ -104,6 +119,11 @@ JSON uses camelCase. Errors contain stable `code`, `message`, `requestId`, optio
 | Jobs | `GET /jobs`, `GET/DELETE /jobs/{jobId}` |
 
 No arbitrary path, download, execute, LinuxCNC or filesystem-browse route exists.
+В remote mode SPA/assets, probes и auth routes доступны до входа, а domain API и
+capabilities требуют opaque session cookie либо явно настроенный optional
+Bearer. HTTP Basic отсутствует. Session login/logout/mutations требуют exact
+HTTPS Host/Origin; каждая session имеет собственный CSRF. Local mode возвращает
+implicit authenticated session и сохраняет прежний startup-CSRF contract.
 
 ## Storage strategy
 
@@ -155,16 +175,26 @@ full SHA-256 reconcile followed by expired-record cleanup and reference-safe GC.
 background full scrub. Later identity/cleanup/GC cycles use the configured
 reconcile interval, while a full SHA-256 scrub repeats every 24 hours.
 
+Remote startup additionally requires a PAM-enabled Linux/cgo build, an existing
+configured account equal to the process EUID, and TLS/trusted-proxy policy. PAM
+receives the password only for the login exchange; neither password nor raw
+session cookie is logged or persisted. Ordinary session state remains memory
+only. Remembered sessions persist by SHA-256 token hash in migration 002 and are
+bound to user, listener, PAM service, TLS termination mode and library identity.
+
 ## Test strategy and evidence catalogue
 
 The following labels expand to exact executable or recorded inspection evidence;
-matrix rows never use an unnamed claim.
+matrix rows never use an unnamed claim. Auth-related unit/integration labels
+below passed in the recorded PAM-tagged run; real-account behavior is separate
+live evidence in `M-TLS`.
 
 | Label | Exact automated tests / recorded evidence |
 |---|---|
-| `T-RUN` | `TestNewWebServerAppliesResourceTimeouts`; `TestServeUsesTLSOnlyWhenConfigured`; `TestStreamingBodyUsesSlidingReadIdleDeadline`; `TestBeginShutdownCancelsTrackedOperation`; `TestHealthReadinessAndSafeErrors`; `TestCapabilitiesAreDomainOnlyAndSecured`; `TestStaticSPAAndNoFilesystemAPI`; `TestMutationAuthorizationChecksHostOriginAndCSRF`; `TestRemoteAPIRequiresConstantTimeBearerAuthentication`; `TestHeadAndMethodContracts` |
-| `T-CFG` | `TestLoadDefaultsAndNormalizesExtensions`; `TestValidateRejectsUnsafeRemoteAndExecutableMode`; `TestValidateRootsRejectsOverlapAndCanonicalizes`; `TestErrorsDoNotEchoPhysicalPaths`; `TestValidateFilesRejectsTLSLinkWithoutLeakingPath` |
-| `T-DB` | `TestOpenMigratesFullInitialSchema`; `TestPragmasApplyToEveryConnection`; `TestProcessLockIsExclusiveAndReleased`; `TestProcessLockRejectsSymlinkAndSpecialFile`; `TestOpenRejectsSymlinkStateDirectoryAndDatabase`; `TestEnsureLibraryIsStable`; all four migration tests; `TestStartupRecoveryMakesInterruptedWorkTerminal`; `TestOnlineBackupIsConsistentAndNeverOverwrites`; `TestSchemaEnforcesArtifactInvariantsAndGCGuard` |
+| `T-RUN` | existing server/deadline/probe/static/domain tests plus `TestAuthenticationSessionSupportsLocalAndRemoteGuestModes`; `TestAuthenticationEndpointMethodContracts`; `TestRemoteConstructorFailsClosedWithoutAuthenticationDependencies`; `TestRemoteStaticIsPublicAndProtectedAPIUsesBearerWithoutBasic`; `TestRemoteWithoutOptionalBearerHasNoBearerCredentialPath`; `TestRemoteLoginRequiresExactHTTPSOriginBeforePAM`; `TestRemoteLoginCreatesSecureOpaqueSessionAndCapabilitiesUseItsCSRF`; `TestSessionMutationUsesExactOriginAndPerSessionCSRF`; `TestLogoutRequiresSessionOriginAndCSRFThenRevokesCookie`; `TestRememberedLoginSetsPersistentStrictCookie`; `TestRememberedSessionPersistsOnlyHashAcrossRestartAndLogout`; `TestRemoteLoginThrottlingAndConcurrencyAreBounded`; `TestUnknownUsernameStillAuthenticatesOnlyConfiguredPAMAccount`; `TestDuplicateSessionCookiesAreRejectedWithoutAmbiguity`; `TestExplicitInvalidAuthorizationDoesNotFallBackToValidCookie`; `TestSuccessfulReloginRotatesExistingBrowserSession` |
+| `T-CFG` | existing defaults/root/TLS tests plus `TestValidateRemoteAuthenticationPolicy`; `TestValidateRequiresAuthenticationAndTransportForLoopbackRemoteMode`; `TestRemoteAuthenticationFailsClosedWithoutPAMBuild`; `TestAuthenticationScopeBindsSecurityRelevantDeploymentState` |
+| `T-AUTH` | `TestStoreCreatesOpaqueTokensAndExpiresIdleSession`; `TestStoreCreatesRememberedSessionWithFixedDeadline`; `TestPersistentStoreInvalidatesSessionsWhenUserOrScopeChanges`; `TestPersistentDeleteFailureKeepsRememberedSessionValid`; non-PAM fail-closed tests; real configured-account PAM exercised by `M-TLS` (the credential-driven `TestPAMConfiguredAccount` remains opt-in) |
+| `T-DB` | `TestOpenMigratesFullInitialSchema` including migration 002/auth_sessions; `TestPragmasApplyToEveryConnection`; process-lock/root safety; checked migration/backup/recovery/schema suites |
 | `T-DOM` | all `internal/domain` tests: stable IDs/JSON/errors, NFC/case-fold names, revision/state transitions and bounded ASCII/UTF-8/BOM G-code validation |
 | `T-LIFE` | `TestSetupLifecycleCreateListSearchUpdateAndIdempotency`; `TestListSetupsTenThousandRowsUsesBoundedSQLPagination`; `TestLifecycleSavepointPreventsPartialCreateOnAuditFailure`; `TestCurrentSelectionPersistsAcrossMutationAndRequiresExplicitClear`; `TestRecentAndUIStateAreBoundedStableIDState`; `TestArchiveRestoreDetectsManagedObjectReplacement`; `TestPermanentDeleteConfirmationAndSharedObjectSafety`; `TestDeleteConfirmationExpiresAndArchiveTokensAreInvalidated`; `TestConcurrentMetadataMutationHasSingleWinner` |
 | `T-IMPORT` | `TestImportThreeProgramsAndPDFPublishesExactlyOneSetup`; `TestStorageAdoptionReservationBlocksGarbageCollection`; `TestImportRejectsSecondSetupSheetUntilFirstIsExcluded`; `TestImportFailureCanSaveExplicitPartialDraft`; `TestCancelImportInterruptsStreamingAndPublishesNoSetup`; `TestImportCancellationMonitorStopsStorageWork`; `TestArtifactMutationAtomicityRevisionVersionAndSetupSheet`; `TestArtifactStaleRevisionDoesNotLeavePublishedReference`; `TestAddProgramsRejectsWholeBatchWhenOneUploadIsInvalid`; `TestAddProgramsStreamConsumesPartsSequentiallyAndRollsBackSourceFailure`; `TestPrepareArtifactHonorsHeavyWorkLimitBeforeReading`; `TestDeleteLastPrimaryRequiresExplicitLeaveUnassigned`; `TestImportLimitDuplicateNamesExcludeAndRecovery`; `TestExpiredImportCleanupDetachesAndCollectsObjects` |
@@ -175,8 +205,9 @@ matrix rows never use an unnamed claim.
 | `T-LARGE` | `TestHTTPSparseTenGiBHeadAndRangeUseBoundedMemory`; `TestGCodeValidationUsesBoundedReads`; worker test `cancels before allocating or requesting a block` |
 | `T-REC` | `TestReservationAndGarbageCollectionRaceNeverDeletesAdoptedObject`; `TestRestartReconcilesInterruptedImportReplaceAndDuplicate`; `TestProcessKillRollsBackArchiveDeleteAndCurrentSelection`; `TestStartupRecoveryMakesInterruptedWorkTerminal`; `TestFullReconcileRebindsIdenticalColdCopyWithoutClearingAttention` |
 | `T-HTML` | `TestSanitizeHTMLRemovesActiveAndNavigatingContent`; `TestSanitizeHTMLHonorsCancellation`; `TestSanitizeHTMLRejectsAnOversizedSingleToken`; `TestSanitizeHTMLStreamsDocumentsLargerThanFormerViewerLimit`; `TestHTMLSetupSheetRejectsOversizedTokenBeforePublication`; `TestHTMLSetupSheetAllowsLargeDocumentWithBoundedTokens`; `TestHTTPHTMLSetupSheetIsSanitizedAndSandboxed`; `TestHTTPHTMLSetupSheetStreamsBeyondFormerViewerLimit`; SetupSheetViewer HEAD/version-bound empty-sandbox tests |
-| `T-FE-APP` | all `App.test.tsx` scenarios: unavailable/reconnect, library/current, search/filter/cursor/no-match reset, keyboard open/state preservation, draft/duplicate-name create, current failure retry, conflicts, validation issues, recent/UI-state and offline behavior |
-| `T-FE-API` | all `api.test.ts` tests: capabilities/CSRF, stable errors, unsafe paths, network/readiness, uploads/jobs/import preflight/recent/UI-state contracts |
+| `T-FE-APP` | all `App.test.tsx` scenarios: session-first boot/login/session expiry/logout plus unavailable/reconnect, library/current, search/filter/cursor/no-match reset, keyboard/state, operations/conflicts/recent/UI-state/offline behavior |
+| `T-FE-API` | all `api.test.ts` tests: guest/remote/local sessions, PAM credential POST without web storage, session CSRF, fetch/XHR 401 expiry, one-time CSRF retry, capabilities, errors, paths, jobs/import/recent/UI-state contracts |
+| `T-FE-AUTH` | all `LoginView.test.tsx` tests: keyboard submit/no web-storage secret, pending double-submit prevention, generic rejection/password clearing/focus and distinct expired-session announcement |
 | `T-FE-IMPORT` | all `ImportWizard.test.tsx` tests: atomic multi-file/primary, one-sheet rules, Unicode backend preflight, conflicts/retry/cancel/partial-draft and progress |
 | `T-FE-FOCUS` | all five `Modal.test.tsx` tests: labeling/trap/restore, explicit targets, Escape/backdrop busy rules and escaped focus recovery |
 | `T-FE-GC` | all gcodeCore/GCodePreview tests: LF/CRLF sparse offsets, bounded search pages/cancel, adaptive bounded traversal across >1 MiB thinned-index gaps, stable Worker lifecycle, proportional huge-line scroll, wrap paging, highlighting and version errors |
@@ -193,7 +224,9 @@ matrix rows never use an unnamed claim.
 | `M-VIEWER` | открыть malicious HTML/PDF under browser network/console instrumentation; try scripts/forms/links/actions/fullscreen/close/replace; assert zero unexpected request/code execution | pending controlled-browser run |
 | `M-STATE` | save filters/selected setup/program/line/current, restart process/browser, verify same stable IDs; delete selected ID and verify empty state, never name substitution | pending controlled-browser run |
 | `M-LOG` | defense-in-depth target drill: run audited operations using newline/control/secret/path-like strings and independently inspect JSON logs/audit for escaped safe IDs/result and absence of secret/content/SQL/path/key | optional target hardening; code audit complete |
-| `M-TLS` | deploy direct TLS 1.3 and trusted proxy separately; unauthenticated/missing TLS fail, Basic/Bearer succeeds, Host/Origin/CSRF attacks fail | pending deployment run |
+| `M-TLS` | current direct TLS 1.3 host: guest session 200/capabilities 401; PAM login 200, authenticated session/capabilities 200, logout 204; remembered login persisted only a token hash and survived graceful service restart, then logout 204 removed it; health/ready 200; TLS 1.2 rejected; no Basic or configured Bearer | V — live 2026-08-20 |
+| `M-PROXY` | repeat auth/session/Host/Origin/CSRF flow through a locked-down trusted TLS reverse proxy if that alternative deployment mode is selected | pending conditional deployment run |
+| `M-SLOW` | run progressing and stalled large request/response clients against the deployed listener; verify sliding deadline keeps progress and terminates stalls | pending live network run |
 | `M-KEYBOARD` | mouse disabled: find/open setup, choose program, preview/search/line jump, sheet viewer, validate, choose current; inspect focus order/trap/return and text/ARIA | pending controlled-browser run |
 | `M-POWER` | repeatedly power-cut/SIGKILL import, replace and duplicate on the target filesystem; restart and assert no partial revision plus stable job/journal/sentinel state; archive/delete/current subprocess SIGKILL is already in `T-REC` | pending target fault run |
 | `X-HW` | measure cold start, idle RSS/CPU, stream delta RSS, 10k latency and first viewport against NFR budgets on the agreed LinuxCNC workstation | external target pending |
@@ -210,11 +243,11 @@ matrix rows never use an unnamed claim.
 
 | ID | Control / exact evidence | Status |
 |---|---|---|
-| `FR-DEP-001` | Single Go + embedded SQLite: `T-DB`, production build | V |
-| `FR-DEP-002` | production-tag embedded Vite FS: `T-RUN`; Vite+Go build | V |
+| `FR-DEP-001` | Single Go + embedded SQLite architecture: `T-DB`; cgo/PAM production build and live binary | V |
+| `FR-DEP-002` | production-tag embedded Vite FS: `T-RUN`; Vite+cgo/PAM build and live SPA | V |
 | `FR-DEP-003` | no telemetry/cloud endpoint or dependency; exact network check `M-OFFLINE` | I — manual pending |
 | `FR-DEP-004` | startup refuses EUID 0; non-root unit/run in `M-OFFLINE` | I — target run pending |
-| `FR-DEP-005` | amd64 runtime/cross-arm64 build, baseline D-001; `X-ARM64` | P — arm64 runtime pending |
+| `FR-DEP-005` | amd64/arm64 target baseline D-001; current cgo/PAM build plus `X-ARM64` | P — PAM-linked build/arm64 runtime pending |
 | `FR-DEP-006` | DB + both roots readiness: `T-RUN` (`TestHealthReadinessAndSafeErrors`) | V |
 | `FR-CFG-001` | startup env-only roots: `T-CFG`; no mutation route in `T-RUN` | V |
 | `FR-CFG-002` | capabilities/route/UI omit path controls: `T-RUN`, `T-FE-API` | V |
@@ -434,7 +467,7 @@ matrix rows never use an unnamed claim.
 | ID | Control / exact evidence | Status |
 |---|---|---|
 | `DATA-001` | FK/WAL/busy timeout/FULL on every pool connection: `TestPragmasApplyToEveryConnection` | V |
-| `DATA-002` | embedded numbered checksums, transactional before ready: `T-DB` migration tests | V |
+| `DATA-002` | embedded numbered checksums including migration 002, transactional before ready: `T-DB` | V |
 | `DATA-003` | consistent exclusive SQLite backup primitive tested: `TestOnlineBackupIsConsistentAndNeverOverwrites`; irreversible-upgrade drill `M-POWER` | P — future migration drill pending |
 | `DATA-004` | unmanaged/newer/checksum/failing migration never overwritten/downgraded: `T-DB` | V |
 | `DATA-005` | startup quick-check and no auto-delete: DB open/recovery tests; corrupt restore runbook scenario `M-POWER` | P — operator drill pending |
@@ -460,14 +493,14 @@ matrix rows never use an unnamed claim.
 
 | ID | Control / exact evidence | Status |
 |---|---|---|
-| `SEC-NET-001` | loopback default and config validation: `T-CFG` | V |
-| `SEC-NET-002` | non-loopback requires explicit remote+32-char auth+TLS/proxy: `T-CFG`, `T-RUN`; deployment `M-TLS` | P — live deployment pending |
-| `SEC-NET-003` | same-origin allowed Host/Origin, no wildcard CORS: `TestMutationAuthorizationChecksHostOriginAndCSRF` | V |
-| `SEC-NET-004` | in-memory capabilities CSRF required on mutations: `T-RUN`, `T-FE-API` | V |
-| `SEC-NET-005` | separate header/connection and sliding request-read/response-write deadlines + heavy semaphore: `T-RUN`, `TestPrepareArtifactHonorsHeavyWorkLimitBeforeReading`; live slow-client `M-TLS` | P — live network test pending |
+| `SEC-NET-001` | loopback default and implicit-local session config: `T-CFG`, `T-RUN` | V |
+| `SEC-NET-002` | remote requires explicit flag + matching non-root PAM account + PAM build + TLS/proxy; optional Bearer ≥32: `T-CFG`, `T-AUTH`, `T-RUN`, direct deployment `M-TLS` | V |
+| `SEC-NET-003` | exact HTTPS Host/Origin for session login/logout/mutation, per-session CSRF, no wildcard CORS: `T-RUN`, `T-FE-API`, `M-TLS` | V |
+| `SEC-NET-004` | opaque `__Host-` cookie, memory-only ordinary sessions, hash-only remembered SQLite rows, per-session CSRF and no Basic: `T-AUTH`, `T-RUN`, `T-FE-AUTH`, `M-TLS` | V |
+| `SEC-NET-005` | separate header/connection and sliding request-read/response-write deadlines + heavy semaphore: `T-RUN`, `TestPrepareArtifactHonorsHeavyWorkLimitBeforeReading`; live slow-client `M-SLOW` | P — live network test pending |
 | `SEC-NET-006` | app CSP/COOP/CORP/permissions/frame policy headers: `T-RUN`; browser `M-VIEWER` | P — browser observation pending |
 | `SEC-NET-007` | route inventory rejects `/fs`/unknown arbitrary reads: `TestStaticSPAAndNoFilesystemAPI`, `T-PATH` | V |
-| `SEC-NET-008` | content responses private/no-store and no shared-cache eligibility: HTTP content tests; proxy observation `M-TLS` | P — proxy check pending |
+| `SEC-NET-008` | content responses private/no-store and no shared-cache eligibility: HTTP content tests; proxy observation `M-PROXY` | P — proxy check pending |
 
 ### Performance/reliability/logging NFR (18)
 
@@ -521,44 +554,46 @@ matrix rows never use an unnamed claim.
 
 | Deviation | Development evidence | Необходимое закрытие |
 |---|---|---|
-| arm64 runtime | production binary cross-builds | `X-ARM64` on an actual supported host |
+| arm64 PAM build/runtime | прежний non-PAM cross-build не применим к текущей auth-версии | PAM-linked build and `X-ARM64` on an actual supported host |
 | numeric machine budgets | bounded algorithms, sparse 10 GiB backend, 10k bounded SQL | `X-HW` on agreed LinuxCNC workstation |
 | browser visual/accessibility | Vitest/Testing Library unit/component baseline | `M-UI`, `M-LARGE`, `M-VIEWER`, `M-KEYBOARD` in controlled production browser |
 | PDF/HTML active-content observation | backend sanitizer/CSP and no-action canvas architecture | instrumented malicious documents with network/console observation |
-| TLS/reverse proxy | config/auth/TLS unit/handler tests | `M-TLS` with real certificate, proxy and remote client |
+| trusted-proxy/certificate trust | PAM/config/session tests and direct TLS `M-TLS` passed; current host certificate is self-signed | `M-PROXY` only if selected, plus managed client trust for the production certificate |
 | hard process/power loss | durable intermediate fixtures, atomic post-commit reopen, and actual SIGKILL rollback for archive/delete/current | repeated import/replace/duplicate power-loss `M-POWER` on target |
 | operator deployment/restore | guide, portable marker/fingerprint migration and `TestFullReconcileRebindsIdenticalColdCopyWithoutClearingAttention` | cold backup/restore/upgrade drill on target filesystem |
 
 ## Финальные quality gates
 
-Подтверждено на финальном development tree после atomic job/recovery и TLS/root
-hardening:
+После PAM/browser-session integration записано следующее evidence:
 
-- `gofmt -l` — empty; `git diff --check` — passed;
-- `go mod tidy -diff` — empty;
-- `go test ./... -count=1 -timeout=3m` — passed (`internal/httpapi` 2.577 s,
-  `internal/service` 3.490 s); a final JSON-count rerun recorded 7 packages,
-  310 passed test/subtest events and 0 failed events;
-- `go vet ./...` — passed;
-- `go test -race ./... -count=1 -timeout=8m` — passed
-  (`internal/httpapi` 13.911 s, `internal/service` 49.939 s);
-- fresh `npm ci --no-audit --no-fund`, ESLint and TypeScript typecheck — passed;
-- serial Vitest — 11 files, 68/68 tests, 55.63 s; Vite production build —
-  51 modules, passed;
-- `scripts/build.sh` from a clean `git archive` without generated frontend or
-  build outputs — passed;
-- static production amd64 build SHA-256
-  `f79750f8e8cf06313e76cddb6cffb0898badd9ce50f9c8092a8538064a486f67`
-  and `CGO_ENABLED=0` arm64 cross-build SHA-256
-  `fd8a4f2d086ca1f86dc2bcf8495804ff0fe87a30e72575692512065ef0e39008`
-  — passed;
-- production smoke — `/healthz`, `/readyz`, embedded index/current asset,
-  `/fs` 404, CSRF-protected create plus library list, HEAD and graceful signal
-  exit code 0 — passed.
+- `go test ./... -count=1` — passed;
+- `go test -race ./... -count=1 -timeout=10m` — passed
+  (`internal/service` 53.682 s);
+- `CGO_ENABLED=1 go test -tags pam ./...` — passed;
+- `CGO_ENABLED=1 go test -race -tags pam ./...` — passed;
+- `CGO_ENABLED=1 go vet -tags pam ./...` — passed;
+- frontend lint/typecheck — passed; Vitest — 12 files/83 tests passed;
+  TypeScript/Vite production build — passed;
+- `scripts/build.sh` — passed, включая чистую dependency restore/check/build
+  последовательность;
+- `CGO_ENABLED=1 go build -tags "production pam"` — passed; installed amd64
+  binary metadata фиксирует Go 1.26.5, `CGO_ENABLED=1`, tags `production,pam`, а
+  `ldd` разрешает `libpam.so.0`;
+- отдельная non-PAM remote-сборка завершилась fail-closed: exit 1 и stable
+  `AUTHENTICATION_UNAVAILABLE`;
+- SHA-256 build и `/opt/websetupmanager/current/bin/websetupmanager` совпадает:
+  `5df67ec084ec30e0f253f6fd38f565adbe9e4eb8656edc180f3fa2454be8469d`;
+- `websetupmanager.service` — enabled/active, `User=user`, direct TLS listener
+  `10.0.1.136:443`; live `/healthz` и `/readyz` — 200;
+- `M-TLS` — guest/API gate, normal PAM login/logout, hash-only remembered login
+  across graceful restart and final logout passed; TLS 1.2 handshake rejected.
 
-An earlier headless Firefox run loaded only same-origin API/assets and captured a
-loading-state screenshot. It remains a smoke, not controlled visual/keyboard/
-viewer acceptance.
+Formatting, final `git diff --check` and clean-worktree checks выполняются ещё
+раз после последней документационной правки и фиксируются в final report, а не
+предполагаются здесь заранее.
+
+Ранний headless Firefox same-origin loading-state screenshot остаётся
+историческим smoke, а не controlled visual/keyboard/viewer или PAM acceptance.
 
 Full target Definition of Done cannot be called complete until the explicit `X`
 and AC partial scenarios above have recorded evidence or an approved deviation.
