@@ -1,4 +1,4 @@
-import { render, screen, waitFor, within } from '@testing-library/react'
+import { act, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { ApiError } from './api'
@@ -6,6 +6,7 @@ import type { Setup, SetupSummary } from './domain'
 import { App } from './App'
 
 const mocks = vi.hoisted(() => ({
+  getAuthSession: vi.fn(), login: vi.fn(), logout: vi.fn(), setUnauthorizedHandler: vi.fn(), clearApiSession: vi.fn(),
   getCapabilities: vi.fn(), listSetups: vi.fn(), getCurrentSetup: vi.fn(), getSetup: vi.fn(),
   checkSetupName: vi.fn(), createSetup: vi.fn(), updateSetup: vi.fn(), setCurrentSetup: vi.fn(), clearCurrentSetup: vi.fn(),
   setupAction: vi.fn(), waitForJob: vi.fn(), uploadProgram: vi.fn(), uploadSetupSheet: vi.fn(),
@@ -48,6 +49,13 @@ const summary: SetupSummary = {
 }
 
 beforeEach(() => {
+  mocks.getAuthSession.mockResolvedValue({
+    authenticated: true, loginRequired: false, user: null, csrfToken: 'local-session-token',
+  })
+  mocks.login.mockResolvedValue({
+    authenticated: true, loginRequired: true, user: { username: 'operator' }, csrfToken: 'remote-session-token',
+  })
+  mocks.logout.mockResolvedValue(undefined)
   mocks.getCapabilities.mockResolvedValue({
     libraryId: 'library-1', libraryAlias: 'Производственные сетапы', csrfToken: 'token',
     gcodeExtensions: ['.ngc'], requireSetupSheetForReady: false, features: {},
@@ -88,9 +96,90 @@ describe('App', () => {
     expect(mocks.getCapabilities).toHaveBeenCalledTimes(2)
   })
 
+  it('checks the session before capabilities and signs in from an accessible login view', async () => {
+    mocks.getAuthSession.mockResolvedValue({
+      authenticated: false, loginRequired: true, user: null,
+    })
+    const user = userEvent.setup()
+    render(<App />)
+
+    expect(await screen.findByRole('heading', { name: 'Вход в систему' })).toBeInTheDocument()
+    expect(mocks.getCapabilities).not.toHaveBeenCalled()
+    expect(screen.getByRole('textbox', { name: 'Имя пользователя' })).toHaveFocus()
+    await user.type(screen.getByRole('textbox', { name: 'Имя пользователя' }), 'operator')
+    await user.type(screen.getByLabelText('Пароль'), 'secret')
+    await user.click(screen.getByRole('checkbox', { name: /Запомнить меня/ }))
+    await user.click(screen.getByRole('button', { name: 'Открыть библиотеку сетапов' }))
+
+    expect(await screen.findByRole('heading', { name: 'Производственные сетапы' })).toBeInTheDocument()
+    expect(mocks.login).toHaveBeenCalledWith('operator', 'secret', true)
+    expect(screen.getByText('operator')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Выйти' })).toBeInTheDocument()
+    await waitFor(() => expect(document.getElementById('main-content')).toHaveFocus())
+  })
+
+  it('unmounts the workspace and focuses login when the API reports session expiry', async () => {
+    mocks.getAuthSession.mockResolvedValue({
+      authenticated: true, loginRequired: true,
+      user: { username: 'operator' }, csrfToken: 'remote-token',
+    })
+    render(<App />)
+    expect(await screen.findByRole('heading', { name: 'Производственные сетапы' })).toBeInTheDocument()
+    const handler = mocks.setUnauthorizedHandler.mock.calls
+      .map(([candidate]) => candidate as (() => void) | undefined)
+      .find((candidate) => typeof candidate === 'function')
+    expect(handler).toBeTypeOf('function')
+
+    act(() => handler?.())
+
+    expect(await screen.findByRole('status')).toHaveTextContent('Сессия истекла')
+    expect(screen.queryByRole('heading', { name: 'Производственные сетапы' })).not.toBeInTheDocument()
+    expect(screen.getByRole('textbox', { name: 'Имя пользователя' })).toHaveFocus()
+  })
+
+  it('disables logout while pending and announces a successful logout', async () => {
+    let resolveLogout!: () => void
+    mocks.getAuthSession.mockResolvedValue({
+      authenticated: true, loginRequired: true,
+      user: { username: 'operator' }, csrfToken: 'remote-token',
+    })
+    mocks.logout.mockReturnValue(new Promise<void>((resolve) => { resolveLogout = resolve }))
+    const user = userEvent.setup()
+    render(<App />)
+    await screen.findByRole('heading', { name: 'Производственные сетапы' })
+
+    await user.click(screen.getByRole('button', { name: 'Выйти' }))
+    expect(screen.getByRole('button', { name: 'Выходим…' })).toBeDisabled()
+    act(() => resolveLogout())
+
+    expect(await screen.findByRole('status')).toHaveTextContent('Вы вышли')
+    expect(screen.getByRole('textbox', { name: 'Имя пользователя' })).toHaveFocus()
+    expect(mocks.logout).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps the loaded workspace and logout focus when logout fails', async () => {
+    mocks.getAuthSession.mockResolvedValue({
+      authenticated: true, loginRequired: true,
+      user: { username: 'operator' }, csrfToken: 'remote-token',
+    })
+    mocks.logout.mockRejectedValue(new ApiError({
+      message: 'Сервис временно недоступен.', status: 0, code: 'NETWORK_ERROR', retryable: true,
+    }))
+    const user = userEvent.setup()
+    render(<App />)
+    await screen.findByRole('heading', { name: 'Производственные сетапы' })
+    const logoutButton = screen.getByRole('button', { name: 'Выйти' })
+    await user.click(logoutButton)
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('Не удалось выйти')
+    expect(screen.getByRole('heading', { name: 'Производственные сетапы' })).toBeInTheDocument()
+    expect(logoutButton).toBeEnabled()
+    expect(logoutButton).toHaveFocus()
+  })
+
   it('loads the pinned current area and setup library without exposing a file browser', async () => {
     render(<App />)
-    expect(screen.getByRole('heading', { name: 'Загружаем библиотеку сетапов' })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: 'Проверяем защищённую сессию' })).toBeInTheDocument()
     expect(await screen.findByRole('heading', { name: 'Производственные сетапы' })).toBeInTheDocument()
     expect(await screen.findByRole('heading', { name: 'Не выбран' })).toBeInTheDocument()
     expect(screen.getByRole('heading', { name: baseSetup.name })).toBeInTheDocument()

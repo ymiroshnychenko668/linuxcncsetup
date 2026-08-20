@@ -18,6 +18,17 @@ export interface Capabilities {
   features: Readonly<Record<string, boolean>>
 }
 
+export interface AuthenticatedUser {
+  username: string
+}
+
+export interface AuthSession {
+  authenticated: boolean
+  loginRequired: boolean
+  user: AuthenticatedUser | null
+  csrfToken?: string
+}
+
 export class ApiError extends Error {
   readonly status: number
   readonly code: string
@@ -54,6 +65,14 @@ export class ApiError extends Error {
 type JsonRecord = Record<string, unknown>
 
 let csrfToken: string | undefined
+let authenticatedSession = false
+let unauthorizedHandler: (() => void) | undefined
+
+interface ApiRequestOptions {
+  csrf?: boolean
+  suppressUnauthorized?: boolean
+  csrfRetryAttempted?: boolean
+}
 
 function isRecord(value: unknown): value is JsonRecord {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -160,21 +179,34 @@ function isSafeMethod(method: string): boolean {
 
 export function setCsrfToken(token: string | undefined): void {
   csrfToken = asNonEmptyString(token)
+  if (csrfToken) authenticatedSession = true
 }
 
 export function clearApiSession(): void {
   csrfToken = undefined
+  authenticatedSession = false
+}
+
+export function setUnauthorizedHandler(handler?: () => void): void {
+  unauthorizedHandler = handler
+}
+
+function expireApiSession(): void {
+  const notify = authenticatedSession || csrfToken !== undefined
+  clearApiSession()
+  if (notify) unauthorizedHandler?.()
 }
 
 export async function apiRequest<T>(
   path: string,
   init: RequestInit = {},
+  options: ApiRequestOptions = {},
 ): Promise<T> {
   const method = (init.method ?? 'GET').toUpperCase()
   const headers = new Headers(init.headers)
   headers.set('Accept', 'application/json')
 
-  if (!isSafeMethod(method)) {
+  if (!isSafeMethod(method) && options.csrf !== false) {
     if (!csrfToken) {
       throw new ApiError({
         message: 'The security token is unavailable. Refresh the application and try again.',
@@ -206,8 +238,23 @@ export async function apiRequest<T>(
     })
   }
 
+  if (response.status === 401 && !options.suppressUnauthorized) expireApiSession()
+
   const body = await responseBody(response)
-  if (!response.ok) throw errorFromResponse(response, body)
+  if (!response.ok) {
+    const failure = errorFromResponse(response, body)
+    if (
+      response.status === 403
+      && failure.code === 'CSRF_REJECTED'
+      && options.csrf !== false
+      && !options.csrfRetryAttempted
+    ) {
+      const session = await getAuthSession(init.signal ?? undefined)
+      if (!session.authenticated) throw failure
+      return apiRequest<T>(path, init, { ...options, csrfRetryAttempted: true })
+    }
+    throw failure
+  }
   return body as T
 }
 
@@ -266,6 +313,7 @@ function xhrUpload<T>(
       options.onProgress?.(Math.min(event.loaded, totalBytes), totalBytes)
     })
     request.addEventListener('load', () => {
+      if (request.status === 401) expireApiSession()
       let body: unknown
       try { body = request.responseText === '' ? undefined : JSON.parse(request.responseText) as unknown }
       catch (cause) {
@@ -792,6 +840,84 @@ function normalizeStringList(value: unknown): string[] {
   return value.filter((item): item is string => typeof item === 'string')
 }
 
+function normalizeAuthSession(body: unknown): AuthSession {
+  const envelope = isRecord(body) ? body : {}
+  const root = isRecord(envelope.data) ? envelope.data : envelope
+  if (typeof root.authenticated !== 'boolean') throw invalidResponse('Invalid authentication session.')
+
+  const rawLoginRequired = root.loginRequired ?? root.login_required
+  if (typeof rawLoginRequired !== 'boolean') throw invalidResponse('Invalid authentication session.')
+  if (root.user === undefined) throw invalidResponse('Invalid authentication session user.')
+
+  let user: AuthenticatedUser | null = null
+  if (root.user !== null) {
+    if (!isRecord(root.user)) throw invalidResponse('Invalid authentication session user.')
+    user = { username: requiredString(root.user.username, 'authentication username') }
+  }
+
+  const token = asNonEmptyString(root.csrfToken)
+    ?? asNonEmptyString(root.csrf_token)
+    ?? asNonEmptyString(envelope.csrfToken)
+    ?? asNonEmptyString(envelope.csrf_token)
+
+  if (!root.authenticated) {
+    if (!rawLoginRequired || user !== null || token) throw invalidResponse('Invalid guest authentication session.')
+    return { authenticated: false, loginRequired: true, user: null }
+  }
+  if (!token || (rawLoginRequired && user === null)) {
+    throw invalidResponse('Invalid authenticated session.')
+  }
+
+  return {
+    authenticated: true,
+    loginRequired: rawLoginRequired,
+    user,
+    csrfToken: token,
+  }
+}
+
+function adoptAuthSession(body: unknown): AuthSession {
+  const session = normalizeAuthSession(body)
+  const notifyExpired = authenticatedSession && !session.authenticated
+  csrfToken = session.csrfToken
+  authenticatedSession = session.authenticated
+  if (notifyExpired) unauthorizedHandler?.()
+  return session
+}
+
+export async function getAuthSession(signal?: AbortSignal): Promise<AuthSession> {
+  const response = await apiRequest<unknown>(
+    '/api/v1/auth/session',
+    { signal },
+    { suppressUnauthorized: true },
+  )
+  return adoptAuthSession(response)
+}
+
+export async function login(
+  username: string,
+  password: string,
+  rememberMe: boolean,
+  signal?: AbortSignal,
+): Promise<AuthSession> {
+  const response = await apiRequest<unknown>(
+    '/api/v1/auth/login',
+    {
+      method: 'POST',
+      signal,
+      body: JSON.stringify({ username, password, rememberMe }),
+      headers: { 'Content-Type': 'application/json' },
+    },
+    { csrf: false, suppressUnauthorized: true },
+  )
+  return adoptAuthSession(response)
+}
+
+export async function logout(signal?: AbortSignal): Promise<void> {
+  await apiRequest<void>('/api/v1/auth/logout', { method: 'POST', signal })
+  clearApiSession()
+}
+
 function normalizeCapabilities(body: unknown): Capabilities {
   const envelope = isRecord(body) ? body : {}
   const root = isRecord(envelope.data) ? envelope.data : envelope
@@ -835,7 +961,10 @@ function normalizeCapabilities(body: unknown): Capabilities {
 export async function getCapabilities(signal?: AbortSignal): Promise<Capabilities> {
   const response = await apiRequest<unknown>('/api/v1/capabilities', { signal })
   const capabilities = normalizeCapabilities(response)
-  setCsrfToken(capabilities.csrfToken)
+  // The authenticated session is authoritative. Capabilities may retain a
+  // compatibility token for implicit-local clients, but must never rotate a
+  // cookie principal to an unrelated token.
+  if (!authenticatedSession && capabilities.csrfToken) setCsrfToken(capabilities.csrfToken)
   return capabilities
 }
 

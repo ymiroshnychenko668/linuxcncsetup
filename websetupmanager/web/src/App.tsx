@@ -1,19 +1,24 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   ApiError,
+  clearApiSession,
   clearRecentSetups,
   clearCurrentSetup,
   deleteRecentSetup,
   getCapabilities,
+  getAuthSession,
   getCurrentSetup,
   getReadiness,
   getSetup,
   getUIState,
   listSetups,
   listRecentSetups,
+  logout,
   putUIState,
+  setUnauthorizedHandler,
   touchRecentSetup,
   type Capabilities,
+  type AuthSession,
   type Readiness,
   type SetupQuery,
 } from './api'
@@ -22,6 +27,7 @@ import { stableClientID } from './clientState'
 import { CreateSetupDialog } from './components/CreateSetupDialog'
 import { CurrentSetupPanel } from './components/CurrentSetupPanel'
 import { ImportWizard } from './components/ImportWizard'
+import { LoginView } from './components/LoginView'
 import { RecentSetupsPanel } from './components/RecentSetupsPanel'
 import { ConfirmOperationDialog } from './components/SetupOperationDialogs'
 import { SetupDetail } from './components/SetupDetail'
@@ -30,7 +36,8 @@ import { errorMessage } from './ui'
 
 type LoadState =
   | { kind: 'loading' }
-  | { kind: 'ready'; capabilities: Capabilities }
+  | { kind: 'guest'; message?: string }
+  | { kind: 'ready'; capabilities: Capabilities; session: AuthSession }
   | { kind: 'unavailable'; message: string }
 
 const initialFilters: LibraryFilters = {
@@ -65,7 +72,7 @@ function queryFor(filters: LibraryFilters, cursor?: string): SetupQuery {
 }
 
 function LoadingLibrary() {
-  return <section className="state-panel" aria-busy="true" aria-labelledby="loading-title"><span className="spinner" aria-hidden="true" /><div><h2 id="loading-title">Загружаем библиотеку сетапов</h2><p role="status">Проверяем локальный Backend и управляемое хранилище…</p></div></section>
+  return <section className="state-panel auth-loading" aria-busy="true" aria-labelledby="loading-title"><span className="spinner" aria-hidden="true" /><div><h2 id="loading-title">Проверяем защищённую сессию</h2><p role="status">Подготавливаем Web Setup Manager и управляемое хранилище…</p></div></section>
 }
 
 function BackendUnavailable({ message, onRetry }: { message: string; onRetry: () => void }) {
@@ -316,19 +323,70 @@ export function App() {
   const [attempt, setAttempt] = useState(0)
   const [readiness, setReadiness] = useState<Readiness>({ ok: true })
   const [readinessAttempt, setReadinessAttempt] = useState(0)
+  const [loggingOut, setLoggingOut] = useState(false)
+  const [logoutError, setLogoutError] = useState<string>()
+  const mainRef = useRef<HTMLElement>(null)
+  const focusWorkspace = useRef(false)
   const retry = useCallback(() => { setState({ kind: 'loading' }); setAttempt((value) => value + 1) }, [])
 
   useEffect(() => {
+    setUnauthorizedHandler(() => {
+      setLoggingOut(false)
+      setLogoutError(undefined)
+      setReadiness({ ok: true })
+      setState({ kind: 'guest', message: 'Сессия истекла. Войдите снова, чтобы продолжить.' })
+    })
+    return () => setUnauthorizedHandler(undefined)
+  }, [])
+
+  useEffect(() => {
     const controller = new AbortController()
-    void getCapabilities(controller.signal).then(
-      (capabilities) => setState({ kind: 'ready', capabilities }),
+    const load = async () => {
+      try {
+        const session = await getAuthSession(controller.signal)
+        if (!session.authenticated) {
+          setState({ kind: 'guest' })
+          return
+        }
+        const capabilities = await getCapabilities(controller.signal)
+        setState({ kind: 'ready', capabilities, session })
+      } catch (error) {
+        if (error instanceof DOMException && error.name === 'AbortError') return
+        if (error instanceof ApiError && error.status === 401) {
+          clearApiSession()
+          setState({ kind: 'guest' })
+          return
+        }
+        setState({ kind: 'unavailable', message: error instanceof ApiError ? error.message : 'Не удалось получить конфигурацию приложения.' })
+      }
+    }
+    void load()
+    return () => controller.abort()
+  }, [attempt])
+
+  const onAuthenticated = useCallback((session: AuthSession) => {
+    focusWorkspace.current = true
+    setLogoutError(undefined)
+    setState({ kind: 'loading' })
+    void getCapabilities().then(
+      (capabilities) => setState({ kind: 'ready', capabilities, session }),
       (error: unknown) => {
         if (error instanceof DOMException && error.name === 'AbortError') return
+        if (error instanceof ApiError && error.status === 401) {
+          clearApiSession()
+          setState({ kind: 'guest', message: 'Сессия истекла. Войдите снова, чтобы продолжить.' })
+          return
+        }
         setState({ kind: 'unavailable', message: error instanceof ApiError ? error.message : 'Не удалось получить конфигурацию приложения.' })
       },
     )
-    return () => controller.abort()
-  }, [attempt])
+  }, [])
+
+  useEffect(() => {
+    if (state.kind !== 'ready' || !focusWorkspace.current) return
+    focusWorkspace.current = false
+    mainRef.current?.focus()
+  }, [state.kind])
 
   useEffect(() => {
     const onOnline = () => { setNetworkOffline(false); if (state.kind === 'unavailable') retry() }
@@ -349,14 +407,36 @@ export function App() {
     return () => { controller.abort(); window.clearInterval(interval) }
   }, [readinessAttempt, state.kind])
 
+  const signOut = async () => {
+    if (loggingOut) return
+    setLoggingOut(true)
+    setLogoutError(undefined)
+    try {
+      await logout()
+      setReadiness({ ok: true })
+      setState({ kind: 'guest', message: 'Вы вышли из Web Setup Manager.' })
+    } catch (reason) {
+      if (!(reason instanceof ApiError && reason.status === 401)) {
+        setLogoutError(errorMessage(reason))
+      }
+    } finally {
+      setLoggingOut(false)
+    }
+  }
+
   return <div className="app-shell">
     <a className="skip-link" href="#main-content">К основному содержимому</a>
-    <header className="app-header"><button className="brand" type="button" aria-label="Web Setup Manager — библиотека" onClick={() => window.dispatchEvent(new Event('wsm:library'))}><span className="brand__mark" aria-hidden="true">WS</span><span><strong>Web Setup Manager</strong><small>Технологические комплекты станка</small></span></button><div className="service-state" aria-label="Состояние приложения"><span className="service-state__dot" aria-hidden="true" />Локальный режим</div></header>
-    {networkOffline ? <div className="network-notice" role="status">Внешняя сеть недоступна. Setup Manager продолжает работать с локальным Backend.</div> : null}
+    <header className="app-header">
+      {state.kind === 'ready' ? <button className="brand" type="button" aria-label="Web Setup Manager — библиотека" onClick={() => window.dispatchEvent(new Event('wsm:library'))}><span className="brand__mark" aria-hidden="true">WS</span><span><strong>Web Setup Manager</strong><small>Технологические комплекты станка</small></span></button> : <div className="brand"><span className="brand__mark" aria-hidden="true">WS</span><span><strong>Web Setup Manager</strong><small>Технологические комплекты станка</small></span></div>}
+      {state.kind === 'ready' && state.session.loginRequired ? <div className="auth-session" aria-label={`Выполнен вход: ${state.session.user?.username ?? ''}`}><span><small>Пользователь</small><strong>{state.session.user?.username}</strong></span><button className="button auth-session__logout" type="button" disabled={loggingOut} aria-busy={loggingOut} onClick={() => void signOut()}>{loggingOut ? <span className="spinner spinner--small" aria-hidden="true" /> : null}{loggingOut ? 'Выходим…' : 'Выйти'}</button></div> : <div className="service-state" aria-label="Состояние приложения"><span className="service-state__dot" aria-hidden="true" />{state.kind === 'guest' ? 'Требуется вход' : state.kind === 'loading' ? 'Проверка сессии' : state.kind === 'unavailable' ? 'Сервис недоступен' : 'Локальный режим'}</div>}
+    </header>
+    {networkOffline ? <div className="network-notice" role="status">{state.kind === 'ready' && !state.session.loginRequired ? 'Внешняя сеть недоступна. Setup Manager продолжает работать с локальным Backend.' : 'Сеть недоступна. Проверьте соединение с Backend Web Setup Manager.'}</div> : null}
     {!readiness.ok && state.kind === 'ready' ? <div className="critical-notice" role="alert"><div><strong>{readiness.code === 'STORAGE_UNAVAILABLE' ? 'Управляемое хранилище недоступно' : 'Локальный сервис временно не готов'}</strong><span>{readiness.code === 'STORAGE_UNAVAILABLE' ? ' Физическое хранилище недоступно; карточки и фильтры сохранены, публикация файлов заблокирована.' : ` ${readiness.message ?? ''} Интерфейс и несохранённые поля не сброшены.`}</span></div><button className="button button--quiet" type="button" onClick={() => setReadinessAttempt((value) => value + 1)}>Проверить снова</button></div> : null}
-    <main id="main-content" className="main-content" tabIndex={-1}>
+    {logoutError && state.kind === 'ready' ? <div className="critical-notice" role="alert"><div><strong>Не удалось выйти</strong><span> {logoutError} Рабочая область остаётся открытой.</span></div></div> : null}
+    <main ref={mainRef} id="main-content" className={`main-content ${state.kind === 'ready' ? '' : 'main-content--auth'}`} tabIndex={-1}>
       {state.kind === 'loading' ? <LoadingLibrary /> : null}
       {state.kind === 'unavailable' ? <BackendUnavailable message={state.message} onRetry={retry} /> : null}
+      {state.kind === 'guest' ? <LoginView message={state.message} onAuthenticated={onAuthenticated} /> : null}
       {state.kind === 'ready' ? <Workspace capabilities={state.capabilities} /> : null}
     </main>
   </div>
