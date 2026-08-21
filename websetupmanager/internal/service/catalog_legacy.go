@@ -141,21 +141,14 @@ func (s *Service) MigrateLegacyCatalog(ctx context.Context) error {
 				if _, err := s.db.ExecContext(ctx, `INSERT INTO catalog_legacy_migrations(
 					source_key, library_id, legacy_setup_id, legacy_program_artifact_id, target_folder_id, target_name, state)
 					VALUES (?, ?, ?, NULLIF(?, ''), ?, ?, 'pending')
-					ON CONFLICT(source_key) DO UPDATE SET target_folder_id = excluded.target_folder_id,
-					 target_name = excluded.target_name, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`,
+					ON CONFLICT(source_key) DO NOTHING`,
 					sourceKey, s.libraryID, legacy.id, program.ID, folder.ID, setupName); err != nil {
 					return s.failLegacyCatalogMigration(ctx, legacy.id, databaseError(err))
 				}
-				catalogSetup, err := s.CreateCatalogSetup(ctx, CreateCatalogSetupInput{FolderID: folder.ID,
-					Name: setupName, Description: legacy.description, IdempotencyKey: "legacy-setup:" + sourceKey})
+				catalogSetup, err := s.ensureLegacyCatalogSetup(ctx, sourceKey, legacy.id, program.ID,
+					folder.ID, setupName, legacy.description)
 				if err != nil {
 					return s.failLegacyMapping(ctx, sourceKey, err)
-				}
-				if _, err := s.db.ExecContext(ctx, `UPDATE catalog_setups SET legacy_setup_id = ? WHERE id = ? AND library_id = ?`, legacy.id, catalogSetup.ID, s.libraryID); err != nil {
-					return s.failLegacyMapping(ctx, sourceKey, databaseError(err))
-				}
-				if _, err := s.db.ExecContext(ctx, `UPDATE catalog_legacy_migrations SET catalog_setup_id = ?, state = 'publishing', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE source_key = ?`, catalogSetup.ID, sourceKey); err != nil {
-					return s.failLegacyMapping(ctx, sourceKey, databaseError(err))
 				}
 				if program.ID != "" {
 					catalogSetup, err = s.copyLegacyCatalogArtifact(ctx, sourceKey, catalogSetup, program,
@@ -202,20 +195,73 @@ func (s *Service) ensureLegacyCatalogFolder(ctx context.Context, parentID, name,
 	if !errors.Is(err, sql.ErrNoRows) {
 		return nil, databaseError(err)
 	}
-	folder, err = s.CreateCatalogFolder(ctx, CreateCatalogFolderInput{ParentFolderID: parentID, Name: name, IdempotencyKey: key})
+	folder, err = s.CreateCatalogFolder(ctx, CreateCatalogFolderInput{
+		ParentFolderID:  parentID,
+		Name:            name,
+		IdempotencyKey:  key,
+		legacySourceKey: key,
+	})
 	if err != nil {
 		return nil, err
 	}
-	result, err := s.db.ExecContext(ctx, `UPDATE catalog_folders SET legacy_source_key = ?
-		WHERE library_id = ? AND id = ? AND legacy_source_key IS NULL`, key, s.libraryID, folder.ID)
+	s.runLegacyMigrationTestHook("folder-created")
+	return folder, nil
+}
+
+func (s *Service) ensureLegacyCatalogSetup(ctx context.Context, sourceKey, legacySetupID,
+	legacyProgramArtifactID, folderID, name, description string,
+) (*domain.CatalogSetup, error) {
+	var recordedLibraryID, recordedLegacySetupID, recordedSetupID, recordedProgramID, recordedFolderID, recordedName, state string
+	err := s.db.QueryRowContext(ctx, `SELECT library_id, legacy_setup_id,
+		COALESCE(legacy_program_artifact_id, ''), COALESCE(catalog_setup_id, ''),
+		COALESCE(target_folder_id, ''), target_name, state
+		FROM catalog_legacy_migrations WHERE source_key = ?`, sourceKey).Scan(
+		&recordedLibraryID, &recordedLegacySetupID, &recordedProgramID, &recordedSetupID,
+		&recordedFolderID, &recordedName, &state)
 	if err != nil {
 		return nil, databaseError(err)
 	}
-	changed, err := result.RowsAffected()
-	if err != nil || changed != 1 {
-		return nil, databaseError(errors.New("legacy folder provenance changed"))
+	if recordedLibraryID != s.libraryID || recordedLegacySetupID != legacySetupID ||
+		recordedProgramID != legacyProgramArtifactID ||
+		recordedFolderID != folderID || recordedName != name || state != "pending" && state != "publishing" {
+		return nil, domain.NewError(domain.CodeInvalidContent, "legacy setup mapping conflicts with its source")
 	}
-	return folder, nil
+	if recordedSetupID != "" {
+		setup, loadErr := s.loadCatalogSetup(ctx, s.db, recordedSetupID, true)
+		if loadErr != nil {
+			return nil, loadErr
+		}
+		var provenanceSource, provenanceSetup string
+		if scanErr := s.db.QueryRowContext(ctx, `SELECT COALESCE(legacy_source_key, ''),
+			COALESCE(legacy_setup_id, '') FROM catalog_setups WHERE library_id = ? AND id = ?`,
+			s.libraryID, recordedSetupID).Scan(&provenanceSource, &provenanceSetup); scanErr != nil {
+			return nil, databaseError(scanErr)
+		}
+		if provenanceSource != sourceKey || provenanceSetup != legacySetupID || setup.FolderID != folderID ||
+			setup.Name != name || setup.Description != description {
+			return nil, domain.NewError(domain.CodeInvalidContent, "legacy catalog setup provenance changed")
+		}
+		return setup, nil
+	}
+	setup, err := s.CreateCatalogSetup(ctx, CreateCatalogSetupInput{
+		FolderID:        folderID,
+		Name:            name,
+		Description:     description,
+		IdempotencyKey:  "legacy-setup:" + sourceKey,
+		legacySourceKey: sourceKey,
+		legacySetupID:   legacySetupID,
+	})
+	if err != nil {
+		return nil, err
+	}
+	s.runLegacyMigrationTestHook("setup-created")
+	return setup, nil
+}
+
+func (s *Service) runLegacyMigrationTestHook(checkpoint string) {
+	if s.legacyMigrationTestHook != nil {
+		s.legacyMigrationTestHook(checkpoint)
+	}
 }
 
 func (s *Service) loadLegacyCatalogArtifacts(ctx context.Context, setupID string) ([]legacyCatalogArtifact, error) {
@@ -271,8 +317,15 @@ func (s *Service) copyLegacyCatalogArtifact(ctx context.Context, sourceKey strin
 	}
 	if recordedArtifactID != artifact.ID || recordedTarget != target || recordedSize != artifact.ByteSize ||
 		recordedSHA != artifact.SHA256 || recordedOutcome != "pending" && recordedOutcome != "copied" ||
-		recordedOutcome == "pending" && recordedFileID != "" {
+		recordedOutcome == "pending" && recordedFileID != "" ||
+		recordedOutcome == "copied" && recordedFileID == "" {
 		return nil, domain.NewError(domain.CodeInvalidContent, "legacy migration manifest conflicts with its source")
+	}
+	if recordedOutcome == "copied" {
+		if err := s.verifyLegacyCatalogManifest(ctx, sourceKey, setup.ID, role, artifact); err != nil {
+			return nil, err
+		}
+		return s.loadCatalogSetup(ctx, s.db, setup.ID, true)
 	}
 	file, err := s.objects.OpenObject(artifact.StorageKey, artifact.SHA256, artifact.Version)
 	if err != nil {
@@ -280,7 +333,8 @@ func (s *Service) copyLegacyCatalogArtifact(ctx context.Context, sourceKey strin
 	}
 	updated, putErr := s.PutCatalogFile(ctx, setup.ID, role, PutCatalogFileInput{ExpectedRevision: setup.Revision,
 		CreateOnly: true, DisplayName: displayName, Content: file, ExpectedSize: artifact.ByteSize,
-		ExpectedSHA256: artifact.SHA256, IdempotencyKey: idempotencyKey})
+		ExpectedSHA256: artifact.SHA256, IdempotencyKey: idempotencyKey,
+		legacySourceKey: sourceKey, legacyArtifactID: artifact.ID, legacyObjectID: artifact.ObjectID})
 	closeErr := file.Close()
 	if putErr != nil {
 		return nil, putErr
@@ -295,22 +349,9 @@ func (s *Service) copyLegacyCatalogArtifact(ctx context.Context, sourceKey strin
 	if copied.SHA256 != artifact.SHA256 || copied.ByteSize != artifact.ByteSize {
 		return nil, domain.NewError(domain.CodeInvalidContent, "migrated catalog file does not match its source")
 	}
-	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
-	if err != nil {
-		return nil, databaseError(err)
-	}
-	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx, `UPDATE catalog_files SET legacy_storage_object_id = ?
-		WHERE library_id = ? AND id = ?`, artifact.ObjectID, s.libraryID, copied.ID); err != nil {
-		return nil, databaseError(err)
-	}
-	if _, err := tx.ExecContext(ctx, `UPDATE catalog_legacy_file_manifest SET catalog_file_id = ?, outcome = 'copied',
-		updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE source_key = ? AND role = ?`,
-		copied.ID, sourceKey, role); err != nil {
-		return nil, databaseError(err)
-	}
-	if err := tx.Commit(); err != nil {
-		return nil, databaseError(err)
+	s.runLegacyMigrationTestHook("file-published")
+	if err := s.verifyLegacyCatalogManifest(ctx, sourceKey, setup.ID, role, artifact); err != nil {
+		return nil, err
 	}
 	return updated, nil
 }

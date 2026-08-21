@@ -53,6 +53,74 @@ func TestNewerSchemaStopsStartupWithoutDowngrade(t *testing.T) {
 	}
 }
 
+func TestCatalogLegacyProvenanceMigrationUpgradesVersionThreeDatabase(t *testing.T) {
+	ctx := context.Background()
+	stateDir := t.TempDir()
+	migrations, err := loadMigrations()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(migrations) < 4 {
+		t.Fatalf("migration count = %d, want at least 4", len(migrations))
+	}
+	raw, err := sql.Open("sqlite", sqliteDSN(stateDir+"/"+defaultFilename, defaultBusyTimeout))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := applyMigrationSet(ctx, raw, migrations[:3], nil); err != nil {
+		_ = raw.Close()
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(`
+		INSERT INTO library_instances(id, fingerprint) VALUES ('library-v3', 'fingerprint-v3');
+		INSERT INTO setups(id, library_id, name) VALUES ('legacy-v3', 'library-v3', 'Legacy v3');
+		INSERT INTO catalog_state(library_id, legacy_migration_state) VALUES ('library-v3', 'running');
+		INSERT INTO catalog_setups(id, library_id, name, name_key, legacy_setup_id)
+		VALUES ('catalog-v3', 'library-v3', 'Legacy v3', 'legacy v3', 'legacy-v3');
+		INSERT INTO catalog_legacy_migrations(
+			source_key, library_id, legacy_setup_id, catalog_setup_id, target_name, state)
+		VALUES ('legacy:legacy-v3:empty', 'library-v3', 'legacy-v3', 'catalog-v3', 'Legacy v3', 'publishing');`); err != nil {
+		_ = raw.Close()
+		t.Fatal(err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := Open(ctx, stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var columnCount, indexCount int
+	if err := db.SQL().QueryRow(`SELECT count(*) FROM pragma_table_info('catalog_setups')
+		WHERE name = 'legacy_source_key'`).Scan(&columnCount); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SQL().QueryRow(`SELECT count(*) FROM sqlite_schema
+		WHERE type = 'index' AND name = 'catalog_setups_legacy_source'`).Scan(&indexCount); err != nil {
+		t.Fatal(err)
+	}
+	if columnCount != 1 || indexCount != 1 {
+		t.Fatalf("legacy provenance schema = column:%d index:%d", columnCount, indexCount)
+	}
+	var sourceKey string
+	if err := db.SQL().QueryRow(`SELECT COALESCE(legacy_source_key, '') FROM catalog_setups
+		WHERE id = 'catalog-v3'`).Scan(&sourceKey); err != nil {
+		t.Fatal(err)
+	}
+	if sourceKey != "legacy:legacy-v3:empty" {
+		t.Fatalf("backfilled legacy source key = %q", sourceKey)
+	}
+	var version int
+	if err := db.SQL().QueryRow(`SELECT max(version) FROM schema_migrations`).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != len(migrations) {
+		t.Fatalf("schema version = %d, want %d", version, len(migrations))
+	}
+}
+
 func TestMigrationIsTransactional(t *testing.T) {
 	db, err := sql.Open("sqlite", ":memory:")
 	if err != nil {

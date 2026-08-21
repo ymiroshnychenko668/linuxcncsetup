@@ -81,6 +81,10 @@ type Service struct {
 	closeErr  error
 	now       func() time.Time
 	logger    *slog.Logger
+
+	// legacyMigrationTestHook is intentionally unexported. Tests use it to
+	// emulate process death immediately after an atomic migration mutation.
+	legacyMigrationTestHook func(string)
 }
 
 type keyedMutex struct {

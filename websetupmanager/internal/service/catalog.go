@@ -16,9 +16,10 @@ import (
 )
 
 type CreateCatalogFolderInput struct {
-	ParentFolderID string
-	Name           string
-	IdempotencyKey string
+	ParentFolderID  string
+	Name            string
+	IdempotencyKey  string
+	legacySourceKey string
 }
 
 type UpdateCatalogFolderInput struct {
@@ -29,10 +30,12 @@ type UpdateCatalogFolderInput struct {
 }
 
 type CreateCatalogSetupInput struct {
-	FolderID       string
-	Name           string
-	Description    string
-	IdempotencyKey string
+	FolderID        string
+	Name            string
+	Description     string
+	IdempotencyKey  string
+	legacySourceKey string
+	legacySetupID   string
 }
 
 type UpdateCatalogSetupInput struct {
@@ -52,6 +55,9 @@ type PutCatalogFileInput struct {
 	ExpectedSize        int64
 	ExpectedSHA256      string
 	IdempotencyKey      string
+	legacySourceKey     string
+	legacyArtifactID    string
+	legacyObjectID      string
 }
 
 type catalogOperationDetails struct {
@@ -372,9 +378,10 @@ func (s *Service) CreateCatalogFolder(ctx context.Context, input CreateCatalogFo
 		return nil, err
 	}
 	requestHash, err := idempotencyRequestHash("catalogCreateFolder", struct {
-		ParentFolderID string `json:"parentFolderId"`
-		Name           string `json:"name"`
-	}{input.ParentFolderID, name})
+		ParentFolderID  string `json:"parentFolderId"`
+		Name            string `json:"name"`
+		LegacySourceKey string `json:"legacySourceKey,omitempty"`
+	}{input.ParentFolderID, name, input.legacySourceKey})
 	if err != nil {
 		return nil, err
 	}
@@ -469,9 +476,10 @@ func (s *Service) CreateCatalogFolder(ctx context.Context, input CreateCatalogFo
 		defer tx.Rollback()
 		now := sqlTimestamp(s.now())
 		_, err = tx.ExecContext(ctx, `
-			INSERT INTO catalog_folders(id, library_id, parent_id, name, name_key, relative_path, path_key, revision, created_at, updated_at)
-			VALUES (?, ?, NULLIF(?, ''), ?, ?, ?, ?, 1, ?, ?)`, folderID, s.libraryID,
-			input.ParentFolderID, name, nameKey, relative, pathKey, now, now)
+			INSERT INTO catalog_folders(id, library_id, parent_id, name, name_key, relative_path, path_key,
+			                            legacy_source_key, revision, created_at, updated_at)
+			VALUES (?, ?, NULLIF(?, ''), ?, ?, ?, ?, NULLIF(?, ''), 1, ?, ?)`, folderID, s.libraryID,
+			input.ParentFolderID, name, nameKey, relative, pathKey, input.legacySourceKey, now, now)
 		if err != nil {
 			return catalogNameConflict(err)
 		}
@@ -523,6 +531,14 @@ func (s *Service) CreateCatalogSetup(ctx context.Context, input CreateCatalogSet
 	if err := validateDescription(input.Description); err != nil {
 		return nil, err
 	}
+	if (input.legacySourceKey == "") != (input.legacySetupID == "") {
+		return nil, domain.NewError(domain.CodeInvalidContent, "legacy setup provenance is incomplete")
+	}
+	if input.legacySetupID != "" {
+		if err := domain.ValidateID(input.legacySetupID); err != nil {
+			return nil, domain.NewError(domain.CodeInvalidContent, "legacy setup provenance is invalid")
+		}
+	}
 	if err := validateIdempotencyKey(input.IdempotencyKey); err != nil {
 		return nil, err
 	}
@@ -530,10 +546,12 @@ func (s *Service) CreateCatalogSetup(ctx context.Context, input CreateCatalogSet
 		return nil, err
 	}
 	requestHash, err := idempotencyRequestHash("catalogCreateSetup", struct {
-		FolderID    string `json:"folderId"`
-		Name        string `json:"name"`
-		Description string `json:"description"`
-	}{input.FolderID, name, input.Description})
+		FolderID        string `json:"folderId"`
+		Name            string `json:"name"`
+		Description     string `json:"description"`
+		LegacySourceKey string `json:"legacySourceKey,omitempty"`
+		LegacySetupID   string `json:"legacySetupId,omitempty"`
+	}{input.FolderID, name, input.Description, input.legacySourceKey, input.legacySetupID})
 	if err != nil {
 		return nil, err
 	}
@@ -565,11 +583,28 @@ func (s *Service) CreateCatalogSetup(ctx context.Context, input CreateCatalogSet
 		defer tx.Rollback()
 		now := sqlTimestamp(s.now())
 		_, err = tx.ExecContext(ctx, `
-			INSERT INTO catalog_setups(id, library_id, folder_id, name, name_key, description, revision, created_at, updated_at)
-			VALUES (?, ?, NULLIF(?, ''), ?, ?, ?, 1, ?, ?)`, setupID, s.libraryID, input.FolderID,
-			name, nameKey, input.Description, now, now)
+			INSERT INTO catalog_setups(id, library_id, folder_id, name, name_key, description, legacy_setup_id,
+			                           legacy_source_key, revision, created_at, updated_at)
+			VALUES (?, ?, NULLIF(?, ''), ?, ?, ?, NULLIF(?, ''), NULLIF(?, ''), 1, ?, ?)`,
+			setupID, s.libraryID, input.FolderID, name, nameKey, input.Description,
+			input.legacySetupID, input.legacySourceKey, now, now)
 		if err != nil {
 			return catalogNameConflict(err)
+		}
+		if input.legacySourceKey != "" {
+			linked, linkErr := tx.ExecContext(ctx, `UPDATE catalog_legacy_migrations
+				SET catalog_setup_id = ?, state = 'publishing', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+				WHERE source_key = ? AND library_id = ? AND legacy_setup_id = ?
+				  AND COALESCE(target_folder_id, '') = ? AND target_name = ?
+				  AND catalog_setup_id IS NULL AND state IN ('pending','publishing')`,
+				setupID, input.legacySourceKey, s.libraryID, input.legacySetupID, input.FolderID, name)
+			if linkErr != nil {
+				return databaseError(linkErr)
+			}
+			changed, rowsErr := linked.RowsAffected()
+			if rowsErr != nil || changed != 1 {
+				return databaseError(errors.New("legacy setup mapping changed"))
+			}
 		}
 		if err := bumpCatalogGeneration(ctx, tx, s.libraryID); err != nil {
 			return err
@@ -1226,6 +1261,26 @@ func (s *Service) PutCatalogFile(ctx context.Context, setupID string, role domai
 	if err := validateIdempotencyKey(input.IdempotencyKey); err != nil {
 		return nil, err
 	}
+	legacyProvenanceCount := 0
+	for _, value := range []string{input.legacySourceKey, input.legacyArtifactID, input.legacyObjectID} {
+		if value != "" {
+			legacyProvenanceCount++
+		}
+	}
+	if legacyProvenanceCount != 0 && legacyProvenanceCount != 3 {
+		return nil, domain.NewError(domain.CodeInvalidContent, "legacy file provenance is incomplete")
+	}
+	if legacyProvenanceCount != 0 {
+		if !input.CreateOnly || input.ExpectedFileVersion != "" {
+			return nil, domain.NewError(domain.CodeInvalidContent, "legacy migration can only create a catalog file")
+		}
+		if err := domain.ValidateID(input.legacyArtifactID); err != nil {
+			return nil, domain.NewError(domain.CodeInvalidContent, "legacy artifact provenance is invalid")
+		}
+		if err := domain.ValidateID(input.legacyObjectID); err != nil {
+			return nil, domain.NewError(domain.CodeInvalidContent, "legacy object provenance is invalid")
+		}
+	}
 	releaseHeavy, err := s.acquireHeavy(ctx)
 	if err != nil {
 		return nil, storageError(err)
@@ -1273,8 +1328,11 @@ func (s *Service) PutCatalogFile(ctx context.Context, setupID string, role domai
 		Size                int64           `json:"size"`
 		SHA256              string          `json:"sha256"`
 		ExpectedSHA256      string          `json:"expectedSha256,omitempty"`
+		LegacySourceKey     string          `json:"legacySourceKey,omitempty"`
+		LegacyArtifactID    string          `json:"legacyArtifactId,omitempty"`
+		LegacyObjectID      string          `json:"legacyObjectId,omitempty"`
 	}{setupID, input.ExpectedRevision, input.ExpectedFileVersion, input.CreateOnly, name, staged.Size, staged.SHA256,
-		input.ExpectedSHA256})
+		input.ExpectedSHA256, input.legacySourceKey, input.legacyArtifactID, input.legacyObjectID})
 	if err != nil {
 		return nil, err
 	}
@@ -1443,11 +1501,11 @@ func (s *Service) PutCatalogFile(ctx context.Context, setupID string, role domai
 				INSERT INTO catalog_files(id, library_id, setup_id, role, display_name, relative_path, path_key,
 				                          media_type, byte_size, sha256, object_version, identity_device,
 				                          identity_inode, identity_size, identity_mtime_ns, identity_ctime_ns,
-				                          created_at, updated_at)
-				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, fileID, s.libraryID,
+				                          legacy_storage_object_id, created_at, updated_at)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULLIF(?, ''), ?, ?)`, fileID, s.libraryID,
 				setupID, role, name, target, pathKey, mediaType, object.Size, object.SHA256, object.Version,
 				int64(object.Identity.Device), int64(object.Identity.Inode), object.Size, object.Identity.ModTimeNS,
-				object.Identity.ChangeTimeNS, now, now)
+				object.Identity.ChangeTimeNS, input.legacyObjectID, now, now)
 		} else {
 			_, err = tx.ExecContext(ctx, `
 				UPDATE catalog_files SET display_name = ?, relative_path = ?, path_key = ?, media_type = ?, byte_size = ?, sha256 = ?, object_version = ?,
@@ -1459,6 +1517,22 @@ func (s *Service) PutCatalogFile(ctx context.Context, setupID string, role domai
 		}
 		if err != nil {
 			return catalogNameConflict(err)
+		}
+		if input.legacySourceKey != "" {
+			linked, linkErr := tx.ExecContext(ctx, `UPDATE catalog_legacy_file_manifest
+				SET catalog_file_id = ?, outcome = 'copied', error_code = NULL,
+				    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+				WHERE source_key = ? AND role = ? AND legacy_artifact_id = ?
+				  AND target_relative_path = ? AND byte_size = ? AND sha256 = ?
+				  AND catalog_file_id IS NULL AND outcome = 'pending'`,
+				fileID, input.legacySourceKey, role, input.legacyArtifactID, target, object.Size, object.SHA256)
+			if linkErr != nil {
+				return databaseError(linkErr)
+			}
+			changed, rowsErr := linked.RowsAffected()
+			if rowsErr != nil || changed != 1 {
+				return databaseError(errors.New("legacy file manifest changed"))
+			}
 		}
 		updated, err := tx.ExecContext(ctx, `UPDATE catalog_setups SET revision = revision + 1, updated_at = ? WHERE library_id = ? AND id = ? AND revision = ?`, now, s.libraryID, setupID, input.ExpectedRevision)
 		if err != nil {
