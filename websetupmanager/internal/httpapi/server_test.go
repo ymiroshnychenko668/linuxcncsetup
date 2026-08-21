@@ -218,6 +218,9 @@ func TestCapabilitiesAreDomainOnlyAndSecured(t *testing.T) {
 			t.Fatalf("missing security header %s", name)
 		}
 	}
+	if policy := response.Header().Get("Content-Security-Policy"); !strings.Contains(policy, "frame-src 'self' blob:") {
+		t.Fatalf("application CSP must allow only the intended same-origin/sanitized-blob frames: %q", policy)
+	}
 	response = request(server, http.MethodPost, "/api/v1/capabilities")
 	if response.Code != http.StatusMethodNotAllowed || response.Header().Get("Allow") != "GET, HEAD" {
 		t.Fatalf("capabilities POST = %d Allow=%q", response.Code, response.Header().Get("Allow"))

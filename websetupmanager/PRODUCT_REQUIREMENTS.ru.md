@@ -20,7 +20,7 @@ Web Setup Manager — компактный каталог и инструмен�
 
 1. понятное физическое место программы на станке;
 2. быстрый upload и просмотр;
-3. компактное дерево каталогов и сетапов;
+3. компактное дерево каталогов, G-code и прикреплённых Setup Sheet;
 4. безопасная работа строго внутри LinuxCNC `PROGRAM_PREFIX`;
 5. отсутствие действий, управляющих LinuxCNC.
 
@@ -65,9 +65,13 @@ WEB_SETUP_MANAGER_PROGRAM_ROOT_DISPLAY=~/linuxcnc/nc_files
 - Основная сущность остаётся **Setup**.
 - Один Setup содержит **не более одной** G-code-программы и **не более одной**
   PDF/HTML Setup Sheet.
-- Setup может быть неполным: без программы, без Setup Sheet или временно без
-  обоих файлов. Неполнота отображается информационно и не блокирует upload,
-  просмотр, переименование или перемещение.
+- В основном операторском UI G-code является корневым файлом Setup, а
+  Setup Sheet — необязательным дочерним файлом. Новый Setup создаётся простой
+  загрузкой одного G-code; одну Sheet можно выбрать вместе с ним или прикрепить
+  позже.
+- Backend сохраняет совместимость с неполными и историческими записями без
+  программы. UI не скрывает их и позволяет добавить G-code, но не предлагает
+  создание пустого или sheet-only Setup как основной сценарий.
 - Setup имеет устойчивый opaque `setup_id`, отображаемое имя, revision и ссылку
   на один каталог каталога.
 - Catalog Folder соответствует реальному подкаталогу под `PROGRAM_ROOT` и может
@@ -85,18 +89,18 @@ WEB_SETUP_MANAGER_PROGRAM_ROOT_DISPLAY=~/linuxcnc/nc_files
 
 | ID | Требование |
 |---|---|
-| `CAT-P0-001` | Основной экран состоит из viewer слева и дерева каталогов/сетапов справа. |
+| `CAT-P0-001` | Основной экран состоит из дерева каталогов/файлов слева и viewer справа. |
 | `CAT-P0-002` | Layout компактный, плотный и визуально близок к UX-паттернам Visual Studio Code: activity/toolbar, tree rows, tabs, resizable split, без больших dashboard-карточек. |
-| `CAT-P0-003` | Дерево отражает иерархию каталогов под настроенным `PROGRAM_ROOT`; каталоги раскрываются/сворачиваются, выбранный Setup подсвечивается. |
+| `CAT-P0-003` | Дерево отражает иерархию каталогов под настроенным `PROGRAM_ROOT`; G-code показан основной строкой, а существующая Setup Sheet — его дочерней строкой. Без Sheet строка остаётся обычным G-code leaf; выбранный файл подсвечивается. |
 | `CAT-P0-004` | Setup имеет cardinality `0..1 program + 0..1 setup_sheet`; вторая программа или вторая sheet не создаётся молча. |
-| `CAT-P0-005` | Неполный Setup допустим и не требует validation/readiness transition. UI показывает только фактическое наличие программы и sheet. |
-| `CAT-P0-006` | До upload UI показывает каталог, имя и понятный operator-facing destination; после успеха сообщает путь вида `Программы → Заказы → Деталь → part.ngc`. |
+| `CAT-P0-005` | Основной create-flow требует один G-code и принимает необязательную Sheet в том же выборе; если выбрана только программа, UI предлагает позже прикрепить Sheet. Исторический неполный Setup остаётся восстанавливаемым и не требует validation/readiness transition. |
+| `CAT-P0-006` | Перед открытием системного file picker UI показывает текущий каталог назначения; имя Setup выводится из имени G-code. После успеха UI сообщает точный operator-facing путь к опубликованной программе. |
 | `CAT-P0-007` | Загруженный G-code атомарно появляется под реальным LinuxCNC `PROGRAM_PREFIX` и доступен в QtDragon после ручной навигации оператора. |
 | `CAT-P0-008` | Выбор Setup, preview и upload не вызывают LinuxCNC API/NML, не открывают и не исполняют программу на станке. |
 | `CAT-P0-009` | Поддержаны создание, переименование, перемещение и удаление catalog folders и setups с revision/version conflict handling. |
 | `CAT-P0-010` | Поддержаны streaming add/replace/delete единственной программы и единственной Setup Sheet без чтения целого файла в память. |
-| `CAT-P0-011` | G-code viewer поддерживает Range/ETag consistency, номера строк, виртуализацию, переход к строке и literal search. |
-| `CAT-P0-012` | PDF показывается локальным безопасным viewer; HTML очищается, получает отдельный CSP и показывается в sandbox без credential. |
+| `CAT-P0-011` | G-code viewer первым приоритетным Range-запросом получает небольшой prefix и показывает начальные строки до фонового полного индекса; сохраняются ETag consistency, номера строк, виртуализация, переход к строке и literal search. |
+| `CAT-P0-012` | PDF показывается локальным безопасным viewer; HTML очищается, получает отдельный CSP и показывается в sandbox без credential. Setup Sheet открывается inline в основной editor surface, а не в modal popup. |
 | `CAT-P0-013` | Public API относится только к catalog entities и content по ID; в нём нет произвольного `/fs`, абсолютных host paths, storage keys или доступа выше root. |
 | `CAT-P0-014` | API может возвращать только нормализованный относительный `relativePath` и безопасный `rootDisplay`, предназначенный для оператора. |
 | `CAT-P0-015` | Все операции разрешают путь от удерживаемого root FD, запрещают traversal, symlink traversal, hardlink/special-file substitution и зарезервированный `ngcgui_lib`. |
@@ -104,7 +108,7 @@ WEB_SETUP_MANAGER_PROGRAM_ROOT_DISPLAY=~/linuxcnc/nc_files
 | `CAT-P0-017` | Create не перезаписывает существующий файл; replace требует ожидаемую revision и версию файла. Внешнее изменение приводит к стабильному conflict, а не к тихой потере данных. |
 | `CAT-P0-018` | Разрешены только G-code-типы активной конфигурации (`.ngc`, `.nc`, `.tap`) и PDF/HTML sheet. Произвольные `.py`, device, FIFO, socket и symlink не принимаются. |
 | `CAT-P0-019` | Поиск/фильтр дерева работает по относительному каталогу и имени Setup; loading, empty, offline, error и conflict состояния локальны и не уничтожают выбранный контекст. |
-| `CAT-P0-020` | Keyboard baseline включает навигацию по tree, открытие Setup, viewer search/line jump, upload dialogs, focus trap/return и видимый focus. |
+| `CAT-P0-020` | Keyboard baseline включает навигацию по tree и дочерней Sheet, переключение editor tabs, viewer search/line jump, запуск системного file picker, возврат focus, modal trap для подтверждений и видимый focus. |
 | `CAT-P0-021` | Remote access сохраняет PAM login того же Linux account, secure cookie session, exact Host/Origin, per-session CSRF, logout и throttle; password не сохраняется приложением. |
 | `CAT-P0-022` | `/healthz` проверяет процесс; `/readyz` — SQLite, state/staging и удерживаемый `PROGRAM_ROOT`, включая совпадение с активным INI. |
 | `CAT-P0-023` | Backup/restore включает SQLite state, legacy library до завершения миграции и весь `PROGRAM_ROOT` как одну согласованную generation. |
@@ -135,16 +139,16 @@ WEB_SETUP_MANAGER_PROGRAM_ROOT_DISPLAY=~/linuxcnc/nc_files
 | AC | Проверяемый результат |
 |---|---|
 | `CAT-AC-01` | Startup на целевом host подтверждает canonical root `/home/user/linuxcnc/nc_files` и соответствующий `PROGRAM_PREFIX` активного `g540.ini`. |
-| `CAT-AC-02` | Созданный через UI вложенный folder физически существует под root и отображается в правом tree после reload. |
-| `CAT-AC-03` | Можно создать пустой Setup, Setup только с программой и Setup только с sheet; validation не требуется и не предлагается. |
+| `CAT-AC-02` | Созданный через UI вложенный folder физически существует под root и отображается в левом tree после reload. |
+| `CAT-AC-03` | Кнопка «Добавить» сразу открывает системный выбор файлов: один G-code создаёт обычный G-code leaf, G-code + одна Sheet загружают обе компоненты, а Sheet можно позже напрямую прикрепить к существующему G-code. Приложение не показывает многошаговый create popup. |
 | `CAT-AC-04` | Upload `jobs/acme/part.ngc` заканчивается atomic publish; файл с теми же bytes виден в QtDragon `User → jobs → acme` и не загружен в LinuxCNC автоматически. |
 | `CAT-AC-05` | Попытка добавить вторую программу/sheet получает понятный replace/conflict flow и не создаёт multi-program composition. |
-| `CAT-AC-06` | Выбор узла открывает слева G-code или sheet; большой G-code использует bounded Range/virtualized preview и сохраняет ETag consistency. |
-| `CAT-AC-07` | Основной viewport — компактный left-viewer/right-tree split; destination виден до подтверждения upload без поиска по отдельной карточке. |
+| `CAT-AC-06` | Выбор G-code или дочерней Sheet открывает файл inline справа. Начало большого G-code появляется после единственного 64-КиБ prefix Range до завершения фонового индекса; preview остаётся bounded/virtualized и сохраняет ETag consistency. |
+| `CAT-AC-07` | Основной viewport — компактный left-tree/right-viewer split; точный destination остаётся в одной строке состояния, без повторяющихся breadcrumb/commandbar/header строк. |
 | `CAT-AC-08` | Traversal, абсолютный путь, symlink, hardlink, FIFO, socket, device и race substitution не читают/не меняют внешний sentinel. |
 | `CAT-AC-09` | Disconnect/cancel/crash до commit оставляет прежний файл либо отсутствие файла; частичное конечное имя не наблюдается, temp восстанавливается/очищается. |
 | `CAT-AC-10` | Внешнее изменение между preview/replace и commit вызывает version conflict; существующие bytes не перезаписываются. |
-| `CAT-AC-11` | Полный keyboard-only flow login → tree → upload → preview/search → logout имеет корректный порядок focus и возврат focus. |
+| `CAT-AC-11` | Полный keyboard-only flow login → left tree/program/sheet → native file picker upload/attach → preview/search → logout имеет корректный порядок focus и возврат focus. |
 | `CAT-AC-12` | Production build, Go unit/integration/race/vet, frontend lint/typecheck/tests, path-security suite, local health/ready и реальный PAM smoke проходят для новой catalog-модели. |
 
 ## 7. Открытые последующие направления

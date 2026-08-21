@@ -4,6 +4,7 @@ import { tokenizeGCode } from '../gcodeHighlight'
 import { resolveSparseLineAnchor, type SparseLineEntry } from '../workers/gcodeCore'
 
 const BLOCK_BYTES = 1 << 20
+const PREVIEW_PREFIX_BYTES = 64 << 10
 const MAX_CACHE_BLOCKS = 8
 const LINE_HEIGHT = 24
 const VIEWPORT_LINES = 28
@@ -79,11 +80,18 @@ async function fetchRangeBytes(
 	return bytes
 }
 
-async function fetchBlock(url: string, version: string, total: number, entry: SparseLineEntry, signal: AbortSignal): Promise<CachedBlock> {
+async function fetchBlock(
+  url: string,
+  version: string,
+  total: number,
+  entry: SparseLineEntry,
+  signal: AbortSignal,
+  blockBytes = BLOCK_BYTES,
+): Promise<CachedBlock> {
 	if (entry.byteOffset === total) {
 		return { offset: entry.byteOffset, startLine: entry.line, lines: [''], truncatedLastLine: false }
 	}
-  const end = Math.min(total - 1, entry.byteOffset + BLOCK_BYTES - 1)
+  const end = Math.min(total - 1, entry.byteOffset + blockBytes - 1)
 	const bytes = await fetchRangeBytes(url, version, total, entry.byteOffset, end, signal)
 	let decoded: string | undefined
 	const removableSuffix = end < total - 1 ? Math.min(3, bytes.byteLength) : 0
@@ -99,8 +107,14 @@ async function fetchBlock(url: string, version: string, total: number, entry: Sp
 	if (decoded === undefined) throw new Error('UNSUPPORTED_ENCODING')
   if (entry.byteOffset === 0 && decoded.charCodeAt(0) === 0xfeff) decoded = decoded.slice(1)
   const lines = decoded.split('\n').map((line) => line.endsWith('\r') ? line.slice(0, -1) : line)
-  const incomplete = end < total - 1 && !decoded.endsWith('\n')
-  if (incomplete && lines.length > 1) lines.pop()
+  const nonFinal = end < total - 1
+  const incomplete = nonFinal && !decoded.endsWith('\n')
+  // A non-final block never owns the fragment after its last newline. That
+  // fragment may be an empty string when the Range ends exactly on `\n`; if it
+  // remained cached, the first line of the next block would look permanently
+  // loaded-but-empty. Keep only a single unterminated long first line as an
+  // explicitly truncated preview.
+  if (nonFinal && (!incomplete || lines.length > 1)) lines.pop()
   return { offset: entry.byteOffset, startLine: entry.line, lines, truncatedLastLine: incomplete && lines.length === 1 }
 }
 
@@ -138,6 +152,8 @@ export function GCodePreview({ setup, artifact, contentUrl, compact = false, onO
     [artifact.artifactId, contentUrl, setup.setupId],
   )
   const workerRef = useRef<Worker | null>(null)
+  const pendingBlockOffsetsRef = useRef(new Set<number>())
+  const artifactGenerationRef = useRef(0)
   const viewportRef = useRef<HTMLDivElement>(null)
   const artifactChangedRef = useRef(onArtifactChanged)
   const lineChangedRef = useRef(onLineChanged)
@@ -148,6 +164,7 @@ export function GCodePreview({ setup, artifact, contentUrl, compact = false, onO
   const [lineInput, setLineInput] = useState(() => String(Math.max(1, Math.floor(initialLine))))
   const [wrap, setWrap] = useState(false)
   const [indexProgress, setIndexProgress] = useState(0)
+  const [workerReady, setWorkerReady] = useState(false)
   const [error, setError] = useState<string>()
   const [query, setQuery] = useState('')
   const [caseSensitive, setCaseSensitive] = useState(false)
@@ -195,18 +212,30 @@ export function GCodePreview({ setup, artifact, contentUrl, compact = false, onO
 
   useEffect(() => {
     const controller = new AbortController()
+    const generation = artifactGenerationRef.current + 1
+    artifactGenerationRef.current = generation
+    const pendingOffsets = new Set<number>()
+    pendingBlockOffsetsRef.current = pendingOffsets
+    let indexStartTimer: number | undefined
+    let worker: Worker | undefined
     setBlocks([])
+    setEntries([{ line: 1, byteOffset: 0 }])
+    setLineCount(1)
+    setIndexProgress(0)
+    setWorkerReady(false)
     setError(undefined)
-		if (artifact.byteSize > 0) void fetchBlock(url, artifact.version, artifact.byteSize, { line: 1, byteOffset: 0 }, controller.signal).then(addBlock, (reason: unknown) => {
-      if (controller.signal.aborted) return
-      const code = reason instanceof Error ? reason.message : 'RANGE_FAILED'
-      setError(code)
-      if (code === 'ARTIFACT_CHANGED') artifactChangedRef.current?.()
-    })
-    if (typeof Worker !== 'undefined') {
-      const worker = new Worker(new URL('../workers/gcodeWorker.ts', import.meta.url), { type: 'module' })
+    setMatches(new Float64Array())
+    setTotalMatches(0)
+    setSearching(false)
+    pendingOffsets.clear()
+
+    const startWorker = () => {
+      if (controller.signal.aborted || generation !== artifactGenerationRef.current || typeof Worker === 'undefined') return
+      worker = new Worker(new URL('../workers/gcodeWorker.ts', import.meta.url), { type: 'module' })
       workerRef.current = worker
+      setWorkerReady(true)
       const onMessage = (event: MessageEvent<WorkerResponse>) => {
+        if (controller.signal.aborted || generation !== artifactGenerationRef.current) return
         const message = event.data
         if (message.requestId === `${requestBase}-index`) {
           if (message.type === 'progress') setIndexProgress(message.totalBytes === 0 ? 1 : message.completedBytes / message.totalBytes)
@@ -251,16 +280,53 @@ export function GCodePreview({ setup, artifact, contentUrl, compact = false, onO
       }
       worker.addEventListener('message', onMessage)
       worker.postMessage({ type: 'index', requestId: `${requestBase}-index`, url, version: artifact.version, byteSize: artifact.byteSize })
-      return () => {
-        controller.abort()
-        worker.postMessage({ type: 'cancel', requestId: `${requestBase}-index` })
-        worker.postMessage({ type: 'cancel', requestId: `${requestBase}-search` })
-        worker.removeEventListener('message', onMessage)
-        worker.terminate()
-        workerRef.current = null
+      workerCleanup = () => {
+        worker?.postMessage({ type: 'cancel', requestId: `${requestBase}-index` })
+        worker?.postMessage({ type: 'cancel', requestId: `${requestBase}-search` })
+        worker?.removeEventListener('message', onMessage)
+        worker?.terminate()
       }
     }
-    return () => controller.abort()
+
+    let workerCleanup = () => undefined
+    const scheduleIndex = () => {
+      if (controller.signal.aborted) return
+      indexStartTimer = window.setTimeout(startWorker, 0)
+    }
+
+    if (artifact.byteSize > 0) {
+      pendingOffsets.add(0)
+      void fetchBlock(
+        url,
+        artifact.version,
+        artifact.byteSize,
+        { line: 1, byteOffset: 0 },
+        controller.signal,
+        PREVIEW_PREFIX_BYTES,
+      ).then((block) => {
+        pendingOffsets.delete(0)
+        if (controller.signal.aborted || generation !== artifactGenerationRef.current) return
+        addBlock(block)
+        setLineCount(Math.max(1, block.startLine + block.lines.length - 1))
+        scheduleIndex()
+      }, (reason: unknown) => {
+        pendingOffsets.delete(0)
+        if (controller.signal.aborted || generation !== artifactGenerationRef.current) return
+        const code = reason instanceof Error ? reason.message : 'RANGE_FAILED'
+        setError(code)
+        if (code === 'ARTIFACT_CHANGED') artifactChangedRef.current?.()
+      })
+    } else {
+      scheduleIndex()
+    }
+
+    return () => {
+      controller.abort()
+      if (indexStartTimer !== undefined) window.clearTimeout(indexStartTimer)
+      workerCleanup()
+      if (workerRef.current === worker) workerRef.current = null
+      pendingOffsets.clear()
+    }
 	}, [addBlock, artifact.byteSize, artifact.version, requestBase, url])
 
   useEffect(() => {
@@ -272,6 +338,10 @@ export function GCodePreview({ setup, artifact, contentUrl, compact = false, onO
 				entry = { line: block.startLine, byteOffset: block.offset }
 			}
 		}
+    const generation = artifactGenerationRef.current
+    const pendingOffsets = pendingBlockOffsetsRef.current
+    if (pendingOffsets.has(entry.byteOffset)) return
+    pendingOffsets.add(entry.byteOffset)
     const controller = new AbortController()
 		const source = {
 			read: (start: number, endInclusive: number, version: string, signal: AbortSignal) =>
@@ -280,12 +350,15 @@ export function GCodePreview({ setup, artifact, contentUrl, compact = false, onO
 		void resolveSparseLineAnchor({
 			source, version: artifact.version, byteSize: artifact.byteSize,
 			signal: controller.signal, blockSize: BLOCK_BYTES, entry, targetLine: firstLine,
-		}).then((resolved) => fetchBlock(url, artifact.version, artifact.byteSize, resolved, controller.signal)).then(addBlock, (reason: unknown) => {
-      if (controller.signal.aborted) return
+		}).then((resolved) => fetchBlock(url, artifact.version, artifact.byteSize, resolved, controller.signal)).then((block) => {
+      if (controller.signal.aborted || generation !== artifactGenerationRef.current) return
+      addBlock(block)
+    }, (reason: unknown) => {
+      if (controller.signal.aborted || generation !== artifactGenerationRef.current) return
       const code = reason instanceof Error ? reason.message : 'RANGE_FAILED'
       setError(code)
       if (code === 'ARTIFACT_CHANGED') artifactChangedRef.current?.()
-    })
+    }).finally(() => pendingOffsets.delete(entry.byteOffset))
     return () => controller.abort()
   }, [addBlock, artifact.byteSize, artifact.version, blocks, entries, firstLine, url])
 
@@ -312,6 +385,7 @@ export function GCodePreview({ setup, artifact, contentUrl, compact = false, onO
 
   const submitSearch = (event: React.FormEvent) => {
     event.preventDefault()
+    if (!workerRef.current) return
     workerRef.current?.postMessage({ type: 'cancel', requestId: `${requestBase}-search` })
 		setMatches(new Float64Array())
     setTotalMatches(0)
@@ -376,28 +450,33 @@ export function GCodePreview({ setup, artifact, contentUrl, compact = false, onO
 
   const hasSheet = setup.artifacts.some((item) => item.role === 'setup_sheet')
   return (
-    <section className={`gcode-preview${compact ? ' gcode-preview--compact' : ''}`} aria-labelledby="preview-title">
-      <header className={`preview-header${compact ? ' preview-header--compact' : ''}`}>
+    <section
+      className={`gcode-preview${compact ? ' gcode-preview--compact' : ''}`}
+      aria-labelledby={compact ? undefined : 'preview-title'}
+      aria-label={compact ? `G-code ${artifact.displayName}` : undefined}
+    >
+      {!compact ? <header className="preview-header">
         <div>
-          {!compact ? <p className="eyebrow">G-code preview · revision {setup.revision}</p> : null}
+          <p className="eyebrow">G-code preview · revision {setup.revision}</p>
           <h2 id="preview-title">{artifact.displayName}</h2>
-          {!compact ? <p>{setup.name} · {artifact.byteSize.toLocaleString()} байт · версия {artifact.version.slice(0, 12)}… {artifact.primary ? '· Основная программа' : ''}</p> : null}
+          <p>{setup.name} · {artifact.byteSize.toLocaleString()} байт · версия {artifact.version.slice(0, 12)}… {artifact.primary ? '· Основная программа' : ''}</p>
         </div>
         <div className="preview-header__actions">
-          {!compact ? <button type="button" className="button button--quiet" disabled={!hasSheet} onClick={onOpenSetupSheet}>Setup Sheet</button> : null}
+          <button type="button" className="button button--quiet" disabled={!hasSheet} onClick={onOpenSetupSheet}>Setup Sheet</button>
           <label className="toggle"><input type="checkbox" checked={wrap} onChange={(event) => setWrap(event.target.checked)} /> Перенос строк</label>
         </div>
-      </header>
-      <div className="index-progress" role="status">
+      </header> : null}
+      {!compact ? <div className="index-progress" role="status">
         Индекс строк: {Math.round(indexProgress * 100)}%
         <progress max={1} value={indexProgress} aria-label="Прогресс индекса строк" />
-      </div>
+      </div> : null}
       {error ? <div className="preview-error" role="alert">
         {error === 'ARTIFACT_CHANGED' ? 'Артефакт изменён. Обновите карточку перед продолжением.' : 'Текстовый preview недоступен.'}
         {error === 'ARTIFACT_CHANGED' && onArtifactChanged ? <button type="button" className="button button--quiet" onClick={() => artifactChangedRef.current?.()}>Обновить карточку</button> : null}
       </div> : null}
       {artifact.byteSize === 0 ? <div className="preview-empty" role="status">Программа пуста.</div> : null}
       <div className="preview-tools">
+        {compact ? <><span className="preview-index-status" role="status">Индекс {Math.round(indexProgress * 100)}%</span><label className="toggle"><input type="checkbox" checked={wrap} onChange={(event) => setWrap(event.target.checked)} /> Перенос</label></> : null}
         <form onSubmit={(event) => { event.preventDefault(); goToLine(Number(lineInput)) }}>
           <label>Строка <input name="line" type="number" min={1} max={lineCount} value={lineInput} onChange={(event) => setLineInput(event.target.value)} /></label>
           <button type="submit" className="button button--quiet">Перейти</button>
@@ -405,7 +484,7 @@ export function GCodePreview({ setup, artifact, contentUrl, compact = false, onO
         <form role="search" onSubmit={submitSearch}>
           <label>Поиск <input type="search" value={query} onChange={(event) => setQuery(event.target.value)} /></label>
           <label className="toggle"><input type="checkbox" checked={caseSensitive} onChange={(event) => setCaseSensitive(event.target.checked)} /> Учитывать регистр</label>
-          <button type="submit" className="button button--quiet">Найти</button>
+          <button type="submit" className="button button--quiet" disabled={!workerReady || searching}>Найти</button>
 					{searching ? <button type="button" className="button button--quiet" onClick={cancelSearch}>Отменить поиск</button> : null}
           <button type="button" aria-label="Предыдущее совпадение" onClick={() => moveMatch(-1)} disabled={totalMatches === 0 || searching}>↑</button>
           <button type="button" aria-label="Следующее совпадение" onClick={() => moveMatch(1)} disabled={totalMatches === 0 || searching}>↓</button>

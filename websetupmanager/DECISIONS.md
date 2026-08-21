@@ -3,7 +3,7 @@
 Неоднозначности требований фиксируются здесь до реализации. Решения `D-001`–
 `D-020` сохраняют историю первой managed-library версии. Прямое продуктовое
 решение владельца станка от 2026-08-21 имеет больший приоритет и зафиксировано в
-`D-021`–`D-031` и
+`D-021`–`D-032` и
 [PRODUCT_REQUIREMENTS.ru.md](PRODUCT_REQUIREMENTS.ru.md). Старое решение нельзя
 использовать для восстановления multi-program/validation/dashboard UX вопреки
 новой модели.
@@ -139,8 +139,8 @@ CSRF/session credential или catalog API.
 
 Document CSP сохраняет `default-src 'none'`/`connect-src 'none'` и разрешает
 только очищенные inline styles и `data:` images. Blob URL отзывается при
-закрытии/unmount/version change. Credential разрешён только trusted fetch
-слою; он не передаётся документу viewer.
+переключении файла, unmount или version change. Credential разрешён только
+trusted fetch слою; он не передаётся документу viewer.
 
 ## D-028: production endpoint — direct HTTPS 443 без listener/redirect на 80
 
@@ -204,6 +204,36 @@ viewer tests проверяют детали trap/return/roving focus. Native fi
 automation представлен стандартным `userEvent.upload`; production PAM/session
 и реальный layout проверены отдельным Firefox smoke.
 
+## D-032: G-code является родителем inline Setup Sheet в левом file tree
+
+Прямая продуктовая корректировка владельца станка от 2026-08-21 заменяет
+стороны split, create-flow и способ открытия Sheet из `D-021`: дерево файлов
+находится слева, а единая editor surface — справа. В дереве G-code является
+строкой верхнего уровня Setup; при наличии Sheet она всегда показана дочерней
+строкой и обе строки переключают обычные editor tabs. Sheet рендерится inline,
+а modal остаётся только для подтверждений и свойств.
+
+Новая кнопка «Добавить» открывает native multi-file picker без application
+wizard. Ровно один G-code обязателен; одна PDF/HTML Sheet может быть выбрана
+вместе с ним или прикреплена позже прямым действием. Формулировка «оба файла —
+оба загружаем» означает upload обеих компонент существующим scoped catalog API,
+а не ZIP/export/download из P1. Backend/schema не ужесточаются: исторические
+empty/sheet-only записи остаются видимыми и восстанавливаемыми добавлением
+G-code, что избегает потери данных и не требует неатомарной destructive cleanup.
+
+Первый paint G-code имеет приоритет над полным индексом: UI запрашивает один
+version-bound prefix не более 64 КиБ, сразу показывает законченные начальные
+строки и только после этого запускает Worker. Дальнейшие Range-блоки остаются
+bounded и связаны exact ETag/`If-Match`. Заголовок не повторяет имя и путь:
+имя остаётся в tab, поиск/line/index — в одной компактной панели, а точный
+destination — в единственной status bar. Primary CTA использует спокойный
+тёмно-зелёный фон с светлым текстом вместо яркого lime.
+
+Очищенный HTML загружается exact-version fetch и показывается через revocable
+`blob:` URL. Поэтому application CSP разрешает `blob:` только в `frame-src`;
+iframe остаётся originless с пустым `sandbox`, а встроенная CSP очищенного
+документа сохраняет `default-src 'none'; connect-src 'none'`.
+
 ## Статус исторических решений
 
 | Решение | Статус в catalog-версии |
@@ -213,12 +243,12 @@ automation представлен стандартным `userEvent.upload`; pro
 | `D-003`, `D-004`, `D-011` | заменены `D-021`–`D-023` |
 | `D-009`, `D-010`, `D-012`, `D-013`, `D-016`, `D-020` | частично применимы к новым catalog mutations; legacy workflow не нормативен |
 | `D-018` | backup boundary расширен до `PROGRAM_ROOT`; legacy текст ниже исторический |
-| `D-025`–`D-031` | текущие exact precondition, migration provenance/backfill, HTML credential boundary, direct HTTPS, editor containment и focus-return решения |
+| `D-025`–`D-032` | текущие exact precondition, migration provenance/backfill, HTML credential boundary, direct HTTPS, editor containment, focus-return и left-tree/inline-sheet решения |
 
 ## Исторический журнал D-001–D-020
 
 Текст ниже сохранён без переписывания исходной мотивации. При конфликте
-применяются `D-021`–`D-031`.
+применяются `D-021`–`D-032`.
 
 ## D-001: production baseline
 

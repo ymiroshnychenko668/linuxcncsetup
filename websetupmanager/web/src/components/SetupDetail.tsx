@@ -334,7 +334,7 @@ export function SetupDetail({
             ))}
           </ul>
         )}
-        {selectedProgram ? <GCodePreview setup={setup} artifact={selectedProgram} initialLine={selectedProgram.artifactId === selectedArtifactId ? initialLine : 1} onLineChanged={(line) => onSelectedArtifact(selectedProgram.artifactId, line)} onOpenSetupSheet={sheet ? () => setViewerOpen(true) : undefined} onArtifactChanged={() => void onReload()} /> : null}
+        {selectedProgram ? <GCodePreview key={`${selectedProgram.artifactId}:${selectedProgram.version}`} setup={setup} artifact={selectedProgram} initialLine={selectedProgram.artifactId === selectedArtifactId ? initialLine : 1} onLineChanged={(line) => onSelectedArtifact(selectedProgram.artifactId, line)} onOpenSetupSheet={sheet ? () => setViewerOpen(true) : undefined} onArtifactChanged={() => void onReload()} /> : null}
       </section>
 
       <section className="detail-section" aria-labelledby="sheet-title">

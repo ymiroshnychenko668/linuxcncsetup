@@ -7,11 +7,12 @@ interface Props {
   setup: Setup
   artifact: Artifact
   contentUrl?: string
-  onClose: () => void
-  onReplace: () => void
+  onClose?: () => void
+  onReplace: (trigger?: HTMLElement) => void
+  inline?: boolean
 }
 
-export function SetupSheetViewer({ setup, artifact, contentUrl, onClose, onReplace }: Props) {
+export function SetupSheetViewer({ setup, artifact, contentUrl, onClose, onReplace, inline = false }: Props) {
   const surfaceRef = useRef<HTMLDivElement>(null)
   const [failed, setFailed] = useState(false)
   const [htmlDocument, setHTMLDocument] = useState<{ source: string; objectURL: string }>()
@@ -64,52 +65,60 @@ export function SetupSheetViewer({ setup, artifact, contentUrl, onClose, onRepla
     }
   }, [artifact.mediaType, artifact.version, versionedContentURL])
 
+  const surface = (
+    <div ref={surfaceRef} className="sheet-viewer-surface">
+      {failed ? (
+        <div className="viewer-error" role="alert">
+          Setup Sheet не удалось показать. Документ мог быть повреждён или изменён.
+          <button type="button" className="button button--quiet" onClick={(event) => onReplace(event.currentTarget)}>Заменить документ</button>
+        </div>
+      ) : artifact.mediaType === 'application/pdf' ? (
+        <PDFViewer artifact={artifact} url={contentURL} onError={handleError} />
+      ) : (
+        <div className="html-sheet-viewer">
+          <div className="viewer-toolbar" role="toolbar" aria-label="Управление HTML Setup Sheet">
+            <button type="button" onClick={() => setHTMLScale((value) => Math.max(0.5, value - 0.25))} aria-label="Уменьшить масштаб">−</button>
+            <output aria-label="Масштаб HTML Setup Sheet">{Math.round(htmlScale * 100)}%</output>
+            <button type="button" onClick={() => setHTMLScale((value) => Math.min(4, value + 0.25))} aria-label="Увеличить масштаб">+</button>
+            {!htmlReady ? <span role="status">Загружаем Setup Sheet…</span> : null}
+          </div>
+          <div className="html-sheet-scroll" tabIndex={0} aria-label={`HTML Setup Sheet ${artifact.displayName}`}>
+            {htmlReady ? (
+              <iframe
+                className="html-sheet-frame"
+                title={`Setup Sheet ${artifact.displayName}`}
+                src={htmlDocument.objectURL}
+                sandbox=""
+                referrerPolicy="no-referrer"
+                onError={handleError}
+                style={{ zoom: htmlScale, width: `${100 / htmlScale}%`, height: `${100 / htmlScale}%` }}
+              />
+            ) : null}
+          </div>
+        </div>
+      )}
+    </div>
+  )
+
+  if (inline) {
+    return <section className="sheet-viewer-inline" aria-label={`Setup Sheet ${artifact.displayName}`}>{surface}</section>
+  }
+
   return (
     <Modal
       title={artifact.displayName}
       description={`Setup Sheet · ${artifact.mediaType === 'application/pdf' ? 'PDF' : 'HTML'} · ${artifact.byteSize.toLocaleString()} байт`}
-      onClose={onClose}
+      onClose={onClose ?? (() => undefined)}
       className="sheet-viewer-modal"
       footer={(
         <>
           <button type="button" className="button button--quiet" onClick={requestFullscreen}>На весь экран</button>
-          <button type="button" className="button button--quiet" onClick={onReplace}>Заменить</button>
+          <button type="button" className="button button--quiet" onClick={(event) => onReplace(event.currentTarget)}>Заменить</button>
           <button type="button" className="button button--primary" onClick={onClose}>Закрыть</button>
         </>
       )}
     >
-      <div ref={surfaceRef} className="sheet-viewer-surface">
-        {failed ? (
-          <div className="viewer-error" role="alert">
-            Setup Sheet не удалось показать. Документ мог быть повреждён или изменён.
-            <button type="button" className="button button--quiet" onClick={onReplace}>Заменить документ</button>
-          </div>
-        ) : artifact.mediaType === 'application/pdf' ? (
-          <PDFViewer artifact={artifact} url={contentURL} onError={handleError} />
-        ) : (
-          <div className="html-sheet-viewer">
-            <div className="viewer-toolbar" aria-label="Управление HTML Setup Sheet">
-              <button type="button" onClick={() => setHTMLScale((value) => Math.max(0.5, value - 0.25))} aria-label="Уменьшить масштаб">−</button>
-              <output aria-label="Масштаб HTML Setup Sheet">{Math.round(htmlScale * 100)}%</output>
-              <button type="button" onClick={() => setHTMLScale((value) => Math.min(4, value + 0.25))} aria-label="Увеличить масштаб">+</button>
-              {!htmlReady ? <span role="status">Загружаем Setup Sheet…</span> : null}
-            </div>
-            <div className="html-sheet-scroll" tabIndex={0} aria-label={`HTML Setup Sheet ${artifact.displayName}`}>
-              {htmlReady ? (
-                <iframe
-                  className="html-sheet-frame"
-                  title={`Setup Sheet ${artifact.displayName}`}
-                  src={htmlDocument.objectURL}
-                  sandbox=""
-                  referrerPolicy="no-referrer"
-                  onError={handleError}
-                  style={{ zoom: htmlScale, width: `${100 / htmlScale}%`, height: `${100 / htmlScale}%` }}
-                />
-              ) : null}
-            </div>
-          </div>
-        )}
-      </div>
+      {surface}
     </Modal>
   )
 }

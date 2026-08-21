@@ -6,10 +6,11 @@ LinuxCNC-станка. Основная сущность — **Setup** с не �
 группируется по реальным каталогам внутри настроенного LinuxCNC
 `PROGRAM_PREFIX`.
 
-Основной экран следует плотному UX-паттерну Visual Studio Code: viewer G-code/
-Setup Sheet слева, дерево folders/setups справа. Приложение показывает, в каком
-каталоге QtDragon найти загруженную программу. Оно не проверяет технологическую
-готовность, не загружает и не исполняет G-code в LinuxCNC.
+Основной экран следует плотному UX-паттерну Visual Studio Code: слева находится
+дерево folders → G-code → optional Setup Sheet, справа — общий inline viewer.
+Приложение показывает, в каком каталоге QtDragon найти загруженную программу.
+Оно не проверяет технологическую готовность, не загружает и не исполняет G-code
+в LinuxCNC.
 
 Актуальные требования:
 [PRODUCT_REQUIREMENTS.ru.md](PRODUCT_REQUIREMENTS.ru.md). Прежняя
@@ -24,7 +25,12 @@ baseline в [functional-requirements.ru.md](functional-requirements.ru.md).
 - folders и setups с устойчивыми IDs и относительными путями;
 - direct streaming/atomic publish именованных файлов в `PROGRAM_PREFIX`;
 - cardinality `0..1 program + 0..1 setup_sheet`, без validation gate;
-- компактный left-viewer/right-tree интерфейс с понятным destination;
+- компактный left-tree/right-inline-viewer интерфейс с понятным destination;
+- «Добавить» сразу открывает native picker: один G-code обязателен, одну Sheet
+  можно выбрать вместе с ним или напрямую прикрепить позже; имя Setup выводится
+  из имени G-code, многошагового create popup нет;
+- первый version-bound prefix G-code ограничен 64 КиБ и показывается до запуска
+  Worker index; последующая навигация/поиск используют bounded Range blocks;
 - Web Worker индекс/поиск G-code, PDF.js и sandboxed sanitized HTML viewer;
 - revision/version conflicts, audit, idempotency и recovery собственных temp;
 - в remote mode — Linux PAM login, защищённые browser sessions, logout,
@@ -35,7 +41,7 @@ baseline в [functional-requirements.ru.md](functional-requirements.ru.md).
 `/home/user/linuxcnc/configs/corvuscnc/g540.ini`. Сервис обязан проверить их
 совпадение до ready. Catalog service/storage/HTTP automation, real subprocess
 SIGKILL recovery, sparse 10 GiB Range, 0/1/N migration/provenance suites и
-frontend lint/typecheck/15 files / 87 tests/Vite build прошли. Catalog release
+frontend lint/typecheck/15 files / 103 tests/Vite build прошли. Catalog release
 развёрнут на production host; Firefox desktop/mobile production smoke прошёл.
 Сквозной keyboard-only integration flow также прошёл; отдельный LAN client,
 DHCP reservation, controlled target performance и ручной визуальный QtDragon

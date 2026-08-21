@@ -1,4 +1,4 @@
-import { render, screen } from '@testing-library/react'
+import { act, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { GCodePreview } from './GCodePreview'
@@ -71,7 +71,7 @@ describe('GCodePreview', () => {
 		expect(screen.getByRole('button', { name: 'Предыдущие строки' })).toBeEnabled()
 	})
 
-	it('keeps the sparse index Worker alive when a parent supplies a new callback identity', () => {
+		it('keeps the sparse index Worker alive when a parent supplies a new callback identity', async () => {
 		let workerCount = 0
 		let indexCount = 0
 		class StableWorker {
@@ -88,12 +88,121 @@ describe('GCodePreview', () => {
 			status: 206, headers: { etag: `"${artifact.version}"` },
 		})))
 		const view = render(<GCodePreview setup={setup} artifact={{ ...artifact, byteSize: 1 }} onArtifactChanged={() => undefined} />)
-		expect(workerCount).toBe(1)
-		expect(indexCount).toBe(1)
-		view.rerender(<GCodePreview setup={setup} artifact={{ ...artifact, byteSize: 1 }} onArtifactChanged={() => undefined} />)
-		expect(workerCount).toBe(1)
-		expect(indexCount).toBe(1)
-	})
+			await waitFor(() => expect(workerCount).toBe(1))
+			expect(indexCount).toBe(1)
+			view.rerender(<GCodePreview setup={setup} artifact={{ ...artifact, byteSize: 1 }} onArtifactChanged={() => undefined} />)
+			await waitFor(() => expect(workerCount).toBe(1))
+			expect(indexCount).toBe(1)
+		})
+
+		it('shows one 64 KiB prefix before starting the background index', async () => {
+			const requestedRanges: string[] = []
+			let resolvePrefix!: (response: Response) => void
+			const prefixRequest = new Promise<Response>((resolve) => { resolvePrefix = resolve })
+			let workers = 0
+			class DeferredIndexWorker {
+				constructor() { workers += 1 }
+				addEventListener() {}
+				removeEventListener() {}
+				terminate() {}
+				postMessage() {}
+			}
+			vi.stubGlobal('Worker', DeferredIndexWorker)
+			vi.stubGlobal('fetch', vi.fn().mockImplementation((_url: string, init?: RequestInit) => {
+				const range = (init?.headers as Record<string, string> | undefined)?.Range ?? ''
+				requestedRanges.push(range)
+				return prefixRequest
+			}))
+
+			render(<GCodePreview compact setup={setup} artifact={{ ...artifact, byteSize: 70_000 }} />)
+			expect(requestedRanges).toEqual(['bytes=0-65535'])
+			expect(workers).toBe(0)
+
+			const prefix = new Uint8Array(65_536).fill(0x20)
+			prefix.set(new TextEncoder().encode('G90\nG0 X0\n'))
+			resolvePrefix(new Response(prefix, { status: 206, headers: { etag: `"${artifact.version}"` } }))
+
+			expect(await screen.findByText('G90')).toBeInTheDocument()
+			await waitFor(() => expect(workers).toBe(1))
+			expect(requestedRanges).toEqual(['bytes=0-65535'])
+			expect(screen.queryByRole('heading', { name: 'main.ngc' })).not.toBeInTheDocument()
+		})
+
+		it('does not let a late prefix from an old artifact overwrite the new generation', async () => {
+			let resolveOld!: (response: Response) => void
+			let resolveNew!: (response: Response) => void
+			const oldRequest = new Promise<Response>((resolve) => { resolveOld = resolve })
+			const newRequest = new Promise<Response>((resolve) => { resolveNew = resolve })
+			const newer = { ...artifact, artifactId: 'new-artifact', displayName: 'new.ngc', version: 'd'.repeat(64), byteSize: 4 }
+			vi.stubGlobal('fetch', vi.fn().mockImplementation((_url: string, init?: RequestInit) => {
+				const version = (init?.headers as Record<string, string> | undefined)?.['If-Match']
+				return version === `"${newer.version}"` ? newRequest : oldRequest
+			}))
+
+			const view = render(<GCodePreview compact setup={setup} artifact={{ ...artifact, byteSize: 4 }} />)
+			view.rerender(<GCodePreview compact setup={setup} artifact={newer} />)
+			await act(async () => {
+				resolveNew(new Response(new TextEncoder().encode('NEW\n'), {
+					status: 206, headers: { etag: `"${newer.version}"` },
+				}))
+				await Promise.resolve()
+			})
+			expect(await screen.findByText('NEW')).toBeInTheDocument()
+
+			await act(async () => {
+				resolveOld(new Response(new TextEncoder().encode('OLD\n'), {
+					status: 206, headers: { etag: `"${artifact.version}"` },
+				}))
+				await Promise.resolve()
+			})
+			await waitFor(() => expect(screen.queryByText('OLD')).not.toBeInTheDocument())
+			expect(screen.getByLabelText('G-code new.ngc')).toBeInTheDocument()
+		})
+
+		it('loads the real next line when the prefix ends exactly on a newline', async () => {
+			const prefixSize = 64 << 10
+			const tail = new TextEncoder().encode('TARGET')
+			const bytes = new Uint8Array(prefixSize + tail.length)
+			bytes.fill(0x58, 0, prefixSize - 1)
+			bytes[prefixSize - 1] = 0x0a
+			bytes.set(tail, prefixSize)
+			const ranges: string[] = []
+			class BoundaryWorker {
+				private listener?: (event: MessageEvent<unknown>) => void
+				addEventListener(_type: string, listener: EventListener) { this.listener = listener as (event: MessageEvent<unknown>) => void }
+				removeEventListener() { this.listener = undefined }
+				terminate() { this.listener = undefined }
+				postMessage(message: { type: string; requestId: string }) {
+					if (message.type !== 'index') return
+					queueMicrotask(() => this.listener?.({ data: {
+						type: 'indexResult', requestId: message.requestId, lineCount: 2,
+						entries: [{ line: 1, byteOffset: 0 }, { line: 2, byteOffset: prefixSize }],
+					} } as MessageEvent<unknown>))
+				}
+			}
+			vi.stubGlobal('Worker', BoundaryWorker)
+			vi.stubGlobal('fetch', vi.fn().mockImplementation((_url: string, init?: RequestInit) => {
+				const range = (init?.headers as Record<string, string> | undefined)?.Range ?? ''
+				ranges.push(range)
+				const match = /^bytes=(\d+)-(\d+)$/.exec(range)
+				if (!match) throw new Error(`unexpected range ${range}`)
+				return Promise.resolve(new Response(bytes.slice(Number(match[1]), Number(match[2]) + 1), {
+					status: 206, headers: { etag: `"${artifact.version}"` },
+				}))
+			}))
+
+			const user = userEvent.setup()
+			render(<GCodePreview compact setup={setup} artifact={{ ...artifact, byteSize: bytes.byteLength }} />)
+			const line = screen.getByRole('spinbutton', { name: 'Строка' })
+			await waitFor(() => expect(line).toHaveAttribute('max', '2'))
+			await user.clear(line)
+			await user.type(line, '2')
+			await user.click(screen.getByRole('button', { name: 'Перейти' }))
+
+			expect(await screen.findByText('TARGET')).toBeInTheDocument()
+			expect(ranges[0]).toBe('bytes=0-65535')
+			expect(ranges.some((range) => range.startsWith(`bytes=${prefixSize}-`))).toBe(true)
+		})
 
 	it('iteratively reaches a target line beyond a one-megabyte thinned-index gap', async () => {
 		const blockBytes = 1 << 20

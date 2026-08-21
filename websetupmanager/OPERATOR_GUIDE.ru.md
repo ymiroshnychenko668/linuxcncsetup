@@ -35,22 +35,27 @@ QtDragon:       User → <каталог> → <программа>.ngc
 
 ### Работа оператора
 
-1. Справа раскройте compact tree folders/setups или создайте нужный folder.
+1. Слева раскройте compact tree folders/files или создайте нужный folder.
    Физические folders находятся под `PROGRAM_PREFIX`; `ngcgui_lib` зарезервирован
    LinuxCNC и не используется для пользовательских сетапов.
-2. Создайте Setup в выбранном folder. Пустой Setup допустим. Добавьте одну
-   `.ngc`, `.nc` или `.tap` программу и при необходимости одну PDF/HTML Setup
-   Sheet. Вторая программа/sheet означает replace, а не добавление composition.
-3. До подтверждения upload проверьте operator-facing destination, например
-   `Программы → Заказы → Клиент → detail.ngc`. Backend не принимает absolute
-   path от browser и не может выйти выше настроенного root.
+2. Выберите folder назначения и нажмите «Добавить». Системный file picker
+   принимает ровно один `.ngc`, `.nc` или `.tap` G-code и необязательно одну
+   PDF/HTML Setup Sheet. Выбор сразу начинает upload без отдельного create
+   popup; имя Setup выводится из имени G-code.
+3. Если Sheet пока нет, G-code остаётся обычной leaf-строкой; прикрепите Sheet
+   позже прямой кнопкой `Setup Sheet`. После этого она появляется дочерней
+   строкой под G-code. Вторая программа/sheet означает replace, а не добавление
+   composition. Текущий folder назначения виден до picker, точный путь — после
+   upload; Backend не принимает absolute path и не выходит выше root.
 4. После успеха программа физически опубликована под
    `/home/user/linuxcnc/nc_files/<относительный каталог>/...`. Откройте штатный
    QtDragon file manager, перейдите из `User` по тому же дереву и выберите файл
    вручную.
-5. Слева просматривайте выбранную программу с номерами строк, переходом и
-   literal-поиском. Большие файлы читаются Range-блоками. Setup Sheet открывается
-   как canvas PDF либо очищенный HTML в sandbox.
+5. Справа просматривайте выбранную программу с номерами строк, переходом и
+   literal-поиском. Один version-bound prefix до 64 КиБ показывает начало до
+   фонового Worker index; дальнейшее чтение остаётся bounded Range/ETag.
+   Дочерняя Setup Sheet открывается inline в той же editor surface как canvas
+   PDF либо очищенный HTML в sandbox, не во всплывающем окне.
 6. При version/revision conflict сначала обновите tree/viewer и сравните
    актуальный файл. Приложение не перезаписывает внешнее изменение молча.
 7. Удаление/перемещение catalog entity меняет именованный файл/каталог только
@@ -328,8 +333,8 @@ loopback/Unix-isolated network и ограничьте доступ firewall. Tr
 отбрасывать client-supplied forwarding/auth headers, передавать session cookie
 и optional Bearer, сохранять внешний `Host` и обеспечивать точное совпадение
 HTTPS `Origin` с ним для login/logout/mutation checks. Сначала проверьте guest
-session response, login, capabilities, тестовое создание пустого catalog Setup
-и logout; не
+session response, login, capabilities, upload disposable G-code в отдельный
+тестовый folder и logout; не
 отключайте Host/Origin/CSRF проверки.
 
 ## 5. Резервное копирование

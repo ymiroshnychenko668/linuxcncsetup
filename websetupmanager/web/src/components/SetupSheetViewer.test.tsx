@@ -65,4 +65,19 @@ describe('SetupSheetViewer', () => {
     await userEvent.click(screen.getByRole('button', { name: 'Заменить документ' }))
     expect(replace).toHaveBeenCalledOnce()
   })
+
+  it('renders the safe document as an inline editor pane without a modal', async () => {
+    vi.stubGlobal('URL', { createObjectURL: vi.fn(() => 'blob:https://microb.int/inline-sheet'), revokeObjectURL: vi.fn() })
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockResolvedValue(new Response('<p>Safe</p>', {
+      status: 200,
+      headers: { 'content-type': 'text/html; charset=utf-8', etag: `"${sheet.version}"` },
+    })))
+
+    const { unmount } = render(<SetupSheetViewer inline setup={setup} artifact={sheet} onReplace={vi.fn()} />)
+
+    expect(await screen.findByLabelText('Setup Sheet instructions.html')).toHaveClass('sheet-viewer-inline')
+    expect(screen.getByTitle('Setup Sheet instructions.html')).toHaveAttribute('sandbox', '')
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+    unmount()
+  })
 })

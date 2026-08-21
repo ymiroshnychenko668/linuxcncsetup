@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import type { PDFDocumentLoadingTask, PDFDocumentProxy } from 'pdfjs-dist/types/src/display/api'
 import type { Artifact } from '../domain'
-import { pdfCanvasGeometry } from '../pdfGeometry'
+import { pdfAccessibleTextFromStream, pdfCanvasGeometry } from '../pdfGeometry'
 
 interface Props {
   artifact: Artifact
@@ -16,11 +16,13 @@ export function PDFViewer({ artifact, url, onError }: Props) {
   const [scale, setScale] = useState(1)
   const [progress, setProgress] = useState(0)
   const [error, setError] = useState(false)
+  const [accessibleText, setAccessibleText] = useState('Загрузка текстового слоя PDF…')
 
 	useEffect(() => {
 		setDocumentProxy(undefined)
 		setPageNumber(1)
 		setError(false)
+		setAccessibleText('Загрузка текстового слоя PDF…')
 		let disposed = false
 		let loading: PDFDocumentLoadingTask | undefined
 		void import('pdfjs-dist').then((pdfjs) => {
@@ -62,8 +64,17 @@ export function PDFViewer({ artifact, url, onError }: Props) {
     if (!documentProxy || !canvasRef.current) return
     let cancelled = false
     let renderTask: { cancel: () => void; promise: Promise<void> } | undefined
+    const textController = new AbortController()
+    setAccessibleText('Загрузка текстового слоя PDF…')
     void documentProxy.getPage(pageNumber).then((page) => {
       if (cancelled || !canvasRef.current) return
+      const textStream = page.streamTextContent() as ReadableStream<{ items: readonly unknown[] }>
+      void pdfAccessibleTextFromStream(textStream, textController.signal).then((text) => {
+        if (cancelled) return
+        setAccessibleText(text || 'На этой странице PDF нет доступного текста.')
+      }, () => {
+        if (!cancelled) setAccessibleText('Текстовый слой этой страницы PDF недоступен.')
+      })
       const viewport = page.getViewport({ scale })
       const geometry = pdfCanvasGeometry(viewport.width, viewport.height, window.devicePixelRatio || 1)
       const canvas = canvasRef.current
@@ -86,6 +97,7 @@ export function PDFViewer({ artifact, url, onError }: Props) {
     })
     return () => {
       cancelled = true
+      textController.abort()
       renderTask?.cancel()
     }
   }, [documentProxy, onError, pageNumber, scale])
@@ -96,17 +108,19 @@ export function PDFViewer({ artifact, url, onError }: Props) {
 
   return (
     <div className="pdf-viewer">
-      <div className="viewer-toolbar" aria-label="Управление PDF">
-        <button type="button" onClick={() => setPageNumber((value) => Math.max(1, value - 1))} disabled={!documentProxy || pageNumber <= 1}>←</button>
+      <div className="viewer-toolbar" role="toolbar" aria-label="Управление PDF">
+        <button type="button" aria-label="Предыдущая страница" onClick={() => setPageNumber((value) => Math.max(1, value - 1))} disabled={!documentProxy || pageNumber <= 1}>←</button>
         <label>Страница <input type="number" min={1} max={documentProxy?.numPages ?? 1} value={pageNumber} onChange={(event) => setPageNumber(Math.max(1, Math.min(documentProxy?.numPages ?? 1, Number(event.target.value))))} /></label>
         <span>из {documentProxy?.numPages ?? '…'}</span>
+        <button type="button" aria-label="Следующая страница" onClick={() => setPageNumber((value) => Math.min(documentProxy?.numPages ?? 1, value + 1))} disabled={!documentProxy || pageNumber >= documentProxy.numPages}>→</button>
         <button type="button" onClick={() => setScale((value) => Math.max(0.5, value - 0.25))} aria-label="Уменьшить масштаб">−</button>
-        <output>{Math.round(scale * 100)}%</output>
+        <output aria-label="Масштаб PDF">{Math.round(scale * 100)}%</output>
         <button type="button" onClick={() => setScale((value) => Math.min(4, value + 0.25))} aria-label="Увеличить масштаб">+</button>
         {!documentProxy ? <span role="status">Загрузка {Math.round(progress * 100)}%</span> : null}
       </div>
-      <div className="pdf-canvas-scroll" tabIndex={0} aria-label={`PDF ${artifact.displayName}, страница ${pageNumber}`}>
-        <canvas ref={canvasRef} />
+      <div className="pdf-canvas-scroll" role="region" tabIndex={0} aria-label={`PDF ${artifact.displayName}, страница ${pageNumber}`}>
+        <canvas ref={canvasRef} aria-hidden="true" />
+        <div className="visually-hidden" role="document" aria-label={`Текст PDF ${artifact.displayName}, страница ${pageNumber}`}>{accessibleText}</div>
       </div>
       <p className="viewer-safety-note">Интерактивные действия, JavaScript и внешние ссылки PDF отключены.</p>
     </div>

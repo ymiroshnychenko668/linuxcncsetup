@@ -21,6 +21,7 @@ const mocks = vi.hoisted(() => ({
   deleteCatalogSetup: vi.fn(),
   putCatalogComponent: vi.fn(),
   deleteCatalogComponent: vi.fn(),
+  newIdempotencyKey: vi.fn(),
 }))
 
 const previewMode = vi.hoisted(() => ({ real: false }))
@@ -28,7 +29,7 @@ const previewMode = vi.hoisted(() => ({ real: false }))
 vi.mock('./api', async (loadOriginal) => ({
   ...await loadOriginal<typeof import('./api')>(),
   ...mocks,
-  newIdempotencyKey: () => 'test-idempotency-key',
+  newIdempotencyKey: mocks.newIdempotencyKey,
 }))
 
 vi.mock('./components/GCodePreview', async (loadOriginal) => {
@@ -43,7 +44,7 @@ vi.mock('./components/GCodePreview', async (loadOriginal) => {
 })
 
 vi.mock('./components/SetupSheetViewer', () => ({
-  SetupSheetViewer: ({ artifact, contentUrl, onClose }: { artifact: { displayName: string }; contentUrl: string; onClose: () => void }) => <div role="dialog" aria-label="Setup Sheet viewer"><span>{artifact.displayName} · {contentUrl}</span><button type="button" onClick={onClose}>Закрыть</button></div>,
+  SetupSheetViewer: ({ artifact, contentUrl, inline }: { artifact: { displayName: string }; contentUrl: string; inline?: boolean }) => <section data-testid="setup-sheet-viewer" data-inline={inline ? 'true' : 'false'} aria-label={`Setup Sheet ${artifact.displayName}`}>{artifact.displayName} · {contentUrl}</section>,
 }))
 
 const catalogSetup: CatalogSetup = {
@@ -79,6 +80,7 @@ beforeEach(() => {
   previewMode.real = false
   Object.values(mocks).forEach((mock) => mock.mockReset())
   mocks.getAuthSession.mockResolvedValue({ authenticated: true, loginRequired: false, user: null, csrfToken: 'local-token' })
+  mocks.newIdempotencyKey.mockReturnValue('test-idempotency-key')
   mocks.login.mockResolvedValue({ authenticated: true, loginRequired: true, user: { username: 'operator' }, csrfToken: 'remote-token' })
   mocks.logout.mockResolvedValue(undefined)
   mocks.getCapabilities.mockResolvedValue({ libraryAlias: 'LinuxCNC', gcodeExtensions: ['.ngc'], requireSetupSheetForReady: false, features: {} })
@@ -105,7 +107,7 @@ beforeEach(() => {
 afterEach(() => vi.unstubAllGlobals())
 
 describe('catalog workbench', () => {
-  it('completes login, tree navigation, upload, preview search, line jump, and logout by keyboard', async () => {
+  it('completes login, left-tree file navigation, direct upload, preview search, line jump, and logout by keyboard', async () => {
     previewMode.real = true
     const user = userEvent.setup()
     const gcode = new TextEncoder().encode('G0 X0\nG1 X10\nM3 S1000\nM30')
@@ -192,51 +194,33 @@ describe('catalog workbench', () => {
     expect(loginButton).toHaveFocus()
     await user.keyboard('{Enter}')
 
-    const editor = await screen.findByLabelText('Просмотр сетапа')
+    const editor = await screen.findByLabelText('Просмотр файла')
     await waitFor(() => expect(editor).toHaveFocus())
-    const treeSetup = await screen.findByRole('treeitem', { name: /Кронштейн/ })
-    for (let step = 0; step < 40 && document.activeElement !== treeSetup; step += 1) await user.tab()
+    const treeSetup = await screen.findByRole('treeitem', { name: /bracket\.ngc/ })
+    for (let step = 0; step < 8 && document.activeElement !== treeSetup; step += 1) await user.tab({ shift: true })
     expect(treeSetup).toHaveFocus()
-    await user.keyboard('{ArrowLeft}')
-    expect(screen.getByRole('treeitem', { name: '2026' })).toHaveFocus()
-    await user.keyboard('{ArrowRight}{ArrowRight}{Enter}')
+    await user.keyboard('{ArrowRight}{Enter}')
+    const treeSheet = screen.getByRole('treeitem', { name: /bracket\.pdf/ })
+    expect(treeSheet).toHaveFocus()
+    expect(treeSheet).toHaveAttribute('aria-selected', 'true')
+    expect(screen.getByTestId('setup-sheet-viewer')).toHaveAttribute('data-inline', 'true')
+    expect(screen.queryByRole('dialog', { name: /Setup Sheet/i })).not.toBeInTheDocument()
+    await user.keyboard('{ArrowLeft}{Enter}')
     expect(treeSetup).toHaveFocus()
     expect(treeSetup).toHaveAttribute('aria-selected', 'true')
 
-    await user.tab()
-    expect(document.body).toHaveFocus()
-    await user.tab()
-    expect(screen.getByRole('link', { name: 'К просмотру G-code' })).toHaveFocus()
-    await user.tab()
-    const uploadButton = screen.getByRole('button', { name: 'Загрузить' })
+    const uploadButton = screen.getByRole('button', { name: 'Добавить' })
+    for (let step = 0; step < 24 && document.activeElement !== uploadButton; step += 1) await user.tab({ shift: true })
     expect(uploadButton).toHaveFocus()
     await user.keyboard('{Enter}')
-
-    const dialog = await screen.findByRole('dialog', { name: 'Загрузить сетап' })
-    expect(dialog).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: 'Закрыть диалог' })).toHaveFocus()
-    await user.tab()
-    expect(screen.getByLabelText('Каталог LinuxCNC')).toHaveFocus()
-    await user.tab()
-    const setupName = screen.getByLabelText('Название сетапа')
-    expect(setupName).toHaveFocus()
-    await user.type(setupName, 'Keyboard Flow')
-    await user.tab()
-    expect(screen.getByLabelText(/Описание/)).toHaveFocus()
-    await user.tab()
-    const programInput = screen.getByLabelText('G-code программа')
-    expect(programInput).toHaveFocus()
     const program = new File([gcode], 'keyboard.ngc', { type: 'text/plain' })
-    await user.upload(programInput, program)
-    await user.tab()
-    expect(screen.getByLabelText('Setup Sheet')).toHaveFocus()
-    await user.tab()
-    expect(screen.getByRole('button', { name: 'Отмена' })).toHaveFocus()
-    await user.tab()
-    const saveButton = screen.getByRole('button', { name: 'Создать и загрузить' })
-    expect(saveButton).toHaveFocus()
-    await user.keyboard('{Enter}')
+    await user.upload(screen.getByLabelText('Файлы нового сетапа'), program)
 
+    await waitFor(() => expect(mocks.createCatalogSetup).toHaveBeenCalledWith(
+      expect.objectContaining({ name: 'keyboard' }),
+      'test-idempotency-key',
+      expect.any(AbortSignal),
+    ))
     await waitFor(() => expect(mocks.putCatalogComponent).toHaveBeenCalledWith(
       expect.objectContaining({ setupId: 'keyboard-setup' }),
       'program',
@@ -245,13 +229,14 @@ describe('catalog workbench', () => {
       expect.any(Object),
     ))
     await waitFor(() => expect(uploadButton).toHaveFocus())
-    expect(await screen.findByRole('heading', { name: 'keyboard.ngc' })).toBeInTheDocument()
+    expect(await screen.findByLabelText('G-code keyboard.ngc')).toBeInTheDocument()
     expect(screen.getByText('M30')).toBeInTheDocument()
 
     const search = screen.getByRole('searchbox', { name: 'Поиск' })
-    for (let step = 0; step < 30 && document.activeElement !== search; step += 1) await user.tab()
+    for (let step = 0; step < 40 && document.activeElement !== search; step += 1) await user.tab()
     expect(search).toHaveFocus()
     await user.type(search, 'M30')
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Найти' })).toBeEnabled())
     await user.keyboard('{Enter}')
     expect(await screen.findByRole('button', { name: 'Совпадение 1, строка 4' })).toHaveAttribute('aria-current', 'true')
 
@@ -267,7 +252,7 @@ describe('catalog workbench', () => {
     expect(screen.getByRole('spinbutton', { name: 'Строка' })).toHaveFocus()
 
     const logoutButton = screen.getByRole('button', { name: 'Выйти' })
-    for (let step = 0; step < 25 && document.activeElement !== logoutButton; step += 1) await user.tab({ shift: true })
+    for (let step = 0; step < 40 && document.activeElement !== logoutButton; step += 1) await user.tab({ shift: true })
     expect(logoutButton).toHaveFocus()
     await user.keyboard('{Enter}')
     expect(await screen.findByRole('status')).toHaveTextContent('Вы вышли из Web Setup Manager')
@@ -286,33 +271,55 @@ describe('catalog workbench', () => {
     await user.type(screen.getByLabelText('Пароль'), 'secret')
     await user.click(screen.getByRole('button', { name: 'Открыть каталог сетапов' }))
 
-    expect(await screen.findByLabelText('Каталог сетапов')).toBeInTheDocument()
+    expect(await screen.findByLabelText('Файлы сетапов')).toBeInTheDocument()
     expect(mocks.login).toHaveBeenCalledWith('operator', 'secret', false)
     expect(screen.getByText('operator')).toBeInTheDocument()
     await waitFor(() => expect(document.getElementById('catalog-editor')).toHaveFocus())
   })
 
-  it('renders G-code on the left, the directory tree on the right, and the exact LinuxCNC destination', async () => {
+  it('renders the file tree on the left, the viewer on the right, and one exact LinuxCNC destination line', async () => {
     render(<App />)
-    const editor = await screen.findByLabelText('Просмотр сетапа')
-    const explorer = screen.getByLabelText('Каталог сетапов')
-    expect(editor.compareDocumentPosition(explorer) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    const editor = await screen.findByLabelText('Просмотр файла')
+    const explorer = screen.getByLabelText('Файлы сетапов')
+    expect(explorer.compareDocumentPosition(editor) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
     expect(await screen.findByTestId('gcode-preview')).toHaveTextContent('/api/v1/catalog/setups/setup-1/program/content')
     expect(screen.getAllByText('~/linuxcnc/nc_files', { exact: true }).length).toBeGreaterThan(0)
     expect(screen.getByText('~/linuxcnc/nc_files/Заказы/2026/bracket.ngc')).toBeInTheDocument()
+    expect(screen.getByRole('treeitem', { name: /bracket\.pdf/ })).toHaveAttribute('aria-level', '5')
+    expect(document.querySelector('.editor-breadcrumbs')).not.toBeInTheDocument()
+    expect(document.querySelector('.editor-commandbar')).not.toBeInTheDocument()
     expect(screen.queryByText(/готовност|проверить сетап|текущий сетап/i)).not.toBeInTheDocument()
   })
 
-  it('treats an incomplete setup as normal and offers independent file actions', async () => {
-    mocks.getCatalog.mockResolvedValue({ ...snapshot, setups: [{ ...catalogSetup, program: null, programRelativePath: undefined }] })
+  it('switches the inline G-code and Setup Sheet tabs with arrow keys', async () => {
+    const user = userEvent.setup()
     render(<App />)
-    expect(await screen.findByRole('heading', { name: 'Программа ещё не загружена' })).toBeInTheDocument()
-    expect(screen.getByText(/нормальный неполный сетап/i)).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: 'Добавить G-code' })).toBeEnabled()
-    expect(screen.getByRole('button', { name: 'Открыть Setup Sheet' })).toBeEnabled()
+    const programTab = await screen.findByRole('tab', { name: 'bracket.ngc' })
+    programTab.focus()
+    await user.keyboard('{ArrowRight}')
+    const sheetTab = screen.getByRole('tab', { name: /bracket\.pdf/ })
+    expect(sheetTab).toHaveFocus()
+    expect(sheetTab).toHaveAttribute('aria-selected', 'true')
+    expect(screen.getByTestId('setup-sheet-viewer')).toHaveAttribute('data-inline', 'true')
+    await user.keyboard('{Home}')
+    expect(programTab).toHaveFocus()
+    expect(programTab).toHaveAttribute('aria-selected', 'true')
+    expect(screen.getByTestId('gcode-preview')).toBeInTheDocument()
   })
 
-  it('uploads at most one program and one sheet and confirms the final destination after closing', async () => {
+  it('keeps a legacy sheet-only record recoverable without making it a new-setup workflow', async () => {
+    const user = userEvent.setup()
+    mocks.getCatalog.mockResolvedValue({ ...snapshot, setups: [{ ...catalogSetup, program: null, programRelativePath: undefined }] })
+    render(<App />)
+    expect(await screen.findByTestId('setup-sheet-viewer')).toHaveAttribute('data-inline', 'true')
+    await user.click(screen.getByRole('tab', { name: /Кронштейн/ }))
+    expect(await screen.findByRole('heading', { name: 'Нужен G-code' })).toBeInTheDocument()
+    const addProgram = screen.getAllByRole('button', { name: 'Добавить G-code' }).at(-1)!
+    expect(addProgram).toBeEnabled()
+    expect(addProgram).not.toHaveClass('workbench-button--primary')
+  })
+
+  it('directly uploads one G-code and one optional sheet without an application popup', async () => {
     const user = userEvent.setup()
     const created: CatalogSetup = { ...catalogSetup, setupId: 'new-setup', name: 'Новая деталь', revision: 1, program: null, setupSheet: null, programRelativePath: undefined, setupSheetRelativePath: undefined }
     const withProgram: CatalogSetup = { ...created, revision: 2, program: { ...catalogSetup.program!, artifactId: 'new-program', displayName: 'new.ngc', relativePath: 'Заказы/2026/new.ngc' }, programRelativePath: 'Заказы/2026/new.ngc' }
@@ -320,46 +327,275 @@ describe('catalog workbench', () => {
     mocks.createCatalogSetup.mockResolvedValue(created)
     mocks.putCatalogComponent.mockResolvedValueOnce(withProgram).mockResolvedValueOnce(complete)
     render(<App />)
-    await screen.findByLabelText('Каталог сетапов')
-    await user.click(screen.getByRole('button', { name: 'Загрузить' }))
-    await user.selectOptions(screen.getByLabelText('Каталог LinuxCNC'), 'folder-2026')
-    await user.type(screen.getByLabelText('Название сетапа'), 'Новая деталь')
+    await screen.findByLabelText('Файлы сетапов')
+    const add = screen.getByRole('button', { name: 'Добавить' })
+    await user.click(add)
     const program = new File(['G0 X0'], 'new.ngc', { type: 'text/plain' })
     const sheet = new File(['pdf'], 'new.pdf', { type: 'application/pdf' })
-    await user.upload(screen.getByLabelText('G-code программа'), program)
-    await user.upload(screen.getByLabelText('Setup Sheet'), sheet)
-    expect(screen.getByText('~/linuxcnc/nc_files/Заказы/2026/new.ngc')).toBeInTheDocument()
-    await user.click(screen.getByRole('button', { name: 'Создать и загрузить' }))
+    await user.upload(screen.getByLabelText('Файлы нового сетапа'), [program, sheet])
 
+    await waitFor(() => expect(mocks.createCatalogSetup).toHaveBeenCalledWith(
+      { folderId: 'folder-2026', name: 'new' },
+      'test-idempotency-key',
+      expect.any(AbortSignal),
+    ))
     await waitFor(() => expect(mocks.putCatalogComponent).toHaveBeenCalledTimes(2))
     expect(mocks.putCatalogComponent.mock.calls[0]?.slice(1, 3)).toEqual(['program', program])
     expect(mocks.putCatalogComponent.mock.calls[1]?.slice(1, 3)).toEqual(['setup-sheet', sheet])
     expect(await screen.findByText('Сохранено в LinuxCNC: ~/linuxcnc/nc_files/Заказы/2026/new.ngc')).toBeInTheDocument()
     expect(screen.queryByRole('dialog', { name: 'Загрузить сетап' })).not.toBeInTheDocument()
+    expect(add).toHaveFocus()
   })
 
-  it('supports keyboard resizing of the right explorer', async () => {
+  it('replays a response-lost create with the same key before uploading the program', async () => {
+    const user = userEvent.setup()
+    const created: CatalogSetup = { ...catalogSetup, setupId: 'lost-create', name: 'lost', revision: 1, program: null, setupSheet: null, programRelativePath: undefined, setupSheetRelativePath: undefined }
+    const complete: CatalogSetup = { ...created, revision: 2, program: { ...catalogSetup.program!, displayName: 'lost.ngc' }, programRelativePath: 'Заказы/2026/lost.ngc' }
+    mocks.newIdempotencyKey.mockReturnValueOnce('create-replay-key').mockReturnValueOnce('program-replay-key')
+    mocks.createCatalogSetup.mockRejectedValueOnce(new TypeError('Failed to fetch')).mockResolvedValueOnce(created)
+    mocks.putCatalogComponent.mockResolvedValue(complete)
+    render(<App />)
+    await screen.findByLabelText('Файлы сетапов')
+
+    await user.upload(screen.getByLabelText('Файлы нового сетапа'), new File(['G0'], 'lost.ngc', { type: 'text/plain' }))
+    await user.click(await screen.findByRole('button', { name: 'Повторить: lost.ngc' }))
+
+    await waitFor(() => expect(mocks.createCatalogSetup).toHaveBeenCalledTimes(2))
+    expect(mocks.createCatalogSetup.mock.calls[0]?.[1]).toBe('create-replay-key')
+    expect(mocks.createCatalogSetup.mock.calls[1]?.[1]).toBe('create-replay-key')
+    expect(mocks.putCatalogComponent).toHaveBeenCalledTimes(1)
+    expect(mocks.putCatalogComponent.mock.calls[0]?.[3]).toBe('program-replay-key')
+  })
+
+  it('replays a structurally invalid create response with the same key', async () => {
+    const user = userEvent.setup()
+    const created: CatalogSetup = { ...catalogSetup, setupId: 'invalid-create', name: 'invalid', revision: 1, program: null, setupSheet: null, programRelativePath: undefined, setupSheetRelativePath: undefined }
+    const complete: CatalogSetup = { ...created, revision: 2, program: { ...catalogSetup.program!, displayName: 'invalid.ngc' }, programRelativePath: 'Заказы/2026/invalid.ngc' }
+    mocks.newIdempotencyKey.mockReturnValueOnce('invalid-create-key').mockReturnValueOnce('invalid-program-key')
+    mocks.createCatalogSetup
+      .mockRejectedValueOnce(new ApiError({ message: 'Missing setupId.', status: 0, code: 'INVALID_RESPONSE' }))
+      .mockResolvedValueOnce(created)
+    mocks.putCatalogComponent.mockResolvedValue(complete)
+    render(<App />)
+    await screen.findByLabelText('Файлы сетапов')
+
+    await user.upload(screen.getByLabelText('Файлы нового сетапа'), new File(['G0'], 'invalid.ngc', { type: 'text/plain' }))
+    await user.click(await screen.findByRole('button', { name: 'Повторить: invalid.ngc' }))
+
+    await waitFor(() => expect(mocks.createCatalogSetup).toHaveBeenCalledTimes(2))
+    expect(mocks.createCatalogSetup.mock.calls[0]?.[1]).toBe('invalid-create-key')
+    expect(mocks.createCatalogSetup.mock.calls[1]?.[1]).toBe('invalid-create-key')
+    expect(mocks.putCatalogComponent.mock.calls[0]?.[3]).toBe('invalid-program-key')
+  })
+
+  it('resumes a response-lost program upload without creating another Setup', async () => {
+    const user = userEvent.setup()
+    const created: CatalogSetup = { ...catalogSetup, setupId: 'lost-program', name: 'resume', revision: 1, program: null, setupSheet: null, programRelativePath: undefined, setupSheetRelativePath: undefined }
+    const complete: CatalogSetup = { ...created, revision: 2, program: { ...catalogSetup.program!, displayName: 'resume.ngc' }, programRelativePath: 'Заказы/2026/resume.ngc' }
+    mocks.newIdempotencyKey.mockReturnValueOnce('create-once-key').mockReturnValueOnce('program-stable-key')
+    mocks.createCatalogSetup.mockResolvedValue(created)
+    mocks.putCatalogComponent.mockRejectedValueOnce(new TypeError('connection lost')).mockResolvedValueOnce(complete)
+    render(<App />)
+    await screen.findByLabelText('Файлы сетапов')
+
+    await user.upload(screen.getByLabelText('Файлы нового сетапа'), new File(['G0'], 'resume.ngc', { type: 'text/plain' }))
+    await user.click(await screen.findByRole('button', { name: 'Повторить: resume.ngc' }))
+
+    await waitFor(() => expect(mocks.putCatalogComponent).toHaveBeenCalledTimes(2))
+    expect(mocks.createCatalogSetup).toHaveBeenCalledTimes(1)
+    expect(mocks.putCatalogComponent.mock.calls[0]?.[3]).toBe('program-stable-key')
+    expect(mocks.putCatalogComponent.mock.calls[1]?.[3]).toBe('program-stable-key')
+  })
+
+  it('resumes only a response-lost Sheet step with its original key', async () => {
+    const user = userEvent.setup()
+    const created: CatalogSetup = { ...catalogSetup, setupId: 'lost-sheet', name: 'paired', revision: 1, program: null, setupSheet: null, programRelativePath: undefined, setupSheetRelativePath: undefined }
+    const withProgram: CatalogSetup = { ...created, revision: 2, program: { ...catalogSetup.program!, displayName: 'paired.ngc' }, programRelativePath: 'Заказы/2026/paired.ngc' }
+    const complete: CatalogSetup = { ...withProgram, revision: 3, setupSheet: { ...catalogSetup.setupSheet!, displayName: 'paired.pdf' }, setupSheetRelativePath: 'Заказы/2026/paired.pdf' }
+    mocks.newIdempotencyKey.mockReturnValueOnce('paired-create-key').mockReturnValueOnce('paired-program-key').mockReturnValueOnce('paired-sheet-key')
+    mocks.createCatalogSetup.mockResolvedValue(created)
+    mocks.putCatalogComponent.mockResolvedValueOnce(withProgram).mockRejectedValueOnce(new TypeError('connection lost')).mockResolvedValueOnce(complete)
+    render(<App />)
+    await screen.findByLabelText('Файлы сетапов')
+
+    await user.upload(screen.getByLabelText('Файлы нового сетапа'), [
+      new File(['G0'], 'paired.ngc', { type: 'text/plain' }),
+      new File(['pdf'], 'paired.pdf', { type: 'application/pdf' }),
+    ])
+    await user.click(await screen.findByRole('button', { name: 'Повторить: paired.ngc + paired.pdf' }))
+
+    await waitFor(() => expect(mocks.putCatalogComponent).toHaveBeenCalledTimes(3))
+    expect(mocks.createCatalogSetup).toHaveBeenCalledTimes(1)
+    expect(mocks.putCatalogComponent.mock.calls[0]?.slice(1, 4)).toEqual(['program', expect.any(File), 'paired-program-key'])
+    expect(mocks.putCatalogComponent.mock.calls[1]?.slice(1, 4)).toEqual(['setup-sheet', expect.any(File), 'paired-sheet-key'])
+    expect(mocks.putCatalogComponent.mock.calls[2]?.slice(1, 4)).toEqual(['setup-sheet', expect.any(File), 'paired-sheet-key'])
+  })
+
+  it('shows a lone G-code as a leaf and attaches its Setup Sheet directly beneath it', async () => {
+    const user = userEvent.setup()
+    const programOnly = { ...catalogSetup, setupSheet: null, setupSheetRelativePath: undefined }
+    const withSheet = { ...catalogSetup, revision: programOnly.revision + 1 }
+    mocks.getCatalog.mockResolvedValue({ ...snapshot, setups: [programOnly] })
+    mocks.putCatalogComponent.mockResolvedValue(withSheet)
+    render(<App />)
+
+    const programNode = await screen.findByRole('treeitem', { name: /bracket\.ngc/ })
+    expect(programNode).not.toHaveAttribute('aria-expanded')
+    expect(screen.queryByRole('treeitem', { name: /bracket\.pdf/ })).not.toBeInTheDocument()
+
+    const attach = screen.getByRole('button', { name: /Setup Sheet/ })
+    await user.click(attach)
+    const sheet = new File(['pdf'], 'bracket.pdf', { type: 'application/pdf' })
+    await user.upload(screen.getByLabelText('Выбрать Setup Sheet'), sheet)
+
+    await waitFor(() => expect(mocks.putCatalogComponent).toHaveBeenCalledWith(
+      expect.objectContaining({ setupId: 'setup-1', setupSheet: null }),
+      'setup-sheet',
+      sheet,
+      'test-idempotency-key',
+      expect.any(Object),
+    ))
+    expect(await screen.findByRole('treeitem', { name: /bracket\.pdf/ })).toHaveAttribute('aria-level', '5')
+    expect(screen.getByTestId('setup-sheet-viewer')).toHaveAttribute('data-inline', 'true')
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+    await waitFor(() => expect(screen.getByRole('tab', { name: /bracket\.pdf/ })).toHaveFocus())
+  })
+
+  it('cancels and safely replays a direct Sheet attachment with one stable key', async () => {
+    const user = userEvent.setup()
+    const programOnly = { ...catalogSetup, setupSheet: null, setupSheetRelativePath: undefined }
+    const withSheet = { ...catalogSetup, revision: programOnly.revision + 1, setupSheet: { ...catalogSetup.setupSheet!, displayName: 'attach.pdf' } }
+    let aborted = false
+    mocks.getCatalog.mockResolvedValue({ ...snapshot, setups: [programOnly] })
+    mocks.newIdempotencyKey.mockReturnValueOnce('attach-stable-key')
+    mocks.putCatalogComponent.mockImplementationOnce((
+      _setup: CatalogSetup,
+      _component: string,
+      _file: File,
+      _key: string,
+      options: { signal?: AbortSignal },
+    ) => new Promise((_resolve, reject) => {
+      options.signal?.addEventListener('abort', () => {
+        aborted = true
+        reject(new DOMException('cancelled', 'AbortError'))
+      }, { once: true })
+    })).mockResolvedValueOnce(withSheet)
+    render(<App />)
+    await screen.findByRole('treeitem', { name: /bracket\.ngc/ })
+
+    await user.click(screen.getByRole('button', { name: /Setup Sheet/ }))
+    await user.upload(screen.getByLabelText('Выбрать Setup Sheet'), new File(['pdf'], 'attach.pdf', { type: 'application/pdf' }))
+    await user.click(await screen.findByRole('button', { name: 'Отменить' }))
+    expect(aborted).toBe(true)
+    await user.click(await screen.findByRole('button', { name: 'Повторить: attach.pdf' }))
+
+    await waitFor(() => expect(mocks.putCatalogComponent).toHaveBeenCalledTimes(2))
+    expect(mocks.putCatalogComponent.mock.calls[0]?.[3]).toBe('attach-stable-key')
+    expect(mocks.putCatalogComponent.mock.calls[1]?.[3]).toBe('attach-stable-key')
+    expect(mocks.createCatalogSetup).not.toHaveBeenCalled()
+    expect(await screen.findByRole('treeitem', { name: /attach\.pdf/ })).toBeInTheDocument()
+  })
+
+  it('replays a structurally invalid PUT response with the same key', async () => {
+    const user = userEvent.setup()
+    const programOnly = { ...catalogSetup, setupSheet: null, setupSheetRelativePath: undefined }
+    const withSheet = { ...catalogSetup, revision: programOnly.revision + 1, setupSheet: { ...catalogSetup.setupSheet!, displayName: 'invalid-put.pdf' } }
+    mocks.getCatalog.mockResolvedValue({ ...snapshot, setups: [programOnly] })
+    mocks.newIdempotencyKey.mockReturnValueOnce('invalid-put-key')
+    mocks.putCatalogComponent
+      .mockRejectedValueOnce(new ApiError({ message: 'Missing revision.', status: 0, code: 'INVALID_RESPONSE' }))
+      .mockResolvedValueOnce(withSheet)
+    render(<App />)
+    await screen.findByRole('treeitem', { name: /bracket\.ngc/ })
+
+    await user.click(screen.getByRole('button', { name: /Setup Sheet/ }))
+    await user.upload(screen.getByLabelText('Выбрать Setup Sheet'), new File(['pdf'], 'invalid-put.pdf', { type: 'application/pdf' }))
+    await user.click(await screen.findByRole('button', { name: 'Повторить: invalid-put.pdf' }))
+
+    await waitFor(() => expect(mocks.putCatalogComponent).toHaveBeenCalledTimes(2))
+    expect(mocks.putCatalogComponent.mock.calls[0]?.[3]).toBe('invalid-put-key')
+    expect(mocks.putCatalogComponent.mock.calls[1]?.[3]).toBe('invalid-put-key')
+  })
+
+  it('uses a fresh revision, file, and key after a deterministic upload conflict', async () => {
+    const user = userEvent.setup()
+    const programOnly = { ...catalogSetup, setupSheet: null, setupSheetRelativePath: undefined }
+    const refreshed = { ...programOnly, revision: programOnly.revision + 1 }
+    const withSheet = {
+      ...refreshed,
+      revision: refreshed.revision + 1,
+      setupSheet: { ...catalogSetup.setupSheet!, displayName: 'same.pdf' },
+      setupSheetRelativePath: 'Заказы/2026/same.pdf',
+    }
+    const firstFile = new File(['aaa'], 'same.pdf', { type: 'application/pdf', lastModified: 1234 })
+    const correctedFile = new File(['bbb'], 'same.pdf', { type: 'application/pdf', lastModified: 1234 })
+    expect([firstFile.size, firstFile.lastModified, firstFile.type]).toEqual([
+      correctedFile.size,
+      correctedFile.lastModified,
+      correctedFile.type,
+    ])
+    mocks.getCatalog.mockResolvedValueOnce({ ...snapshot, setups: [programOnly] })
+      .mockResolvedValue({ ...snapshot, generation: 'generation-2', setups: [refreshed] })
+    mocks.newIdempotencyKey.mockReturnValueOnce('conflicted-key').mockReturnValueOnce('fresh-key')
+    mocks.putCatalogComponent
+      .mockRejectedValueOnce(new ApiError({ message: 'Expected revision 3, actual 4.', status: 409, code: 'REVISION_CONFLICT' }))
+      .mockResolvedValueOnce(withSheet)
+    render(<App />)
+    await screen.findByRole('treeitem', { name: /bracket\.ngc/ })
+
+    await user.click(screen.getByRole('button', { name: /Setup Sheet/ }))
+    await user.upload(screen.getByLabelText('Выбрать Setup Sheet'), firstFile)
+    expect(await screen.findByRole('alert')).toHaveTextContent('Expected revision 3, actual 4.')
+    expect(screen.queryByRole('button', { name: /Повторить:/ })).not.toBeInTheDocument()
+
+    await user.click(screen.getByRole('button', { name: 'Обновить каталог' }))
+    await waitFor(() => expect(mocks.getCatalog).toHaveBeenCalledTimes(2))
+    await user.click(screen.getByRole('button', { name: /Setup Sheet/ }))
+    await user.upload(screen.getByLabelText('Выбрать Setup Sheet'), correctedFile)
+
+    await waitFor(() => expect(mocks.putCatalogComponent).toHaveBeenCalledTimes(2))
+    expect(mocks.putCatalogComponent.mock.calls[0]?.[0]).toMatchObject({ setupId: 'setup-1', revision: 3 })
+    expect(mocks.putCatalogComponent.mock.calls[0]?.[2]).toBe(firstFile)
+    expect(mocks.putCatalogComponent.mock.calls[0]?.[3]).toBe('conflicted-key')
+    expect(mocks.putCatalogComponent.mock.calls[1]?.[0]).toMatchObject({ setupId: 'setup-1', revision: 4 })
+    expect(mocks.putCatalogComponent.mock.calls[1]?.[2]).toBe(correctedFile)
+    expect(mocks.putCatalogComponent.mock.calls[1]?.[3]).toBe('fresh-key')
+  })
+
+  it('supports keyboard resizing of the left explorer', async () => {
     const user = userEvent.setup()
     render(<App />)
-    const separator = await screen.findByRole('separator', { name: 'Изменить ширину дерева сетапов' })
+    const separator = await screen.findByRole('separator', { name: 'Изменить ширину дерева файлов' })
     expect(separator).toHaveAttribute('aria-valuenow', '320')
     separator.focus()
-    await user.keyboard('{ArrowLeft}{ArrowLeft}')
+    await user.keyboard('{ArrowRight}{ArrowRight}')
     expect(separator).toHaveAttribute('aria-valuenow', '352')
-    await user.keyboard('{End}')
+    await user.keyboard('{Home}')
     expect(separator).toHaveAttribute('aria-valuenow', '260')
   })
 
-  it('opens the right explorer as a keyboard-dismissible mobile drawer', async () => {
+  it('opens the left explorer as a keyboard-dismissible mobile drawer', async () => {
     const user = userEvent.setup()
+    vi.stubGlobal('matchMedia', vi.fn().mockReturnValue({ matches: true }))
     render(<App />)
-    const toggle = await screen.findByRole('button', { name: 'Открыть дерево сетапов' })
+    const toggle = await screen.findByRole('button', { name: 'Открыть дерево файлов' })
     await user.click(toggle)
-    expect(screen.getByLabelText('Каталог сетапов')).toHaveClass('catalog-explorer--open')
-    expect(screen.getByRole('button', { name: 'Закрыть дерево сетапов' })).toHaveFocus()
+    const explorer = screen.getByLabelText('Файлы сетапов')
+    const editor = screen.getByLabelText('Просмотр файла')
+    expect(explorer).toHaveClass('catalog-explorer--open')
+    expect(editor).toHaveAttribute('inert')
+    expect(screen.getByRole('button', { name: 'Закрыть дерево файлов' })).toHaveFocus()
+    editor.focus()
+    fireEvent.keyDown(window, { key: 'Tab' })
+    const firstFocusable = explorer.querySelector<HTMLElement>('button:not(:disabled):not([tabindex="-1"])')
+    expect(firstFocusable).toHaveFocus()
+    fireEvent.keyDown(window, { key: 'Tab', shiftKey: true })
+    const focusable = explorer.querySelectorAll<HTMLElement>('button:not(:disabled):not([tabindex="-1"]), input:not(:disabled):not([tabindex="-1"]), [tabindex]:not([tabindex="-1"])')
+    expect(focusable[focusable.length - 1]).toHaveFocus()
     await user.keyboard('{Escape}')
-    expect(screen.getByLabelText('Каталог сетапов')).not.toHaveClass('catalog-explorer--open')
-    expect(toggle).toHaveFocus()
+    expect(explorer).not.toHaveClass('catalog-explorer--open')
+    expect(editor).not.toHaveAttribute('inert')
+    await waitFor(() => expect(toggle).toHaveFocus())
   })
 
   it('keeps the selected setup and entered properties on a local revision conflict', async () => {
@@ -380,7 +616,7 @@ describe('catalog workbench', () => {
   it('creates a real folder below the selected catalog and retains the destination preview', async () => {
     const user = userEvent.setup()
     render(<App />)
-    await screen.findByLabelText('Каталог сетапов')
+    await screen.findByLabelText('Файлы сетапов')
     await user.click(screen.getByRole('button', { name: 'Новый каталог' }))
     await user.type(screen.getByRole('textbox', { name: 'Название' }), 'Серия 42')
     expect(screen.getByText('~/linuxcnc/nc_files/Серия 42')).toBeInTheDocument()
@@ -391,11 +627,11 @@ describe('catalog workbench', () => {
   it('preserves authentication expiry and logout behavior around the workbench', async () => {
     mocks.getAuthSession.mockResolvedValue({ authenticated: true, loginRequired: true, user: { username: 'operator' }, csrfToken: 'remote-token' })
     render(<App />)
-    await screen.findByLabelText('Каталог сетапов')
+    await screen.findByLabelText('Файлы сетапов')
     const handler = mocks.setUnauthorizedHandler.mock.calls.map(([candidate]) => candidate as (() => void) | undefined).find(Boolean)
     act(() => handler?.())
     expect(await screen.findByRole('status')).toHaveTextContent('Сессия истекла')
-    expect(screen.queryByLabelText('Каталог сетапов')).not.toBeInTheDocument()
+    expect(screen.queryByLabelText('Файлы сетапов')).not.toBeInTheDocument()
     expect(screen.getByRole('textbox', { name: 'Имя пользователя' })).toHaveFocus()
   })
 
@@ -414,7 +650,7 @@ describe('catalog workbench', () => {
     const separator = await screen.findByRole('separator')
     fireEvent(separator, new MouseEvent('pointerdown', { bubbles: true, button: 0, clientX: 1000 }))
     expect(document.body).toHaveClass('catalog-resizing')
-    fireEvent(window, new MouseEvent('pointermove', { bubbles: true, clientX: 950 }))
+    fireEvent(window, new MouseEvent('pointermove', { bubbles: true, clientX: 1050 }))
     expect(separator).toHaveAttribute('aria-valuenow', '370')
     fireEvent(window, new MouseEvent('pointercancel', { bubbles: true }))
     expect(document.body).not.toHaveClass('catalog-resizing')

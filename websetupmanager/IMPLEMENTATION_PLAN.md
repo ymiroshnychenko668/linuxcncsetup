@@ -15,7 +15,7 @@ LinuxCNC catalog: один Setup имеет не более одной прог�
 
 ```text
 ┌──────────────────────────── React SPA ─────────────────────────────┐
-│  G-code / Setup Sheet viewer (слева) │ catalog tree (справа)       │
+│  catalog file tree (слева) │ G-code / inline Setup Sheet (справа) │
 └──────────────────── same-origin /api/v1/catalog ───────────────────┘
                                │
                      PAM session + CSRF
@@ -41,13 +41,33 @@ browser не может выбрать другой каталог хоста.
 | 0. Direction reset | новый normative source, decisions, host discovery, migration boundary | выполнено в документации |
 | 1. Catalog backend | config/INI match, additive schema, folders/setups, singular files, scoped API | реализовано; catalog service/HTTP integration suites прошли |
 | 2. Direct filesystem storage | root-FD traversal, prepared atomic publish, conflicts, durable recovery | реализовано; path/race, real SIGKILL и sparse 10 GiB suites прошли |
-| 3. Compact frontend | left viewer/right tree, destination-first upload, folder/component operations | реализовано; 15 files / 87 tests/build, сквозной keyboard-only integration flow и production desktop/mobile visual smoke прошли |
+| 3. Compact frontend | left file tree/right viewer, native file picker, inline Sheet, folder/component operations | реализовано; 15 files / 103 tests/build, сквозной keyboard-only flow и Firefox desktop/mobile visual smoke прошли |
 | 4. Legacy migration | 0/1/N split, sheet fan-out, provenance, manifest и no-replace publication | выполнено на host; schema v4, 2 completed mappings и 4 copied manifests, restart idempotent |
 | 5. Integrated verification | automated catalog regression и production wiring | full build/test gates и host integrity/hash/readiness/no-execution checks прошли |
 | 6. Deployment | cold backup, verified restore rehearsal, versioned release и direct HTTPS smoke | выполнено; внешний LAN client, DHCP reservation, target performance и ручной QtDragon отмечены отдельно |
 
 Подробная безопасная последовательность преобразования данных находится в
 [MIGRATION_PLAN.md](MIGRATION_PLAN.md).
+
+### UI refinement от 2026-08-21
+
+- G-code — родительский file node Setup; существующая Setup Sheet показана
+  дочерним node и открывается inline в той же правой editor surface.
+- «Добавить» сразу открывает native multi-file picker: один G-code обязателен,
+  одна PDF/HTML Sheet необязательна и может быть прикреплена позже.
+- Editor не повторяет breadcrumb/commandbar/filename; точный путь остаётся в
+  одной status bar. Первый paint получает один 64-КиБ prefix до Worker index.
+- Неоднозначно прерванный upload повторяется с тем же idempotency key; новый
+  выбор файла после детерминированной ошибки всегда создаёт новый intent/key.
+- Search-forced tree expansion использует единое visual/ARIA/keyboard state;
+  mobile drawer делает фон inert, удерживает Tab и возвращает focus после
+  Escape. PDF text alternative ограничена streaming budget 100 000 символов /
+  20 000 items.
+- Application CSP разрешает `blob:` только в `frame-src`, потому что очищенный
+  HTML показывается через originless empty-sandbox iframe; CSP самого документа
+  по-прежнему запрещает script/network/forms/navigation.
+- Исторический sheet-only/empty Setup не скрывается и может быть восстановлен
+  добавлением G-code; новый UI такие записи не создаёт.
 
 ## Фактическая production generation
 
@@ -100,7 +120,7 @@ browser не может выбрать другой каталог хоста.
 | Entity | Обязательные данные и invariants |
 |---|---|
 | `catalog_folders` | opaque ID, nullable parent, display/normalized name, revision; hierarchy соответствует real directories под root |
-| `catalog_setups` | opaque ID, nullable folder, display name, revision; неполный Setup допустим |
+| `catalog_setups` | opaque ID, nullable folder, display name, revision; новый UI создаёт запись только из G-code, исторический неполный Setup допустим и восстанавливаем |
 | `catalog_files` | setup ID, unique role `program` или `setup_sheet`, relative basename/path, size/digest, inode/version identity; максимум один файл каждой роли |
 | `catalog_operations` | durable intent/storage/DB/terminal checkpoints для publish, move, delete и folder operations; recovery привязана к ожидаемым identity/digest/version |
 | `catalog_state`, `catalog_legacy_*` | общий migration state, source→target mapping и per-role manifest; completed mapping повторно сверяется с source provenance, catalog row и physical file |
@@ -120,7 +140,7 @@ browser не может выбрать другой каталог хоста.
 | `GET /api/v1/catalog` | дерево folders/setups, destination `rootLabel`/`rootDisplay` и generation |
 | `POST /api/v1/catalog/folders` | создать физический folder под root |
 | `PATCH/DELETE /api/v1/catalog/folders/{folderId}` | rename/move/delete пустого folder с expected revision |
-| `POST /api/v1/catalog/setups` | создать полный или неполный Setup в folder/root |
+| `POST /api/v1/catalog/setups` | создать Setup-запись в folder/root как первый шаг простого G-code upload; совместимый API допускает recovery исторических неполных записей |
 | `PATCH/DELETE /api/v1/catalog/setups/{setupId}` | rename/move и безопасное удаление Setup; detail уже входит в catalog snapshot |
 | `PUT/DELETE /api/v1/catalog/setups/{setupId}/program` | streaming add/replace/delete единственной программы |
 | `HEAD/GET /api/v1/catalog/setups/{setupId}/program/content` | Range/ETag preview программы |
@@ -169,8 +189,8 @@ storage key, inode/device или staging name.
 | Domain/API | incomplete/singular CRUD, exact preconditions/routes плюс production Firefox guest/login/catalog/UI/logout smoke | внешний LAN client |
 | Storage security | traversal, reserved tree, symlink/hardlink/special substitution, identity races, no-replace, rollback/recovery | target filesystem spot-check |
 | Upload/recovery | streaming unknown length, prepared publication, journal phases, actual subprocess SIGKILL and same-key retry | target disconnect/power-loss drill |
-| Viewer | sparse 10 GiB bounded Range/ETag/Worker suites плюс production render 1.7 MiB G-code: 37 virtual rows, `%`, viewport `1030x516` | controlled target-hardware performance и malicious-document observation |
-| Frontend | 15 files / 87 tests/build, сквозной keyboard-only integration flow плюс production desktop/mobile screenshots after grid→flex fix | дополнительный native-key walkthrough на отдельном managed client |
+| Viewer | single 64 KiB prefix-before-Worker test, sparse 10 GiB bounded Range/ETag/Worker suites, cancellable bounded PDF text и Firefox render G-code/inline HTML | controlled target-hardware performance и malicious-document observation |
+| Frontend | 15 files / 103 tests/build; left-tree parent/child, inline Sheet, direct dual/single upload, stable retry, later attach и сквозной keyboard-only flow; Firefox desktop/mobile smoke | дополнительный native-key walkthrough на отдельном managed client |
 | No execution | catalog-only route gate, exact target publication/root binding и live LinuxCNC snapshot unchanged | дополнительный ручной visual confirmation в QtDragon |
 | Migration | automated 0/1/N/restart/collision suites плюс live manifest/hash/count/restart verification | legacy cleanup только отдельным будущим решением |
 | Authentication | PAM/session/CSRF/throttle suites плюс production Firefox PAM login/session/logout; Bearer unset | внешний managed-client login only if separately required |
@@ -185,18 +205,18 @@ browser/live шаг, `D` — процедура документирована, 
 
 | ID | Planned evidence | Статус |
 |---|---|---|
-| `CAT-P0-001` | Workbench/App component tests assert left viewer/right explorer composition | V |
+| `CAT-P0-001` | Workbench/App component tests assert left file tree/right viewer composition | V |
 | `CAT-P0-002` | compact/resizable implementation plus production desktop/mobile visual rerun after grid→flex fix | V |
-| `CAT-P0-003` | folder service/HTTP CRUD plus `CatalogTree` reload/selection tests | V |
+| `CAT-P0-003` | folder service/HTTP CRUD plus `CatalogTree` G-code parent/Sheet child levels, selection and keyboard tests | V |
 | `CAT-P0-004` | schema unique role and service/HTTP singular-component tests | V |
-| `CAT-P0-005` | empty/program-only/sheet-only service/UI flows; catalog capabilities disable validation | V |
-| `CAT-P0-006` | catalog dialog destination preview and persistent success location tests | V |
+| `CAT-P0-005` | native G-code + optional Sheet create, program-only leaf/later attach, legacy sheet-only recovery; no validation flow | V |
+| `CAT-P0-006` | current-folder selection, filename-derived Setup name and persistent exact success location tests | V |
 | `CAT-P0-007` | direct atomic named publication/exact bytes plus running QtDragon config/log and read-only matching `QFileSystemModel` rows `1002.ngc`/`1003.ngc` verified; manual hidden-tab screenshot is only an operator qualification | V |
 | `CAT-P0-008` | catalog-only route плюс live unchanged LinuxCNC snapshot `file=""`, `1/1/1/2` | V |
 | `CAT-P0-009` | folder/setup create/rename/move/delete, revision and recovery suites | V |
 | `CAT-P0-010` | singular streaming add/replace/delete including unknown-length body tests | V |
-| `CAT-P0-011` | catalog Range/ETag plus virtualized viewer/Worker/search tests | V |
-| `CAT-P0-012` | local PDF canvas and sanitized HTML CSP/blob/empty-sandbox tests | V |
+| `CAT-P0-011` | exactly one 64 KiB initial Range becomes visible before Worker; catalog Range/ETag, virtualization/index/search suites remain green | V |
+| `CAT-P0-012` | inline PDF canvas and sanitized HTML CSP/blob/empty-sandbox tests; no Sheet dialog in Workbench | V |
 | `CAT-P0-013` | catalog-only production gate, safe route and filename attack tests | V |
 | `CAT-P0-014` | catalog snapshot/API leak assertions cover relative path/root display only | V |
 | `CAT-P0-015` | root-FD traversal/reserved/symlink/hardlink/special/race suite | V |
@@ -204,7 +224,7 @@ browser/live шаг, `D` — процедура документирована, 
 | `CAT-P0-017` | exact conditional headers, no-replace and substitution/version conflicts | V |
 | `CAT-P0-018` | active extensions, reserved tree and special-file rejection tests | V |
 | `CAT-P0-019` | catalog filter plus loading/empty/offline/error/conflict component states | V |
-| `CAT-P0-020` | end-to-end keyboard-only App flow plus tree, viewer, dialog focus-trap/return and visible-focus component tests | V |
+| `CAT-P0-020` | end-to-end keyboard-only App flow through left tree/child Sheet/native picker/tabs/search/logout plus focused tree/viewer/modal tests | V |
 | `CAT-P0-021` | PAM/session/CSRF/throttle foundation plus production Firefox PAM login/session/logout | V |
 | `CAT-P0-022` | startup/readiness order, root replacement and INI mismatch tests | V |
 | `CAT-P0-023` | three-root cold generation; four archive hashes and full extract/diff `RESTORE_CHECK_OK` | V |
@@ -215,16 +235,16 @@ browser/live шаг, `D` — процедура документирована, 
 | AC | Status / remaining evidence |
 |---|---|
 | `CAT-AC-01` | V — actual host/root/INI, active unit and live health/readiness verified |
-| `CAT-AC-02` | V — physical nested-folder create/reload plus React dialog/tree reload behavior covered together by HTTP/service and App/tree tests |
-| `CAT-AC-03` | V — empty/program-only/sheet-only combinations and no-validation contract automated |
+| `CAT-AC-02` | V — physical nested-folder create/reload plus React left-tree reload behavior covered together by HTTP/service and App/tree tests |
+| `CAT-AC-03` | V — native picker directly uploads G-code + optional Sheet; program-only leaf and later direct Sheet attach automated without application create popup |
 | `CAT-AC-04` | V — atomic nested publication/exact bytes, running QtDragon root/model visibility and unchanged live LinuxCNC loaded-file invariant verified; no input was sent to the hidden File tab |
-| `CAT-AC-05` | V — second component, exact create/replace preconditions and conflicts automated |
-| `CAT-AC-06` | V — sparse 10 GiB bounded Range/ETag evidence, Worker/virtualization suites and production 1.7 MiB render with 37 virtual rows passed; target-hardware performance remains separate qualification |
-| `CAT-AC-07` | V — desktop 1366x768 и mobile 390x844 production screenshots visually confirm compact split/tree/viewer |
+| `CAT-AC-05` | V — direct attach/replace, exact create/replace preconditions and conflicts automated |
+| `CAT-AC-06` | V — one 64 KiB prefix appears before Worker in automation; sparse 10 GiB Range/ETag/virtualization suites and Firefox first-line/inline-Sheet smoke passed |
+| `CAT-AC-07` | V — DOM/style tests plus desktop/mobile Firefox screenshots confirm compact left-tree/right-viewer, one status path and no duplicate header rows |
 | `CAT-AC-08` | V — traversal/absolute/symlink/hardlink/special/race suite passed |
 | `CAT-AC-09` | V — prepared rollback, journal phases and real subprocess SIGKILL recovery passed |
 | `CAT-AC-10` | V — external same-content/substitution/version conflict suites passed |
-| `CAT-AC-11` | V — one integration scenario covers keyboard-only login→tree→upload→preview search/line jump→logout; focused component suites verify roving tree, modal trap/return and visible focus |
+| `CAT-AC-11` | V — one integration scenario uses keyboard-only login→left tree/child Sheet→native picker trigger→preview search/line jump→logout; focused suites verify roving tree, editor tabs, modal trap/return and visible focus |
 | `CAT-AC-12` | V — production build, Go unit/integration/race/vet, frontend lint/typecheck/tests, path-security, local health/ready and real production PAM smoke all passed |
 
 ## Историческая implementation/evidence matrix (до 2026-08-21)

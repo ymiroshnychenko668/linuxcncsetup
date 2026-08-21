@@ -1,11 +1,12 @@
 import { useEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent } from 'react'
-import type { CatalogFolder, CatalogSetup, CatalogSnapshot } from '../api'
+import type { CatalogComponent, CatalogFolder, CatalogSetup, CatalogSnapshot } from '../api'
 import { ChevronIcon, FolderIcon, ProgramIcon, SheetIcon } from './CatalogIcons'
 
 type TreeNode =
   | { key: 'root'; kind: 'root'; level: 1; parentKey?: undefined }
   | { key: string; kind: 'folder'; level: number; parentKey: string; folder: CatalogFolder }
   | { key: string; kind: 'setup'; level: number; parentKey: string; setup: CatalogSetup }
+  | { key: string; kind: 'sheet'; level: number; parentKey: string; setup: CatalogSetup }
 
 interface Props {
   catalog: CatalogSnapshot
@@ -13,14 +14,17 @@ interface Props {
   expandedFolderIds: ReadonlySet<string>
   activeFolderId?: string
   selectedSetupId?: string
+  selectedComponent?: CatalogComponent
   onExpandedChange: (folderId: string, expanded: boolean) => void
   onActivateRoot: () => void
   onActivateFolder: (folder: CatalogFolder) => void
   onActivateSetup: (setup: CatalogSetup) => void
+  onActivateSetupSheet: (setup: CatalogSetup) => void
   onRenameFolder: (folder: CatalogFolder) => void
   onRenameSetup: (setup: CatalogSetup) => void
   onDeleteFolder: (folder: CatalogFolder) => void
   onDeleteSetup: (setup: CatalogSetup) => void
+  onDeleteSetupSheet: (setup: CatalogSetup) => void
 }
 
 const ROOT_KEY = 'root'
@@ -41,7 +45,8 @@ function setupMatches(setup: CatalogSetup, query: string): boolean {
 }
 
 function folderKey(id: string): string { return `folder:${id}` }
-function setupKey(id: string): string { return `setup:${id}` }
+function setupKey(id: string): string { return `program:${id}` }
+function sheetKey(id: string): string { return `sheet:${id}` }
 
 // Exported for deterministic tree-model tests; this module otherwise exports
 // the component consumed by the workbench.
@@ -50,6 +55,7 @@ export function flattenCatalogTree(
   catalog: CatalogSnapshot,
   expandedFolderIds: ReadonlySet<string>,
   rawQuery: string,
+  collapsedSetupIds: ReadonlySet<string> = new Set(),
 ): TreeNode[] {
   const query = normalizedSearch(rawQuery)
   const foldersByID = new Map(catalog.folders.map((folder) => [folder.folderId, folder]))
@@ -121,7 +127,11 @@ export function flattenCatalogTree(
     }
     for (const setup of childSetups.get(parentId) ?? []) {
       if (query && !matchingSetups.has(setup.setupId)) continue
-      nodes.push({ key: setupKey(setup.setupId), kind: 'setup', level, parentKey, setup })
+      const key = setupKey(setup.setupId)
+      nodes.push({ key, kind: 'setup', level, parentKey, setup })
+      if (setup.setupSheet && (query || !collapsedSetupIds.has(setup.setupId))) {
+        nodes.push({ key: sheetKey(setup.setupId), kind: 'sheet', level: level + 1, parentKey: key, setup })
+      }
     }
   }
   appendChildren(undefined, ROOT_KEY, 2)
@@ -139,7 +149,7 @@ export function flattenCatalogTree(
 }
 
 function setupLabel(setup: CatalogSetup): string {
-  return setup.name || setup.program?.displayName || 'Без названия'
+  return setup.program?.displayName || setup.name || 'G-code не загружен'
 }
 
 export function CatalogTree({
@@ -148,21 +158,26 @@ export function CatalogTree({
   expandedFolderIds,
   activeFolderId,
   selectedSetupId,
+  selectedComponent = 'program',
   onExpandedChange,
   onActivateRoot,
   onActivateFolder,
   onActivateSetup,
+  onActivateSetupSheet,
   onRenameFolder,
   onRenameSetup,
   onDeleteFolder,
   onDeleteSetup,
+  onDeleteSetupSheet,
 }: Props) {
+  const [collapsedSetupIds, setCollapsedSetupIds] = useState<Set<string>>(() => new Set())
+  const searchActive = normalizedSearch(query) !== ''
   const nodes = useMemo(
-    () => flattenCatalogTree(catalog, expandedFolderIds, query),
-    [catalog, expandedFolderIds, query],
+    () => flattenCatalogTree(catalog, expandedFolderIds, query, collapsedSetupIds),
+    [catalog, collapsedSetupIds, expandedFolderIds, query],
   )
   const preferredKey = selectedSetupId
-    ? setupKey(selectedSetupId)
+    ? selectedComponent === 'setup-sheet' ? sheetKey(selectedSetupId) : setupKey(selectedSetupId)
     : activeFolderId ? folderKey(activeFolderId) : ROOT_KEY
   const [focusedKey, setFocusedKey] = useState(preferredKey)
   const refs = useRef(new Map<string, HTMLButtonElement>())
@@ -175,6 +190,29 @@ export function CatalogTree({
     if (!nodes.some((node) => node.key === focusedKey)) setFocusedKey(nodes[0]?.key ?? ROOT_KEY)
   }, [focusedKey, nodes])
 
+  useEffect(() => {
+    if (!selectedSetupId || selectedComponent !== 'setup-sheet') return
+    setCollapsedSetupIds((current) => {
+      if (!current.has(selectedSetupId)) return current
+      const next = new Set(current)
+      next.delete(selectedSetupId)
+      return next
+    })
+  }, [selectedComponent, selectedSetupId])
+
+  const siblingPositions = useMemo(() => {
+    const groups = new Map<string, TreeNode[]>()
+    for (const node of nodes) {
+      const parent = node.parentKey ?? '__tree-root__'
+      groups.set(parent, [...(groups.get(parent) ?? []), node])
+    }
+    const result = new Map<string, { position: number; size: number }>()
+    for (const siblings of groups.values()) {
+      siblings.forEach((node, index) => result.set(node.key, { position: index + 1, size: siblings.length }))
+    }
+    return result
+  }, [nodes])
+
   const focusNode = (key: string) => {
     setFocusedKey(key)
     queueMicrotask(() => refs.current.get(key)?.focus())
@@ -185,21 +223,42 @@ export function CatalogTree({
     else if (node.kind === 'folder') {
       onActivateFolder(node.folder)
       onExpandedChange(node.folder.folderId, !expandedFolderIds.has(node.folder.folderId))
-    } else onActivateSetup(node.setup)
+    } else if (node.kind === 'setup') onActivateSetup(node.setup)
+    else onActivateSetupSheet(node.setup)
+  }
+
+  const setSetupCollapsed = (setup: CatalogSetup, collapsed: boolean) => {
+    setCollapsedSetupIds((current) => {
+      const next = new Set(current)
+      if (collapsed) next.add(setup.setupId)
+      else next.delete(setup.setupId)
+      return next
+    })
   }
 
   const onKeyDown = (event: KeyboardEvent<HTMLButtonElement>, node: TreeNode, index: number) => {
     let target: string | undefined
+    const effectivelyExpanded = node.kind === 'folder'
+      ? searchActive || expandedFolderIds.has(node.folder.folderId)
+      : node.kind === 'setup' && Boolean(node.setup.setupSheet)
+        ? searchActive || !collapsedSetupIds.has(node.setup.setupId)
+        : false
     if (event.key === 'ArrowDown') target = nodes[Math.min(nodes.length - 1, index + 1)]?.key
     else if (event.key === 'ArrowUp') target = nodes[Math.max(0, index - 1)]?.key
     else if (event.key === 'Home') target = nodes[0]?.key
     else if (event.key === 'End') target = nodes[nodes.length - 1]?.key
-    else if (event.key === 'ArrowRight' && node.kind === 'folder') {
-      if (!expandedFolderIds.has(node.folder.folderId)) onExpandedChange(node.folder.folderId, true)
+    else if (event.key === 'ArrowRight' && (node.kind === 'folder' || node.kind === 'setup')) {
+      if (node.kind === 'folder' && !effectivelyExpanded) onExpandedChange(node.folder.folderId, true)
+      else if (node.kind === 'setup' && node.setup.setupSheet && !effectivelyExpanded) setSetupCollapsed(node.setup, false)
       else if (nodes[index + 1]?.level > node.level) target = nodes[index + 1]?.key
     } else if (event.key === 'ArrowLeft') {
-      if (node.kind === 'folder' && expandedFolderIds.has(node.folder.folderId)) {
+      if (searchActive && effectivelyExpanded) {
+        target = node.parentKey
+      } else if (node.kind === 'folder' && expandedFolderIds.has(node.folder.folderId)) {
         onExpandedChange(node.folder.folderId, false)
+      } else if (node.kind === 'setup' && node.setup.setupSheet && !collapsedSetupIds.has(node.setup.setupId)) {
+        setSetupCollapsed(node.setup, true)
+        onActivateSetup(node.setup)
       } else target = node.parentKey
     } else if (event.key === 'Enter' || event.key === ' ') {
       activate(node)
@@ -209,23 +268,29 @@ export function CatalogTree({
     } else if (event.key === 'Delete') {
       if (node.kind === 'folder') onDeleteFolder(node.folder)
       if (node.kind === 'setup') onDeleteSetup(node.setup)
+      if (node.kind === 'sheet') onDeleteSetupSheet(node.setup)
     } else return
     event.preventDefault()
     if (target) focusNode(target)
   }
 
   return (
-    <div className="catalog-tree" role="tree" aria-label="Сетапы по каталогам">
+    <div className="catalog-tree" role="tree" aria-label="G-code и Setup Sheet по каталогам">
       {nodes.map((node, index) => {
         const selected = node.kind === 'root'
           ? !selectedSetupId && !activeFolderId
-          : node.kind === 'folder'
+            : node.kind === 'folder'
             ? !selectedSetupId && node.folder.folderId === activeFolderId
-            : node.setup.setupId === selectedSetupId
-        const expanded = node.kind === 'root' || node.kind === 'folder' && expandedFolderIds.has(node.folder.folderId)
-        const hasChildren = node.kind === 'root' || node.kind === 'folder'
+            : node.setup.setupId === selectedSetupId && (node.kind === 'sheet') === (selectedComponent === 'setup-sheet')
+        const expanded = node.kind === 'root'
+          || node.kind === 'folder' && (searchActive || expandedFolderIds.has(node.folder.folderId))
+          || node.kind === 'setup' && Boolean(node.setup.setupSheet) && (searchActive || !collapsedSetupIds.has(node.setup.setupId))
+        const hasChildren = node.kind === 'root' || node.kind === 'folder' || node.kind === 'setup' && Boolean(node.setup.setupSheet)
+        const siblingPosition = siblingPositions.get(node.key)
         const label = node.kind === 'root' ? catalog.destination.rootLabel
-          : node.kind === 'folder' ? node.folder.name : setupLabel(node.setup)
+          : node.kind === 'folder' ? node.folder.name
+            : node.kind === 'sheet' ? node.setup.setupSheet?.displayName ?? 'Setup Sheet'
+              : setupLabel(node.setup)
         return (
           <button
             ref={(element) => { if (element) refs.current.set(node.key, element); else refs.current.delete(node.key) }}
@@ -234,28 +299,38 @@ export function CatalogTree({
             type="button"
             role="treeitem"
             aria-level={node.level}
+            aria-posinset={siblingPosition?.position}
+            aria-setsize={siblingPosition?.size}
             aria-selected={selected}
             aria-expanded={hasChildren ? expanded : undefined}
             tabIndex={node.key === focusedKey ? 0 : -1}
             title={node.kind === 'root' ? catalog.destination.rootDisplay
               : node.kind === 'folder' ? node.folder.relativePath
-                : node.setup.programRelativePath ?? `${node.setup.name} — программа не загружена`}
+                : node.kind === 'sheet' ? node.setup.setupSheetRelativePath
+                  : node.setup.programRelativePath ?? `${node.setup.name} — программа не загружена`}
             style={{ '--tree-level': node.level } as CSSProperties}
             onFocus={() => setFocusedKey(node.key)}
             onKeyDown={(event) => onKeyDown(event, node, index)}
-            onClick={() => activate(node)}
+            onClick={(event) => {
+              if (node.kind === 'setup' && node.setup.setupSheet && (event.target as Element).closest('.catalog-tree__twist')) {
+                setSetupCollapsed(node.setup, !expanded)
+                if (expanded) onActivateSetup(node.setup)
+                return
+              }
+              activate(node)
+            }}
           >
             <span className="catalog-tree__twist" aria-hidden="true">
               {hasChildren ? <ChevronIcon direction={expanded ? 'down' : 'right'} /> : null}
             </span>
             <span className="catalog-tree__kind" aria-hidden="true">
-              {node.kind === 'setup' ? <ProgramIcon /> : <FolderIcon />}
+              {node.kind === 'setup' ? <ProgramIcon /> : node.kind === 'sheet' ? <SheetIcon /> : <FolderIcon />}
             </span>
             <span className="catalog-tree__label">{label}</span>
             {node.kind === 'setup' ? (
               <span className="catalog-tree__badges" aria-label={`${node.setup.program ? 'G-code загружен' : 'G-code отсутствует'}; ${node.setup.setupSheet ? 'Setup Sheet загружена' : 'Setup Sheet отсутствует'}`}>
-                {!node.setup.program ? <span className="catalog-tree__empty-badge">пусто</span> : null}
-                {node.setup.setupSheet ? <SheetIcon /> : null}
+                {!node.setup.program ? <span className="catalog-tree__empty-badge">нужен G-code</span> : null}
+                {node.setup.setupSheet ? <span className="catalog-tree__setup-badge">SETUP</span> : null}
               </span>
             ) : null}
           </button>

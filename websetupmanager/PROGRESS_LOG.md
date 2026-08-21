@@ -188,6 +188,45 @@ evidence новой catalog-модели. Актуальные требован�
   QtDragon File tab остаются дополнительной qualification, а не незакрытыми
   текущими AC.
 
+## Этап 16 — file-first tree, inline Sheet и быстрый первый paint
+
+- По прямой корректировке владельца станка split развёрнут: file tree находится
+  слева, единая editor surface справа. G-code является родительской строкой
+  Setup, а существующая Setup Sheet — дочерней строкой и отдельным editor tab;
+  PDF/очищенный HTML показываются inline без viewer popup.
+- Многошаговый upload dialog удалён из основного Workbench. «Добавить» запускает
+  native multi-file picker с одним обязательным G-code и одной optional Sheet;
+  program-only Setup остаётся leaf и получает прямое действие attach Sheet.
+  Исторические sheet-only записи сохраняются и восстанавливаются добавлением
+  G-code, а не удаляются.
+- Повторяющиеся breadcrumb/commandbar/filename/path строки удалены; имя файла
+  остаётся в tab, точный destination — в единственной status bar. Primary CTA
+  получил спокойный тёмно-зелёный фон и светлый текст.
+- Первый preview делает ровно один 64-КиБ Range, показывает законченные начальные
+  строки и только после этого запускает Worker index. Pending-offset dedupe не
+  допускает параллельного повторного main-thread запроса; exact ETag/If-Match и
+  bounded последующие блоки сохранены.
+- Frontend `lint`, `typecheck`, 15 files / 103 tests и Vite production build
+  прошли. Обновлённый App scenario снова использует только keyboard events для
+  login → left tree/child Sheet → native picker trigger → search/line jump →
+  logout. Regression suites дополнительно закрывают stable-key replay только
+  после ambiguous failure, fresh key/revision после deterministic conflict,
+  late Range generation, newline boundary, search-effective expansion, mobile
+  focus trap/inert и bounded/cancellable PDF text stream.
+- Firefox BiDi на disposable roots подтвердил desktop `1366x768`: дерево слева,
+  G-code справа с первой строкой `%`, child Sheet, одна status path, отсутствие
+  breadcrumb/commandbar и primary contrast `6.02:1`; HTML Sheet показалась
+  inline без dialog. Первый smoke обнаружил белый iframe: application CSP не
+  разрешал созданный viewer-ом sanitized `blob:`. `frame-src 'self' blob:`
+  добавлен с empty sandbox и document CSP без script/network; повторный smoke
+  показал содержимое Sheet. Mobile `390x844` подтвердил left drawer, inert
+  editor, Tab wrap и focus return после Escape.
+- Финальные screenshots: `/tmp/wsm-ui-evidence-csp.OedI4k`; SHA-256 program /
+  Sheet / mobile — `f83cedd4ab5b494717b45d5acf3724a520e65ffbcb9c11f0241edb08e08ef971` /
+  `feadf0f6a31790df77376fb34657f533788242ef00d993caa48d38c76c6d536d` /
+  `7ea399e3695d3922e71bd4170a14648a01f8de3c92f72e421fc1dd2acc9d0aa0`.
+  Deployment фиксируется отдельной release generation после feature commit.
+
 ## Discovery и этап 1 — каркас приложения
 
 - Полностью прочитан `functional-requirements.ru.md`; извлечено ровно 221 P0 ID.

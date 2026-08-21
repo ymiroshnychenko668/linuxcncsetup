@@ -620,12 +620,13 @@ export async function deleteCatalogFolder(
 export async function createCatalogSetup(
   input: { folderId?: string; name: string; description?: string },
   key = newIdempotencyKey(),
+  signal?: AbortSignal,
 ): Promise<CatalogSetup> {
   return normalizeCatalogSetup(await jsonMutation<unknown>('/api/v1/catalog/setups', 'POST', {
     folderId: input.folderId ?? null,
     name: input.name,
     description: input.description ?? '',
-  }, key))
+  }, key, signal))
 }
 
 export async function updateCatalogSetup(
