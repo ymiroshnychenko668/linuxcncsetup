@@ -33,9 +33,42 @@ baseline в [functional-requirements.ru.md](functional-requirements.ru.md).
 
 На целевом host root равен `/home/user/linuxcnc/nc_files`, а active INI —
 `/home/user/linuxcnc/configs/corvuscnc/g540.ini`. Сервис обязан проверить их
-совпадение до ready. Старый deployed artifact от 2026-08-20 доказал PAM/TLS, но
-не считается acceptance evidence новой catalog/storage/UI модели; её текущий
-статус ведётся в [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md).
+совпадение до ready. Catalog service/storage/HTTP automation, real subprocess
+SIGKILL recovery, sparse 10 GiB Range, 0/1/N migration/provenance suites и
+frontend lint/typecheck/15 files / 87 tests/Vite build прошли. Catalog release
+развёрнут на production host; Firefox desktop/mobile production smoke прошёл.
+Сквозной keyboard-only integration flow также прошёл; отдельный LAN client,
+DHCP reservation, controlled target performance и ручной визуальный QtDragon
+walkthrough остаются дополнительной qualification. Точный статус ведётся в
+[IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md).
+
+Production generation от 2026-08-21:
+
+- release `/opt/websetupmanager/releases/12aa6a2adf3c`, source commit
+  `12aa6a2adf3c9908a2120c03ed310aa40ac1fecc`, binary SHA-256
+  `ee2f2afe0e0f3cf50ca79a57a36d94c4f1cbd971ea85474b599e11dd7bd9872a`;
+- cold backup `/var/backups/websetupmanager/pre-catalog-20260821T145214Z`;
+  четыре archive checksum прошли сверку, полный extract/diff —
+  `RESTORE_CHECK_OK`;
+- active unit слушает только direct HTTPS `10.0.1.136:443`; TCP/80 отсутствует,
+  `/healthz` и `/readyz` возвращают 200;
+- schema v4 и catalog migration completed: 2 folders, 2 setups, 4 files,
+  2 completed mappings, 4 copied manifests; SQLite integrity/FK, exact
+  source↔target size/SHA и idempotent restart проверены;
+- legacy rows/objects сохранены, temp remnants отсутствуют; LinuxCNC snapshot
+  остался `file=""`, `state/mode/interp/exec=1/1/1/2`.
+- headless Firefox ESR/WebDriver BiDi прошёл guest, PAM login, ready/catalog/UI
+  и logout на production HTTPS. После обнаруженного 0 px code viewport commit
+  `18411e613b380c4b73837003b96c949a21661041` заменил editor grid→flex; rerun
+  показал highlighted G-code/tree, 37 virtual rows, первую `%` и viewport
+  `1030x516` на desktop `1366x768`; также проверен mobile `390x844`.
+- commit `12aa6a2adf3c9908a2120c03ed310aa40ac1fecc` исправил возврат focus
+  после portal dialog и перехода к строке. Полный keyboard-only App flow и
+  87 frontend tests прошли; текущий release после restart снова отдал
+  `/healthz=200`, `/readyz=200` и guest PAM contract.
+- read-only QtDragon audit той же `QFileSystemModel` подтвердил доступную
+  цепочку `linuxcnc/nc_files/Импортировано/adssad` и строки `1002.ngc`/
+  `1003.ngc`; вкладка File и selection работающего LinuxCNC не изменялись.
 
 Production targets: Linux amd64/arm64. Production build использует cgo и PAM;
 на build host нужны PAM headers/library, на target — совместимый PAM runtime.
@@ -103,22 +136,34 @@ destination новых catalog upload. Не направляйте новый up
 `GET /readyz` дополнительно проверяет SQLite, state и удерживаемый program root,
 включая соответствие активному INI.
 SIGTERM запрещает новые мутации, завершает graceful HTTP shutdown и закрывает
-SQLite. До открытия listener startup очищает только собственные stale catalog
-temp, восстанавливает незавершённые операции и проверяет root/INI/file identity.
-Legacy object reconciliation/GC сохраняется только для migration/rollback и не
-публикует новые catalog files. Readiness не означает, что G-code проверен или
-загружен в LinuxCNC.
+SQLite. До открытия listener startup последовательно завершает legacy journal и
+imports, проверяет legacy content identity, восстанавливает catalog operations и
+запускает idempotent legacy→catalog migration. `manual_review` или любая ошибка
+блокирует listener. При возобновлении незавершённой migration уже completed
+per-source mappings сверяются с provenance/manifest; общий terminal state
+`completed` при следующих стартах является no-op. Readiness не означает, что
+G-code проверен или загружен в LinuxCNC.
 
 PDF/HTML Setup Sheet загружаются потоково. Общий размер HTML
 ограничивают только configured upload limit, filesystem и диск; один
 незавершённый HTML token ограничен 1 MiB и проверяется до публикации,
 чтобы sanitizer имел bounded memory.
 
-## Проверенная PAM-сборка старого baseline
+## Catalog delivery evidence и PAM foundation
 
-Следующее evidence подтверждает auth/TLS foundation, а не новую catalog-модель,
-direct `PROGRAM_ROOT` publication или переработанный UI. После catalog transition
-вся последовательность должна быть повторена integrated.
+Catalog-specific automated suites подтверждают folder/setup CRUD, singular
+components, direct placement, exact file preconditions, Range/ETag, path/race
+protection, durable recovery, actual subprocess SIGKILL, sparse 10 GiB Range и
+0/1/N no-data-loss migration с provenance/manual-review. Frontend lint/typecheck,
+15 files / 87 tests и Vite production build прошли. Сквозной keyboard-only flow
+закрывает login/tree/upload/preview-search/line-jump/logout и focus return;
+production visual smoke дополнительно подтверждает layout. Controlled target
+performance остаётся отдельной qualification.
+
+Auth/TLS foundation сохранена в catalog release. Production remote login
+использует только Linux/PAM account `user` и текущий системный password; его
+значение не хранится в приложении и не должно попадать в документацию. Optional
+Bearer в текущем deployment не задан.
 
 После интеграции прошли обычные и PAM-tagged backend-команды:
 
@@ -131,26 +176,35 @@ CGO_ENABLED=1 go vet -tags pam ./...
 CGO_ENABLED=1 go build -tags "production pam" ./cmd/websetupmanager
 ```
 
-Frontend lint и typecheck прошли; Vitest — 12 files/83 tests; Vite production
+Frontend lint и typecheck прошли; Vitest — 15 files/87 tests; Vite production
 build прошёл и встроен в Go binary. Полный `scripts/build.sh` также прошёл.
+Для финального focus-only release его шаги повторены отдельно; clean detached
+worktree выполнил `npm ci`, Vite build и production PAM Go build.
 Отдельная non-PAM сборка в remote mode ожидаемо завершилась с exit 1 и
-`AUTHENTICATION_UNAVAILABLE`. Установленный amd64 artifact собран Go 1.26.5 с
+`AUTHENTICATION_UNAVAILABLE`. Текущий amd64 artifact собран Go 1.26.5 с
 `CGO_ENABLED=1`, tags `production,pam`, использует системный `libpam.so.0` и
 имеет SHA-256
-`5df67ec084ec30e0f253f6fd38f565adbe9e4eb8656edc180f3fa2454be8469d`.
+`ee2f2afe0e0f3cf50ca79a57a36d94c4f1cbd971ea85474b599e11dd7bd9872a` и установлен
+как `/opt/websetupmanager/releases/12aa6a2adf3c` из source commit
+`12aa6a2adf3c9908a2120c03ed310aa40ac1fecc`.
 
-На текущем host (2026-08-20) `websetupmanager.service` установлен как enabled и active от
-пользователя `user`, слушает `https://microb.int:443`; `/healthz` и `/readyz`
-возвращают 200. Live direct-TLS flow подтвердил guest session, защищённые
-capabilities, реальный PAM login/logout и «Запомнить меня» через graceful
-service restart с последующим logout. Сертификат текущего host self-signed для
+Catalog `websetupmanager.service` enabled/active от пользователя `user`, слушает
+`https://microb.int:443`, а `/healthz` и `/readyz` возвращают 200. Listener или
+redirect на port 80 отсутствует. Сертификат текущего host self-signed для
 `microb.int`/`10.0.1.136`, поэтому client должен явно доверять ему; это не
 заменяет развёртывание доверенного PKI certificate.
 
-Arm64 PAM build/runtime, численные NFR на целевом LinuxCNC-компьютере,
-controlled-browser viewer/keyboard walkthrough, trusted-proxy variant и
-repeated target power-loss остаются отдельной qualification; live host smoke их
-не заменяет.
+Production contract catalog deployment задаёт direct HTTPS на
+`10.0.1.136:443` и адрес `https://microb.int/`. Сам Backend не слушает port 80 и не выполняет
+HTTP→HTTPS redirect: `http://microb.int/` должен получить connection refused,
+если отдельный proxy не настроен. Browser HTTPS-first/HSTS может локально
+переписать введённый URL — это не redirect приложения. Login — Linux/PAM account
+из `ALLOWED_USER` (на текущем host `user`) и его Linux password; отдельного
+Web Setup Manager password нет.
+
+Arm64 PAM build/runtime, численные NFR и controlled 10 GiB browser performance,
+trusted-proxy variant и repeated target power-loss остаются отдельной
+qualification; production visual smoke их не заменяет.
 
 ## Основная конфигурация
 
@@ -209,6 +263,15 @@ certificate/key либо явно доверенный TLS proxy. Процесс
 В loopback local mode вход не требуется. Полный список, PAM policy, systemd
 example, TLS/auth, backup/restore, upgrade, recovery, GC и incident runbook
 находятся в [OPERATOR_GUIDE.ru.md](OPERATOR_GUIDE.ru.md).
+
+Перед первым catalog deployment остановите legacy service и сделайте одну cold
+generation из `STATE_DIR`, legacy `LIBRARY_DIR`, всего `PROGRAM_ROOT`, active INI
+и unit/env. Rollback после schema/data migration выполняется только
+восстановлением всей этой generation вместе со старым binary; смешивать SQLite и
+program files разных backup generation нельзя. Пошаговая процедура и поля для
+финального live evidence находятся в
+[OPERATOR_GUIDE.ru.md](OPERATOR_GUIDE.ru.md) и
+[MIGRATION_PLAN.md](MIGRATION_PLAN.md).
 
 ## Документы
 

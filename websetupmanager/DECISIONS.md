@@ -3,7 +3,7 @@
 Неоднозначности требований фиксируются здесь до реализации. Решения `D-001`–
 `D-020` сохраняют историю первой managed-library версии. Прямое продуктовое
 решение владельца станка от 2026-08-21 имеет больший приоритет и зафиксировано в
-`D-021`–`D-024` и
+`D-021`–`D-031` и
 [PRODUCT_REQUIREMENTS.ru.md](PRODUCT_REQUIREMENTS.ru.md). Старое решение нельзя
 использовать для восстановления multi-program/validation/dashboard UX вопреки
 новой модели.
@@ -91,6 +91,119 @@ Cold backup во время transition включает `state_dir`, legacy `lib
 весь `PROGRAM_ROOT`. Полная процедура находится в
 [MIGRATION_PLAN.md](MIGRATION_PLAN.md).
 
+## D-025: file mutation precondition задаётся ровно одним HTTP header
+
+Setup revision защищает composition/metadata, но не заменяет identity конкретного
+именованного файла. Поэтому `PUT` новой program/sheet требует ровно
+`If-None-Match: *`; replace и `DELETE` существующей component требуют ровно один
+`If-Match: "<version>"`, где `version` — lowercase 64-hex opaque ETag из catalog
+DTO/content response. Weak, unquoted, wildcard для replace, несколько значений
+или одновременные `If-Match`/`If-None-Match` отклоняются как
+`PRECONDITION_REQUIRED` до filesystem effect.
+
+Mutation одновременно несёт `expectedRevision`, `Idempotency-Key` и session
+CSRF. Header связывает действие с file identity, revision — с Setup, а
+idempotency — с повтором одного network intent; ни один из трёх механизмов не
+заменяет остальные. Content GET/HEAD допускает standard optional `If-Match`
+candidate/`*` и отдельный exact `version` query, а Range viewer всегда отправляет
+один exact ETag, чтобы блоки разных версий не объединялись.
+
+## D-026: completed migration остаётся проверяемой provenance, а не флагом доверия
+
+Общий `legacy_migration_state=completed` — terminal marker: последующий startup
+является no-op и не превращает migration в постоянный filesystem scanner. Пока
+общий run ещё `pending`/`running`, возобновление не доверяет уже completed
+per-source mapping только по флагу: оно повторно сверяет ожидаемую cardinality
+manifest, legacy artifact/object IDs, role, target relative path, byte
+size/SHA-256, catalog setup/file linkage, version и physical identity. Только
+после обработки всех source mappings общий state становится `completed`.
+Folder, созданный migrator, получает unique `legacy_source_key`; существующий
+same-name folder без этого точного source key не усваивается как migration-owned.
+
+Legacy tables/objects остаются неизменяемой provenance и rollback source.
+Collision, неполный/mismatched manifest, изменившийся target либо неясное
+владение folder переводят migration в `manual_review` и возвращают startup
+error до открытия listener. Автоматическое «починить» provenance по совпавшему
+имени или молча отметить migration completed запрещено.
+
+## D-027: HTML viewer отделяет credential fetch от originless rendering
+
+Trusted SPA получает version-bound sanitized HTML same-origin запросом с
+session credential и exact `If-Match`; Backend уже удалил active content и
+выдал restrictive response/document CSP. Полученные bytes превращаются в Blob
+URL и показываются только в iframe с пустым `sandbox` — без
+`allow-scripts`, `allow-same-origin`, forms, navigation или popups. Поэтому даже
+если строка URL выглядит как `blob:https://microb.int/...`, sandboxed document
+имеет opaque origin и не получает доступ к parent DOM, cookies, local storage,
+CSRF/session credential или catalog API.
+
+Document CSP сохраняет `default-src 'none'`/`connect-src 'none'` и разрешает
+только очищенные inline styles и `data:` images. Blob URL отзывается при
+закрытии/unmount/version change. Credential разрешён только trusted fetch
+слою; он не передаётся документу viewer.
+
+## D-028: production endpoint — direct HTTPS 443 без listener/redirect на 80
+
+Фактический host использует direct TLS на `10.0.1.136:443` и URL
+`https://microb.int/`. Web Setup Manager не слушает TCP/80 и не реализует
+HTTP→HTTPS redirect. `http://microb.int/` поэтому должен получить connection
+refused, если отдельный внешний proxy не был явно установлен; browser может
+визуально «перенаправить» адрес локально из-за HTTPS-first/HSTS, но это не ответ
+приложения.
+
+Login, session cookie и mutations обслуживаются только HTTPS endpoint. Если в
+будущем понадобится port 80 redirect, это отдельная reverse-proxy/firewall
+конфигурация вне процесса и без принятия credentials по HTTP.
+
+## D-029: v3→v4 migration backfill принимает только точную provenance
+
+Migration 004 добавляет `catalog_setups.legacy_source_key` отдельно от уже
+применяемой migration 003, не изменяя checksum старой schema generation. Для
+незавершённого v3 run source key восстанавливается только из
+`catalog_legacy_migrations`, если `catalog_setup_id`, `library_id` и
+`legacy_setup_id` образуют ровно одну согласованную связь. Missing target,
+cross-library/mismatched legacy setup, orphan marker или несколько mappings на
+один catalog Setup заставляют всю migration 004 откатиться транзакционно.
+
+Совпавшие folder/name и idempotency-key сами по себе не считаются provenance и
+не дают права усвоить существующий объект. Новые folder/setup/file migration
+effects записывают source provenance, mapping/manifest linkage и logical DB
+effect в одной SQLite transaction; filesystem effect остаётся покрыт durable
+catalog operation journal. Это устраняет зависимость restart resume от срока
+жизни idempotency response.
+
+## D-030: editor viewport использует flex containment и проверяется визуально
+
+Catalog Workbench сохраняет горизонтальный split viewer/tree, но внутренний
+editor stack строится как column flex с явными `min-height: 0` и растущим
+content region. В production первый headless Firefox visual run обнаружил, что
+предыдущий nested grid сжал G-code viewport до 0 px, хотя component tests были
+зелёными. Commit `18411e613b380c4b73837003b96c949a21661041` заменил этот участок
+grid→flex; повторный desktop/mobile run показал подсвеченный G-code и дерево.
+
+Production visual smoke через WebDriver BiDi считается evidence layout/auth/UI,
+но не подменяет keyboard-only acceptance или performance qualification
+логического 10 GiB preview. Эти проверки получают отдельные статусы и не
+объявляются пройденными по screenshot.
+
+## D-031: focus return фиксируется до portal autoFocus, line jump не remount-ит input
+
+Сквозной keyboard-only integration test обнаружил две реальные потери focus,
+которые раздельные component tests не показывали. Portal child с `autoFocus`
+успевал перехватить `document.activeElement` до эффекта `Modal`, поэтому при
+закрытии dialog исходная кнопка не восстанавливалась. `Modal` теперь запоминает
+инициатор при первом render до portal commit; если mutation удалила инициатор,
+focus возвращается сначала в устойчивый `#catalog-editor`, затем в общий
+`#main-content`.
+
+Поле перехода к строке больше не имеет изменяющийся React `key`: оно controlled
+и синхронизирует значение без remount, поэтому Enter сохраняет focus. Один App
+integration scenario теперь проходит только keyboard events через login, tree,
+upload/file choice, preview search, line jump и logout; отдельные tree/modal/
+viewer tests проверяют детали trap/return/roving focus. Native file picker в
+automation представлен стандартным `userEvent.upload`; production PAM/session
+и реальный layout проверены отдельным Firefox smoke.
+
 ## Статус исторических решений
 
 | Решение | Статус в catalog-версии |
@@ -100,11 +213,12 @@ Cold backup во время transition включает `state_dir`, legacy `lib
 | `D-003`, `D-004`, `D-011` | заменены `D-021`–`D-023` |
 | `D-009`, `D-010`, `D-012`, `D-013`, `D-016`, `D-020` | частично применимы к новым catalog mutations; legacy workflow не нормативен |
 | `D-018` | backup boundary расширен до `PROGRAM_ROOT`; legacy текст ниже исторический |
+| `D-025`–`D-031` | текущие exact precondition, migration provenance/backfill, HTML credential boundary, direct HTTPS, editor containment и focus-return решения |
 
 ## Исторический журнал D-001–D-020
 
 Текст ниже сохранён без переписывания исходной мотивации. При конфликте
-применяются `D-021`–`D-024`.
+применяются `D-021`–`D-031`.
 
 ## D-001: production baseline
 
@@ -268,7 +382,7 @@ durable запись `database_applied`: crash до commit не публикуе
 Development evidence получено на Debian 13.5, Linux
 `6.12.95+deb13-rt-amd64` PREEMPT_RT, ext4, Go 1.26.5, Node 20.19.2. После auth
 integration полный Go test/race/vet прошёл с `CGO_ENABLED=1 -tags pam`, frontend
-lint/typecheck и 12 files/83 tests прошли, а production amd64 artifact собран с
+lint/typecheck и 15 files/87 tests прошли, а production amd64 artifact собран с
 tags `production,pam`; untagged Go/race и полный `scripts/build.sh` также прошли.
 Non-PAM remote binary отдельно подтвердил fail-closed startup. На этом же host
 direct TLS 1.3 проверен с реальным PAM login/logout и hash-only remembered

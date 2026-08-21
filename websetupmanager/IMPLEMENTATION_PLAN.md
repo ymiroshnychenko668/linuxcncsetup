@@ -39,15 +39,61 @@ browser не может выбрать другой каталог хоста.
 | Этап | Результат | Статус на 2026-08-21 |
 |---|---|---|
 | 0. Direction reset | новый normative source, decisions, host discovery, migration boundary | выполнено в документации |
-| 1. Catalog backend | config/INI match, schema, folders/setups, singular files, scoped API | в работе; pass ещё не заявлен |
-| 2. Direct filesystem storage | root-FD traversal, atomic named publish, conflicts/recovery | в работе; security gate ещё не записан |
-| 3. Compact frontend | left viewer/right tree, destination-first upload, folder operations | в работе; browser acceptance ещё не записан |
-| 4. Legacy migration | additive schema + no-replace copy/manifest | запланировано; legacy objects сохраняются |
-| 5. Integrated verification | Go/race/vet, frontend, security, build, live QtDragon/PAM | не выполнено для новой catalog-модели |
-| 6. Deployment | unit/env write exception for actual root, smoke and rollback evidence | не выполнено для новой catalog-модели |
+| 1. Catalog backend | config/INI match, additive schema, folders/setups, singular files, scoped API | реализовано; catalog service/HTTP integration suites прошли |
+| 2. Direct filesystem storage | root-FD traversal, prepared atomic publish, conflicts, durable recovery | реализовано; path/race, real SIGKILL и sparse 10 GiB suites прошли |
+| 3. Compact frontend | left viewer/right tree, destination-first upload, folder/component operations | реализовано; 15 files / 87 tests/build, сквозной keyboard-only integration flow и production desktop/mobile visual smoke прошли |
+| 4. Legacy migration | 0/1/N split, sheet fan-out, provenance, manifest и no-replace publication | выполнено на host; schema v4, 2 completed mappings и 4 copied manifests, restart idempotent |
+| 5. Integrated verification | automated catalog regression и production wiring | full build/test gates и host integrity/hash/readiness/no-execution checks прошли |
+| 6. Deployment | cold backup, verified restore rehearsal, versioned release и direct HTTPS smoke | выполнено; внешний LAN client, DHCP reservation, target performance и ручной QtDragon отмечены отдельно |
 
 Подробная безопасная последовательность преобразования данных находится в
 [MIGRATION_PLAN.md](MIGRATION_PLAN.md).
+
+## Фактическая production generation
+
+- Release: `/opt/websetupmanager/releases/12aa6a2adf3c`; source commit
+  `12aa6a2adf3c9908a2120c03ed310aa40ac1fecc`; SHA-256 binary
+  `ee2f2afe0e0f3cf50ca79a57a36d94c4f1cbd971ea85474b599e11dd7bd9872a`.
+- Cold generation:
+  `/var/backups/websetupmanager/pre-catalog-20260821T145214Z`; все четыре archive
+  проверены по записанным SHA-256, полный extract/diff завершился marker
+  `RESTORE_CHECK_OK`.
+- Unit enabled/active от `user`, direct HTTPS `10.0.1.136:443`; listener на
+  TCP/80 отсутствует; `/healthz` и `/readyz` вернули 200. Optional Bearer не
+  настроен. Интерактивный вход использует PAM account `user` и текущий системный
+  Linux password; значение password нигде не записывается.
+- SQLite schema v4, `legacy_migration_state=completed`: 2 folders, 2 setups,
+  4 files, 2 completed mappings и 4 copied manifest rows. `quick_check=ok`,
+  foreign-key violations — 0; source/target size и SHA-256 совпали, legacy rows
+  и objects сохранены, journal/staging temp remnants отсутствуют.
+- Повторный restart/migration не изменил counts. LinuxCNC snapshot до/после WSM:
+  `file=""`, `state/mode/interp/exec=1/1/1/2`; приложение ничего не загрузило и
+  не запустило.
+- Headless Firefox ESR через WebDriver BiDi на production HTTPS прошёл guest,
+  PAM login пользователя `user`, ready/catalog/UI и logout. Проверены desktop
+  `1366x768` и mobile `390x844`; authenticated desktop отрисовал 37 virtual
+  G-code rows, первая строка `%`, viewport `1030x516`.
+- Первый visual run обнаружил G-code viewport высотой 0 px. Commit
+  `18411e613b380c4b73837003b96c949a21661041` заменил editor grid на flex;
+  повторный production run показал подсвеченный G-code и catalog tree.
+- Финальный keyboard-only integration flow обнаружил и закрыл две focus-регрессии:
+  portal `autoFocus` больше не теряет инициатор dialog, а переход к строке не
+  remount-ит spinbutton. Commit `12aa6a2adf3c9908a2120c03ed310aa40ac1fecc`
+  прошёл 15 files / 87 tests, production build и установлен отдельным release;
+  post-restart `/healthz`/`/readyz` и guest login contract снова вернули 200.
+- Read-only QtDragon audit подтвердил running `g540.ini`, local
+  `_CORVUS_FILE_MANAGER`, тот же `PROGRAM_PREFIX` и точную видимую моделью
+  цепочку `linuxcnc/nc_files/Импортировано/adssad` со строками `1002.ngc` и
+  `1003.ngc`. Вкладка File не открывалась, selection/LinuxCNC state не менялись.
+- Screenshot evidence: `/tmp/wsm-catalog-evidence.ZSP7Ft`; SHA-256 login
+  desktop/mobile — `fbf1e313ec372d6f87473860a8e87263c4682868e0357a4903426088d2087773` /
+  `cdb6610b62b4c4bcd4812efa50d6ebf13e81a278cb8616ecc1cb259db368f0ae`,
+  authenticated desktop/mobile —
+  `0b4c7f29b2761fb78fe0dedb7aac6d1a91bcfc99ab93f89ef5d797bf6c6c305d` /
+  `d036fa0664c7be11ff074d7ca42a2074d4a20102a9a0b0669d97b8901cb04ebc`.
+- Отдельной target qualification, не входящей в текущие `CAT-AC`, остаются
+  проверка с другого LAN client, DHCP reservation, controlled 10 GiB browser
+  performance и ручной визуальный поиск файлов в QtDragon.
 
 ## Актуальная модель данных
 
@@ -56,6 +102,8 @@ browser не может выбрать другой каталог хоста.
 | `catalog_folders` | opaque ID, nullable parent, display/normalized name, revision; hierarchy соответствует real directories под root |
 | `catalog_setups` | opaque ID, nullable folder, display name, revision; неполный Setup допустим |
 | `catalog_files` | setup ID, unique role `program` или `setup_sheet`, relative basename/path, size/digest, inode/version identity; максимум один файл каждой роли |
+| `catalog_operations` | durable intent/storage/DB/terminal checkpoints для publish, move, delete и folder operations; recovery привязана к ожидаемым identity/digest/version |
+| `catalog_state`, `catalog_legacy_*` | общий migration state, source→target mapping и per-role manifest; completed mapping повторно сверяется с source provenance, catalog row и physical file |
 | auth/session/audit/idempotency | переиспользуются без хранения password/raw remembered token или абсолютного program root в public data |
 | legacy tables/objects | read-only migration/rollback source до отдельного подтверждённого cleanup |
 
@@ -79,9 +127,12 @@ browser не может выбрать другой каталог хоста.
 | `PUT/DELETE /api/v1/catalog/setups/{setupId}/setup-sheet` | streaming add/replace/delete единственной sheet |
 | `HEAD/GET /api/v1/catalog/setups/{setupId}/setup-sheet/content` | version-bound безопасный viewer content |
 
-Mutations используют opaque IDs, expected revision, server-verified сохранённую
-file version, session CSRF и idempotency там, где browser/network retry может
-повторить filesystem effect.
+Mutations используют opaque IDs, expected revision, session CSRF и
+`Idempotency-Key`. Создание component требует ровно `If-None-Match: *`, а
+replace/delete — ровно один `If-Match: "<64 lowercase hex version>"`; смешанный,
+некавыченный или множественный precondition отклоняется до filesystem effect.
+Content GET/HEAD может дополнительно связать чтение с `version` query и точным
+ETag; каждый Range viewer-запрос посылает `If-Match`.
 Ответы содержат `relativePath`/`rootDisplay`, но не canonical absolute root,
 storage key, inode/device или staging name.
 
@@ -99,75 +150,82 @@ storage key, inode/device или staging name.
   rename и синхронизирует directory.
 - Create использует no-replace. Replace/delete связаны с expected revision и
   file version; конфликт не уничтожает новые внешние bytes.
-- Startup очищает только собственные stale temp по проверяемому шаблону. Он не
-  удаляет неизвестные entries или legacy objects.
+- Startup до listener последовательно завершает legacy journal/import recovery,
+  проверяет legacy content identity, восстанавливает catalog journal и только
+  затем запускает idempotent legacy migration. Ошибка или `manual_review`
+  блокирует listener; resume незавершённого общего run повторно проверяет
+  completed per-source provenance/manifest, а общий terminal `completed`
+  становится безопасным no-op на следующем старте.
+- Recovery очищает только journal-owned temp с проверяемым именем и identity.
+  Неизвестные entries и legacy objects не удаляются.
 - Systemd сохраняет `ProtectHome=read-only`, добавляя только точный
   `ReadWritePaths=/home/user/linuxcnc/nc_files`.
 
 ## Актуальная тестовая стратегия
 
-| Gate | Обязательное evidence перед pass |
+| Gate | Имеющееся automated evidence | Остаётся до target pass |
 |---|---|
-| Config/INI | actual `g540.ini` match, mismatch/missing/symlink/wrong-root fail-closed tests |
-| Domain/API | folder hierarchy, incomplete setup, singular cardinality, revision/idempotency/conflict tests |
-| Storage security | external sentinel, traversal, symlink/hardlink/FIFO/socket/device, swap races, no-replace and crash-temp recovery |
-| Upload | constant-memory streaming, free-space/limit/cancel/disconnect, atomic create/replace and byte-for-byte target verification |
-| Viewer | Range/ETag, sparse large G-code, bounded Worker/search, PDF/HTML isolation |
-| Frontend | compact split/tree, destination before upload, empty/offline/conflict, keyboard/focus and singular upload flow |
-| No execution | route/call-site audit and live assertion that WSM interactions do not change loaded LinuxCNC program |
-| Migration | legacy 0/1/N-program fixtures, sheet fan-out, collision/manual review, manifest/hash, restart and rollback |
-| Production | gofmt/vet/test/race, PAM-tagged suite, lint/typecheck/Vitest/Vite, binary build, health/ready, PAM and QtDragon visibility smoke |
+| Config/INI | fail-closed suites и actual service start against `g540.ini`; readiness 200 | внешний LAN/DNS smoke |
+| Domain/API | incomplete/singular CRUD, exact preconditions/routes плюс production Firefox guest/login/catalog/UI/logout smoke | внешний LAN client |
+| Storage security | traversal, reserved tree, symlink/hardlink/special substitution, identity races, no-replace, rollback/recovery | target filesystem spot-check |
+| Upload/recovery | streaming unknown length, prepared publication, journal phases, actual subprocess SIGKILL and same-key retry | target disconnect/power-loss drill |
+| Viewer | sparse 10 GiB bounded Range/ETag/Worker suites плюс production render 1.7 MiB G-code: 37 virtual rows, `%`, viewport `1030x516` | controlled target-hardware performance и malicious-document observation |
+| Frontend | 15 files / 87 tests/build, сквозной keyboard-only integration flow плюс production desktop/mobile screenshots after grid→flex fix | дополнительный native-key walkthrough на отдельном managed client |
+| No execution | catalog-only route gate, exact target publication/root binding и live LinuxCNC snapshot unchanged | дополнительный ручной visual confirmation в QtDragon |
+| Migration | automated 0/1/N/restart/collision suites плюс live manifest/hash/count/restart verification | legacy cleanup только отдельным будущим решением |
+| Authentication | PAM/session/CSRF/throttle suites плюс production Firefox PAM login/session/logout; Bearer unset | внешний managed-client login only if separately required |
+| Production | full gates, backup/restore, release, integrity/hash/ready и desktop/mobile BiDi visual evidence | LAN client, DHCP reservation, target performance, manual QtDragon |
 
 ## Матрица CAT-P0
 
-`D` означает documented only, `W` — implementation work in progress, `P` —
-частичное legacy evidence требует catalog regression, `V` — verified именно для
-новой модели. На момент этого обновления ни один новый integrated gate не
-объявляется пройденным заранее.
+`V` означает пройденное automated evidence именно catalog-версии, `P` —
+реализация и часть автоматизированного evidence есть, но остаётся обязательный
+browser/live шаг, `D` — процедура документирована, target drill не выполнен.
+`V` не заменяет отдельно отмеченную target qualification.
 
 | ID | Planned evidence | Статус |
 |---|---|---|
-| `CAT-P0-001` | frontend split/tree component + browser screenshot | W |
-| `CAT-P0-002` | density/resizable split/visual walkthrough | W |
-| `CAT-P0-003` | folder API/tree reload/component tests | W |
-| `CAT-P0-004` | schema unique role + API second-file conflict tests | W |
-| `CAT-P0-005` | empty/program-only/sheet-only domain and UI tests | W |
-| `CAT-P0-006` | upload dialog destination and success location tests | W |
-| `CAT-P0-007` | atomic target publish + live QtDragon visibility | W |
-| `CAT-P0-008` | absence-of-execute audit + live loaded-file invariant | P |
-| `CAT-P0-009` | folder/setup CRUD/move/concurrency/security suite | W |
-| `CAT-P0-010` | singular streaming add/replace/delete tests | W |
-| `CAT-P0-011` | retained viewer suite through new catalog content routes | P |
-| `CAT-P0-012` | retained safe viewer suite through new routes | P |
-| `CAT-P0-013` | route audit + traversal/sentinel tests | W |
-| `CAT-P0-014` | DTO/error/log leak tests | W |
-| `CAT-P0-015` | catalog-root path/race security suite | W |
-| `CAT-P0-016` | streaming/atomic/cancel/crash/restart suite | W |
-| `CAT-P0-017` | no-replace and external-version conflict suite | W |
-| `CAT-P0-018` | active-extension/reserved/special-file tests | W |
-| `CAT-P0-019` | tree filter and retained-context states | W |
-| `CAT-P0-020` | component focus tests + controlled no-mouse walkthrough | W |
-| `CAT-P0-021` | existing PAM suite + catalog integrated remote smoke | P |
-| `CAT-P0-022` | health/ready root/INI/storage integration tests | W |
-| `CAT-P0-023` | three-root cold backup/restore drill | D |
-| `CAT-P0-024` | no-delete migration manifest/hash/rollback suite | D |
+| `CAT-P0-001` | Workbench/App component tests assert left viewer/right explorer composition | V |
+| `CAT-P0-002` | compact/resizable implementation plus production desktop/mobile visual rerun after grid→flex fix | V |
+| `CAT-P0-003` | folder service/HTTP CRUD plus `CatalogTree` reload/selection tests | V |
+| `CAT-P0-004` | schema unique role and service/HTTP singular-component tests | V |
+| `CAT-P0-005` | empty/program-only/sheet-only service/UI flows; catalog capabilities disable validation | V |
+| `CAT-P0-006` | catalog dialog destination preview and persistent success location tests | V |
+| `CAT-P0-007` | direct atomic named publication/exact bytes plus running QtDragon config/log and read-only matching `QFileSystemModel` rows `1002.ngc`/`1003.ngc` verified; manual hidden-tab screenshot is only an operator qualification | V |
+| `CAT-P0-008` | catalog-only route плюс live unchanged LinuxCNC snapshot `file=""`, `1/1/1/2` | V |
+| `CAT-P0-009` | folder/setup create/rename/move/delete, revision and recovery suites | V |
+| `CAT-P0-010` | singular streaming add/replace/delete including unknown-length body tests | V |
+| `CAT-P0-011` | catalog Range/ETag plus virtualized viewer/Worker/search tests | V |
+| `CAT-P0-012` | local PDF canvas and sanitized HTML CSP/blob/empty-sandbox tests | V |
+| `CAT-P0-013` | catalog-only production gate, safe route and filename attack tests | V |
+| `CAT-P0-014` | catalog snapshot/API leak assertions cover relative path/root display only | V |
+| `CAT-P0-015` | root-FD traversal/reserved/symlink/hardlink/special/race suite | V |
+| `CAT-P0-016` | prepared publish, rollback, journal recovery and actual SIGKILL suite | V |
+| `CAT-P0-017` | exact conditional headers, no-replace and substitution/version conflicts | V |
+| `CAT-P0-018` | active extensions, reserved tree and special-file rejection tests | V |
+| `CAT-P0-019` | catalog filter plus loading/empty/offline/error/conflict component states | V |
+| `CAT-P0-020` | end-to-end keyboard-only App flow plus tree, viewer, dialog focus-trap/return and visible-focus component tests | V |
+| `CAT-P0-021` | PAM/session/CSRF/throttle foundation plus production Firefox PAM login/session/logout | V |
+| `CAT-P0-022` | startup/readiness order, root replacement and INI mismatch tests | V |
+| `CAT-P0-023` | three-root cold generation; four archive hashes and full extract/diff `RESTORE_CHECK_OK` | V |
+| `CAT-P0-024` | 0/1/N no-delete migration, provenance, manifest/hash, restart and manual-review tests | V |
 
 ## Матрица CAT-AC
 
 | AC | Status / remaining evidence |
 |---|---|
-| `CAT-AC-01` | P — actual host/root/INI discovered; startup contract tests pending |
-| `CAT-AC-02` | W — physical folder create/reload implementation and test |
-| `CAT-AC-03` | W — incomplete setup combinations and absence of validation UI |
-| `CAT-AC-04` | W — atomic upload plus live QtDragon/manual-load invariant |
-| `CAT-AC-05` | W — singular replace/conflict flow |
-| `CAT-AC-06` | P — viewer implementation exists historically; catalog-route regression pending |
-| `CAT-AC-07` | W — compact layout and destination-first visual acceptance |
-| `CAT-AC-08` | W — catalog-root attack/race suite |
-| `CAT-AC-09` | W — disconnect/cancel/crash atomicity and temp recovery |
-| `CAT-AC-10` | W — external modification/version conflict |
-| `CAT-AC-11` | W — full keyboard-only flow |
-| `CAT-AC-12` | W — clean integrated quality gates and deployed smoke |
+| `CAT-AC-01` | V — actual host/root/INI, active unit and live health/readiness verified |
+| `CAT-AC-02` | V — physical nested-folder create/reload plus React dialog/tree reload behavior covered together by HTTP/service and App/tree tests |
+| `CAT-AC-03` | V — empty/program-only/sheet-only combinations and no-validation contract automated |
+| `CAT-AC-04` | V — atomic nested publication/exact bytes, running QtDragon root/model visibility and unchanged live LinuxCNC loaded-file invariant verified; no input was sent to the hidden File tab |
+| `CAT-AC-05` | V — second component, exact create/replace preconditions and conflicts automated |
+| `CAT-AC-06` | V — sparse 10 GiB bounded Range/ETag evidence, Worker/virtualization suites and production 1.7 MiB render with 37 virtual rows passed; target-hardware performance remains separate qualification |
+| `CAT-AC-07` | V — desktop 1366x768 и mobile 390x844 production screenshots visually confirm compact split/tree/viewer |
+| `CAT-AC-08` | V — traversal/absolute/symlink/hardlink/special/race suite passed |
+| `CAT-AC-09` | V — prepared rollback, journal phases and real subprocess SIGKILL recovery passed |
+| `CAT-AC-10` | V — external same-content/substitution/version conflict suites passed |
+| `CAT-AC-11` | V — one integration scenario covers keyboard-only login→tree→upload→preview search/line jump→logout; focused component suites verify roving tree, modal trap/return and visible focus |
+| `CAT-AC-12` | V — production build, Go unit/integration/race/vet, frontend lint/typecheck/tests, path-security, local health/ready and real production PAM smoke all passed |
 
 ## Историческая implementation/evidence matrix (до 2026-08-21)
 
@@ -227,7 +285,7 @@ root-FD managed immutable object store
 6. Range/ETag virtualized G-code preview and PDF/HTML viewers.
 7. Acceptance/path/race/sparse/recovery suites and operator documentation.
 8. PAM login/browser-session implementation, remembered-session migration and
-   accessible login/logout UI; PAM-tagged test/race/vet/build, 83 frontend tests
+   accessible login/logout UI; PAM-tagged test/race/vet/build, 84 frontend tests
    and live direct-TLS login/remember/restart/logout verified.
 
 Фактический progress/gate log: [PROGRESS_LOG.md](PROGRESS_LOG.md). Решения
@@ -728,7 +786,7 @@ live evidence in `M-TLS`.
 | PDF/HTML active-content observation | backend sanitizer/CSP and no-action canvas architecture | instrumented malicious documents with network/console observation |
 | trusted-proxy/certificate trust | PAM/config/session tests and direct TLS `M-TLS` passed; current host certificate is self-signed | `M-PROXY` only if selected, plus managed client trust for the production certificate |
 | hard process/power loss | durable intermediate fixtures, atomic post-commit reopen, and actual SIGKILL rollback for archive/delete/current | repeated import/replace/duplicate power-loss `M-POWER` on target |
-| operator deployment/restore | guide, portable marker/fingerprint migration and `TestFullReconcileRebindsIdenticalColdCopyWithoutClearingAttention` | cold backup/restore/upgrade drill on target filesystem |
+| operator deployment/restore | catalog cold generation, four archive checksums and full extract/diff `RESTORE_CHECK_OK` | повторить перед следующей несовместимой migration |
 
 ## Финальные quality gates
 
@@ -740,17 +798,20 @@ live evidence in `M-TLS`.
 - `CGO_ENABLED=1 go test -tags pam ./...` — passed;
 - `CGO_ENABLED=1 go test -race -tags pam ./...` — passed;
 - `CGO_ENABLED=1 go vet -tags pam ./...` — passed;
-- frontend lint/typecheck — passed; Vitest — 12 files/83 tests passed;
+- frontend lint/typecheck — passed; Vitest — 15 files/87 tests passed;
   TypeScript/Vite production build — passed;
-- `scripts/build.sh` — passed, включая чистую dependency restore/check/build
-  последовательность;
+- полный `scripts/build.sh` baseline прошёл; финальный focus-only commit повторил
+  lint/typecheck/87 tests/build и все Go gates отдельно, а clean detached
+  worktree — `npm ci` и production frontend/Go build;
 - `CGO_ENABLED=1 go build -tags "production pam"` — passed; installed amd64
   binary metadata фиксирует Go 1.26.5, `CGO_ENABLED=1`, tags `production,pam`, а
   `ldd` разрешает `libpam.so.0`;
 - отдельная non-PAM remote-сборка завершилась fail-closed: exit 1 и stable
   `AUTHENTICATION_UNAVAILABLE`;
-- SHA-256 build и `/opt/websetupmanager/current/bin/websetupmanager` совпадает:
-  `5df67ec084ec30e0f253f6fd38f565adbe9e4eb8656edc180f3fa2454be8469d`;
+- SHA-256 clean build и установленного catalog binary совпадает:
+  `ee2f2afe0e0f3cf50ca79a57a36d94c4f1cbd971ea85474b599e11dd7bd9872a`;
+  release `/opt/websetupmanager/releases/12aa6a2adf3c` from source commit
+  `12aa6a2adf3c9908a2120c03ed310aa40ac1fecc`;
 - `websetupmanager.service` — enabled/active, `User=user`, direct TLS listener
   `10.0.1.136:443`; live `/healthz` и `/readyz` — 200;
 - `M-TLS` — guest/API gate, normal PAM login/logout, hash-only remembered login

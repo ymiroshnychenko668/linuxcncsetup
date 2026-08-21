@@ -6,6 +6,18 @@
 произвольный доступ к остальной filesystem. Исторические managed `objects` и
 SQLite нельзя изменять вручную во время migration/rollback window.
 
+Статус на 2026-08-21: catalog release
+`/opt/websetupmanager/releases/12aa6a2adf3c` развёрнут из source commit
+`12aa6a2adf3c9908a2120c03ed310aa40ac1fecc`; binary SHA-256 —
+`ee2f2afe0e0f3cf50ca79a57a36d94c4f1cbd971ea85474b599e11dd7bd9872a`.
+Automated suites, frontend 15 files / 87 tests/build, cold backup/restore check,
+live migration, integrity/hash, restart и HTTPS health/readiness прошли.
+Production headless Firefox desktop/mobile visual и PAM login/logout smoke также
+прошли. Сквозной keyboard-only integration flow закрывает login/tree/upload/
+preview-search/line-jump/logout. Отдельный LAN client, DHCP reservation,
+controlled target performance и ручной visual QtDragon walkthrough ниже
+оставлены дополнительными проверками.
+
 ## 1. Каталог и безопасный рабочий цикл
 
 Setup содержит не более одной G-code-программы и не более одной PDF/HTML Setup
@@ -49,6 +61,12 @@ Upload, selection и preview **не открывают и не запускаю�
 LinuxCNC**. Перед обработкой оператор отдельно проверяет станок, оснастку,
 tool table, ноль, траекторию и сам G-code. Security-проверки имени, типа,
 размера и safe path не являются проверкой корректности обработки.
+
+Для API automation действуют те же file preconditions, что отправляет UI:
+create — ровно `If-None-Match: *`, replace/delete — ровно
+`If-Match: "<version>"` из актуального catalog DTO. Одновременно обязательны
+`expectedRevision`, `Idempotency-Key`, CSRF и session/Bearer authentication; не
+подставляйте filename/path вместо opaque Setup ID.
 
 ## 2. Установка
 
@@ -161,6 +179,11 @@ WantedBy=multi-user.target
 [websetupmanager.env.example](deploy/systemd/websetupmanager.env.example), не
 переписывая пути из generic примера вручную.
 
+Эти templates описывают фактическую catalog production model: процесс `user`,
+direct TLS на `10.0.1.136:443`, active `g540.ini`, writable только legacy/state
+roots и `/home/user/linuxcnc/nc_files`. Текущая release generation установлена;
+перед следующей schema/data migration снова выполните cold backup из раздела 5.
+
 `NoNewPrivileges=true` намеренно отсутствует: распространённый `pam_unix`
 использует привилегированный helper для безопасной проверки shadow password.
 Не добавляйте hardening option без повторного интерактивного PAM smoke от имени
@@ -171,8 +194,8 @@ service user.
 ```bash
 sudo systemctl daemon-reload
 sudo systemctl enable --now websetupmanager
-curl --fail --silent http://127.0.0.1:8080/healthz
-curl --fail --silent http://127.0.0.1:8080/readyz
+curl --fail --silent --cacert /path/to/ca.pem https://microb.int/healthz
+curl --fail --silent --cacert /path/to/ca.pem https://microb.int/readyz
 ```
 
 Оба запроса должны вернуть HTTP 200. `/healthz` — liveness процесса;
@@ -180,6 +203,12 @@ curl --fail --silent http://127.0.0.1:8080/readyz
 production процесс на каталог тестов, другой `PROGRAM_PREFIX` или другой legacy
 library marker. Во время migration readiness не заменяет проверку migration
 manifest; выполните отдельный сценарий из [MIGRATION_PLAN.md](MIGRATION_PLAN.md).
+
+Для фактического direct-TLS deployment проверяйте HTTPS, доверяя установленному
+CA/certificate, например `curl --cacert <ca.pem> https://microb.int/healthz` и
+`.../readyz`. Backend не слушает port 80 и не перенаправляет HTTP: запрос
+`http://microb.int/` должен получить connection refused, если отдельный proxy не
+настроен. Browser может сам применить HTTPS-first/HSTS; это не server redirect.
 
 ## 3. Конфигурация
 
@@ -264,6 +293,13 @@ authentication и account-management check только для настроен�
 записи; неизвестное имя получает ту же общую ошибку и не выбирает другой OS
 account. Login защищён лимитами по client IP и submitted username.
 
+На фактическом host адрес — `https://microb.int/`, configured account — `user`.
+Используется Linux/PAM password этого account. Отдельного application login или
+предустановленного Web Setup Manager password нет; password нельзя помещать в
+env, unit, URL, shell history или support log. Catalog binary должен пройти этот
+smoke заново после deployment — исторический PAM smoke старой версии не является
+его заменой.
+
 Успешный login создаёт opaque cookie
 `__Host-websetupmanager_session` с `Secure`, `HttpOnly`, `SameSite=Strict` и
 `Path=/`. Обычная session ограничена idle и absolute timeout. Флажок
@@ -311,6 +347,11 @@ objects/library marker. Не используйте catalog API как backup AP
 4. Проверьте checksum/manifest каждого regular file и отдельно перечислите
    symlink/special entries; затем запустите сервис и проверьте readiness.
 
+Перед первым запуском catalog binary этот backup обязателен: startup сам
+выполняет legacy→catalog migration до listener. Не запускайте новый binary на
+единственной копии state/library/program-root и не продолжайте при
+`manual_review`.
+
 ```bash
 sudo systemctl stop websetupmanager
 sudo rsync -aHAX --numeric-ids /var/lib/websetupmanager/ /backup/wsm-2026-08-21/state/
@@ -336,8 +377,9 @@ authentication state: password/raw cookie там нет, но matching browser t
    generation. Не смешивайте DB одной generation с program files/objects другой.
 3. Восстановите владельца/права, убедитесь, что roots и TLS files не symlink.
 4. Проверьте, что restored root совпадает с `PROGRAM_PREFIX` active INI, затем
-   запустите сервис. Startup выполняет SQLite `quick_check`, checksummed
-   migrations, cleanup собственных temp и catalog identity reconciliation.
+   запустите сервис. Startup выполняет SQLite `quick_check`, checksummed schema
+   migrations, legacy journal/import recovery, legacy identity inspection,
+   catalog operation recovery и idempotent legacy→catalog migration.
 5. Проверьте `/readyz`, дерево folders, один G-code Range preview, Setup Sheet и
    фактический файл в QtDragon. При копировании inode/ctime меняются; Backend
    принимает новую physical identity только после совпадения ожидаемого полного
@@ -365,10 +407,18 @@ backup либо передайте сохранённые roots разработ
 ## 7. Recovery, reconciliation и GC
 
 Startup до listener удаляет только собственные безопасно распознанные staging
-остатки, согласует незавершённые catalog mutations и проверяет удерживаемый root.
-Он не удаляет неизвестные files/folders под `PROGRAM_ROOT`. Periodic reconcile
-сравнивает ожидаемую relative path и file identity; дорогой digest нужен при
-неоднозначной смене identity, а не для validation G-code.
+остатки и строго выполняет: legacy operation recovery → legacy import recovery →
+legacy content inspection → catalog operation recovery → legacy catalog
+migration. Любая ошибка и persisted `manual_review` блокируют listener. Completed
+per-source mapping повторно сверяется с source artifact/object provenance,
+manifest, catalog linkage и physical identity при возобновлении общего
+`pending`/`running` run; общий terminal `completed` затем является startup
+no-op. Migration-owned folder привязан unique source key. Неизвестный same-name
+folder не усваивается автоматически.
+
+Startup не удаляет неизвестные files/folders под `PROGRAM_ROOT`. Periodic
+reconcile сравнивает ожидаемую relative path и file identity; дорогой digest
+нужен при неоднозначной смене identity, а не для validation G-code.
 
 Новые upload создают hidden exclusive temp в target filesystem, синхронизируют
 bytes и публикуют atomic rename. До rename конечное имя отсутствует/содержит
@@ -425,6 +475,11 @@ downgrade нет. Если новая версия успела применит
 generation из pre-upgrade backup. Старый binary без restore допустим только когда release
 notes явно подтверждают schema compatibility.
 
+Для первого catalog rollout старый binary, unit/env и cold generation должны
+оставаться доступными до проверки migration manifest, browser/PAM smoke и
+QtDragon lookup. Rollback восстанавливает вместе state, legacy library и
+program root; частичный откат одной SQLite или только binary запрещён.
+
 ## 10. Incident runbook
 
 | Симптом | Безопасное действие |
@@ -451,46 +506,91 @@ notes явно подтверждают schema compatibility.
 результат readiness, проверенные setup IDs/relative paths и один фактический
 QtDragon lookup. Readiness не заменяет просмотр программы оператором.
 
-## 11. Границы development qualification
+## 11. Границы production qualification
 
-Историческая managed-library версия имела автотесты domain/API/storage/UI,
-sparse 10 GiB backend Range и SHA-verified cold-copy rebind.
-Headless Firefox проверил загрузку same-origin API/assets и loading-state, но это
-не controlled browser acceptance и не заменяет qualification на целевом станке.
-Исторический suite также проверил durable pre-commit recovery, post-commit
-terminal job/replay и несколько SIGKILL сценариев. Это не является доказательством
-direct named-file publish, folder operations или migration новой catalog-модели.
+Новая catalog automation покрывает direct named-file publish, folder/setup CRUD,
+singular components, exact HTTP preconditions, path/race substitution, durable
+catalog journal, настоящий subprocess SIGKILL, sparse 10 GiB metadata/tail Range,
+0/1/N migration, sheet fan-out, completed provenance и collision/manual-review.
+Frontend lint/typecheck, 15 files / 87 tests и Vite production build прошли;
+полный keyboard-only integration flow и component focus regressions включены.
+Production visual smoke отдельно подтверждает реальный layout.
 
 До смены product direction PAM integration, обычные/PAM-tagged Go suites,
 race/vet прошли; отдельный
 non-PAM remote binary подтвердил fail-closed
-`AUTHENTICATION_UNAVAILABLE`. Frontend lint/typecheck, 12 files/83 tests и Vite
-production build прошли; `scripts/build.sh` прошёл целиком. Production binary
-собран с tags `production,pam`. На текущем amd64 host (2026-08-20)
-`websetupmanager.service` enabled/active от Linux-пользователя `user` и слушает
-`https://microb.int:443`. Live direct-TLS проверка зафиксировала health/ready
-200, guest session и закрытые capabilities, обычный PAM login/logout, затем
-remembered PAM login, только SHA-256 cookie-token hash в SQLite, graceful
-restart, восстановленную authenticated session и logout с удалением remembered
-row. SHA-256 установленного binary:
-`5df67ec084ec30e0f253f6fd38f565adbe9e4eb8656edc180f3fa2454be8469d`.
+`AUTHENTICATION_UNAVAILABLE`. Frontend lint/typecheck, 15 files/87 tests и Vite
+production build прошли; baseline `scripts/build.sh` прошёл целиком, а для
+финального focus-only release все gates повторены отдельно и clean detached
+worktree выполнил `npm ci`/Vite/PAM Go build. Production binary
+собран с tags `production,pam`. На текущем amd64 host (2026-08-21)
+catalog `websetupmanager.service` enabled/active от Linux-пользователя `user` и
+слушает `https://microb.int:443`. Live direct-TLS проверка зафиксировала
+health/ready 200 и отсутствие listener на port 80. Установлена release
+`/opt/websetupmanager/releases/12aa6a2adf3c` из commit
+`12aa6a2adf3c9908a2120c03ed310aa40ac1fecc`; SHA-256 binary:
+`ee2f2afe0e0f3cf50ca79a57a36d94c4f1cbd971ea85474b599e11dd7bd9872a`.
+Remote login использует PAM account `user` и текущий системный Linux password;
+его значение нельзя записывать в этот документ, env или командную строку.
+Optional Bearer в production env не задан.
 Текущий certificate self-signed с SAN `microb.int` и `10.0.1.136`; его доверие
 на управляемом browser/client остаётся отдельным deployment действием.
 
-Это evidence можно переиспользовать как auth foundation, но новую версию нельзя
-назвать qualified, пока не пройдут catalog schema/API/storage/frontend tests,
-live upload в `/home/user/linuxcnc/nc_files`, QtDragon visibility без изменения
-loaded program и no-data-loss migration/rollback drill.
+Headless Firefox ESR через WebDriver BiDi прошёл production HTTPS guest/login,
+PAM session, ready/catalog/UI и logout. Desktop `1366x768` и mobile `390x844`
+screenshots находятся в `/tmp/wsm-catalog-evidence.ZSP7Ft`. Первый run выявил
+нулевую высоту code viewport; release commit
+`18411e613b380c4b73837003b96c949a21661041` заменил editor grid→flex, а повторный
+run визуально подтвердил подсвеченный G-code и tree. Desktop assert: 37 virtual
+rows, первая `%`, viewport `1030x516` для G-code 1.7 MiB.
+
+Следующий commit `12aa6a2adf3c9908a2120c03ed310aa40ac1fecc` исправил
+focus return до portal `autoFocus` и remount line-jump input. Сквозной test
+прошёл только keyboard events через login, tree, upload, preview search/line
+jump и logout; после установки release service снова active с `NRestarts=0`,
+`/healthz=200`, `/readyz=200` и guest PAM contract.
+
+Read-only QtDragon audit подтвердил running `g540.ini`, local
+`_CORVUS_FILE_MANAGER`, совпадающий `PROGRAM_PREFIX` и доступную его
+`QFileSystemModel` цепочку `linuxcnc/nc_files/Импортировано/adssad` со строками
+`1002.ngc` и `1003.ngc`. Вкладка File не открывалась и LinuxCNC selection не
+менялся; ручной screenshot скрытой вкладки остаётся только дополнительным
+operator walkthrough.
+
+Cold generation `/var/backups/websetupmanager/pre-catalog-20260821T145214Z`
+прошла проверку всех четырёх archive SHA-256 и полный extract/diff
+`RESTORE_CHECK_OK`. Live migration завершила schema v4 и catalog state:
+2 folders, 2 setups, 4 files, 2 completed mappings, 4 copied manifests;
+SQLite integrity/FK, exact source/target hashes/sizes, отсутствие temp remnants,
+сохранность legacy data и idempotent restart проверены. LinuxCNC snapshot не
+изменился: `file=""`, `state/mode/interp/exec=1/1/1/2`.
 
 До признания target qualification завершённой отдельно выполните:
 
 - arm64 runtime, если целевая архитектура arm64;
 - cold start/RSS/CPU/stream memory/10k-library/first-viewport measurements;
-- controlled-browser visual, keyboard, 10 GiB preview/search and malicious
-  PDF/HTML network/console walkthrough;
+- controlled 10 GiB preview/search performance и malicious PDF/HTML
+  network/console walkthrough;
 - trusted reverse-proxy variant, если он будет использоваться, и provisioning
   доверия к выбранному production certificate на browser clients;
 - полный controlled-browser PAM walkthrough, включая expiry/throttling и
   optional Bearer deployment только если automation credential будет включён;
-- cold backup/restore/upgrade drill на target filesystem;
+- повторный cold backup/restore drill перед следующей несовместимой migration;
 - SIGKILL/power-loss fault drill с последующей recovery-проверкой.
+
+## 12. Запись финального deployment evidence
+
+Зафиксированное evidence текущей generation:
+
+| Evidence | Результат 2026-08-21 |
+|---|---|
+| Release | `/opt/websetupmanager/releases/12aa6a2adf3c`; source `12aa6a2adf3c9908a2120c03ed310aa40ac1fecc`; SHA-256 `ee2f2afe0e0f3cf50ca79a57a36d94c4f1cbd971ea85474b599e11dd7bd9872a` |
+| Cold generation | `/var/backups/websetupmanager/pre-catalog-20260821T145214Z`; 4 archive hashes matched; full extract/diff `RESTORE_CHECK_OK` |
+| Deployment | enabled/active unit, `User=user`, direct HTTPS `10.0.1.136:443`; TCP/80 absent |
+| Migration | schema v4/completed; folders/setups/files/mappings/manifests `2/2/4/2/4`; exact source/target size+SHA; legacy unchanged; restart counts unchanged |
+| Runtime | `/healthz=200`, `/readyz=200`; SQLite `quick_check=ok`, FK violations 0; temp remnants absent |
+| Authentication | Linux/PAM account `user`, current system password (value never recorded); optional Bearer unset |
+| Browser | production Firefox BiDi guest/login/catalog/UI/logout; desktop 1366x768 and mobile 390x844 screenshots; 37 rows/`%`/1030x516 after grid→flex fix |
+| Screenshot SHA-256 | login desktop/mobile `fbf1e313ec372d6f87473860a8e87263c4682868e0357a4903426088d2087773` / `cdb6610b62b4c4bcd4812efa50d6ebf13e81a278cb8616ecc1cb259db368f0ae`; authenticated desktop/mobile `0b4c7f29b2761fb78fe0dedb7aac6d1a91bcfc99ab93f89ef5d797bf6c6c305d` / `d036fa0664c7be11ff074d7ca42a2074d4a20102a9a0b0669d97b8901cb04ebc` |
+| LinuxCNC | stat unchanged: `file=""`, `state/mode/interp/exec=1/1/1/2`; read-only Qt model shows `1002.ngc`/`1003.ngc` under the configured root; hidden-tab screenshot remains optional |
+| Remaining qualification | LAN client, DHCP reservation, controlled target/browser performance and manual visual QtDragon walkthrough; not part of current `CAT-AC-12` |

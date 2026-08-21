@@ -2,8 +2,8 @@
 
 Последнее обновление: 2026-08-21. Ветка: `codex/web-setup-manager`.
 
-Лог отделяет успешные автоматические проверки development environment от
-непроведённой target qualification. Статусы требований и точное evidence
+Лог отделяет успешные automated/production-host проверки от оставшейся
+внешней LAN/browser/QtDragon qualification. Статусы требований и точное evidence
 находятся в [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md).
 
 Важно: этапы 1–8 ниже относятся к superseded managed-library продукту. Они
@@ -34,11 +34,159 @@ evidence новой catalog-модели. Актуальные требован�
 - Зафиксированы config contract `PROGRAM_ROOT`/`LINUXCNC_INI`/display hint,
   каталоговые IDs/relative paths, singular file roles, direct atomic named
   publish и left-viewer/right-tree UX.
-- Backend direct-catalog storage/API и frontend compact tree/split переданы в
-  реализацию параллельно. На момент этой записи integrated tests, migration,
-  production build и deployment новой модели ещё не заявлены зелёными.
-- Существующие legacy objects, SQLite и production service не изменялись этим
-  документационным этапом.
+- Этап direction reset не изменял существующие legacy objects, SQLite и
+  production service; реализация catalog-модели продолжена отдельными этапами
+  ниже.
+
+## Этап 10 — catalog schema, domain и direct storage
+
+- Добавлена forward-only migration `003_catalog_workspace.sql`: folders,
+  setups, unique singular file roles, catalog operation journal, migration
+  state/mappings/file manifest и provenance key для migration-owned folders.
+- Реализованы устойчивые catalog IDs/revisions, неполные Setup, физическая
+  hierarchy, CRUD/move/delete и `0..1 program + 0..1 setup_sheet` без
+  validation/readiness/current workflow.
+- Новый `CatalogStore` удерживает `PROGRAM_ROOT` FD, разрешает операции beneath
+  root, запрещает traversal, `ngcgui_lib`, symlink, hardlink и special files.
+  Prepared folder/file publication использует exclusive hidden entry,
+  no-replace/atomic rename, identity/digest checks и parent `fsync`.
+- Automated evidence прошло в catalog storage/service suites: publish,
+  replacement commit/rollback, post-publish substitution, move/quarantine,
+  external sentinel, traversal, symlink/hardlink/FIFO/reserved tree, root path
+  replacement и prepared-folder callback failure.
+
+## Этап 11 — catalog API, preconditions и recovery
+
+- Публичный production surface ограничен `/api/v1/catalog`; legacy setup,
+  validation/current/jobs API не монтируется. DTO возвращают только opaque IDs,
+  `relativePath` и configured `rootDisplay`, без absolute root/storage key/
+  physical identity.
+- Component create требует ровно `If-None-Match: *`; replace/delete — ровно один
+  exact quoted lowercase 64-hex `If-Match`. Все filesystem mutations также
+  связаны expected revision, idempotency claim и durable catalog journal.
+- Startup до listener выполняет legacy operation/import recovery, legacy
+  content inspection, catalog operation recovery и затем migration. Любая
+  ошибка или persisted `manual_review` блокирует startup.
+- Automated HTTP evidence: CRUD/direct placement, nullable root moves,
+  Range/ETag replacement, sanitized HTML, filename decoding/traversal,
+  catalog-only production routes, idempotent create/stable conflicts и
+  unknown-length upload.
+- Recovery evidence покрывает `intent`, `storage_applied`, `db_applied`,
+  prepared folder, uncommitted delete, substituted targets и special/symlink
+  journal entries. Отдельный subprocess действительно получает `SIGKILL` после
+  filesystem publication; restart убирает uncommitted target и допускает
+  безопасный retry с тем же key.
+- Sparse 10 GiB fixture проверяет 64-bit metadata и bounded tail Range без
+  выделения 10 GiB реального пространства или полного чтения файла.
+
+## Этап 12 — idempotent no-data-loss migration
+
+- Startup migrator преобразует legacy Setup с 0/1/N программами соответственно
+  в один incomplete/один/несколько catalog Setup; общая sheet fan-out копируется
+  для каждого однозначного target.
+- Legacy rows/objects не изменяются. Каждая target file получает manifest с
+  source artifact/object provenance, role, relative target, size/SHA-256 и
+  catalog file ID; migration-owned folders получают unique source key.
+- При resume общего `pending`/`running` run уже `completed` per-source mapping
+  повторно проверяет manifest cardinality, source IDs/digest/size, catalog
+  linkage/version/physical identity. Общий terminal `completed` затем является
+  no-op. Same-name folder без ожидаемой provenance не усваивается; collision или
+  неоднозначность фиксируется как `manual_review` и fail-closed блокирует listener.
+- Automated migration suites прошли для 0/1/N split, sheet fan-out, restart,
+  completed provenance, logical/physical collision и unowned same-name folder.
+- Migration 004 сохраняет checksum v3 и backfill-ит setup source key только из
+  единственной exact same-library mapping с совпавшим legacy setup ID;
+  inconsistent/orphan/ambiguous linkage транзакционно fail-closed. Populated
+  v3→v4 reopen/resume после истечения idempotency TTL покрыт integration test.
+- Live schema v4 migration завершилась: 2 folders, 2 setups, 4 files,
+  2 completed mappings и 4 copied manifests. Source/target sizes и SHA-256
+  совпали, legacy rows/objects не удалены; повторный restart сохранил counts.
+
+## Этап 13 — compact catalog frontend
+
+- Основной Workbench заменён на compact left-viewer/right-explorer layout с
+  tabs/breadcrumbs/statusbar, resizable divider и mobile drawer. Tree имеет
+  folder/setup hierarchy, selection, filtering и roving keyboard navigation.
+- Dialogs поддерживают folder/setup CRUD, destination preview, создание
+  incomplete Setup и add/replace/delete одного program/sheet. После upload
+  показывается persistent operator-facing location; retryable ambiguous error
+  сохраняет idempotency key.
+- G-code Range/Worker/virtualization/search и PDF canvas viewer переиспользованы
+  через catalog content URLs. Sanitized HTML сначала fetch-ится trusted SPA,
+  затем показывается как revocable Blob URL в iframe с пустым sandbox и opaque
+  origin.
+- Frontend lint/typecheck прошли; Vitest — 15 files / 87 tests, включая App/Workbench,
+  catalog API/dialog/tree, authentication и viewers; Vite production build
+  прошёл. Production desktop/mobile screenshots записаны на этапе 14; сквозной
+  keyboard-only flow и найденные им focus-регрессии закрыты на этапе 15.
+
+## Этап 14 — production cutover и проверка generation
+
+- Перед cutover создана cold generation
+  `/var/backups/websetupmanager/pre-catalog-20260821T145214Z`. Все четыре
+  archives прошли сверку записанных SHA-256; полный extract/diff завершился
+  `RESTORE_CHECK_OK`.
+- Установлен versioned release
+  `/opt/websetupmanager/releases/18411e613b380c4b` из source commit
+  `18411e613b380c4b73837003b96c949a21661041`; binary SHA-256
+  `8b3b758d248f2bdb0270cf06215d9e944542b83b3fc8fd1da972d79da84be3cf`.
+  Full Go/PAM/race/vet/build и frontend lint/typecheck/15 files / 84 tests/Vite
+  gates прошли.
+- `websetupmanager.service` enabled/active от `user`, direct HTTPS listener —
+  `10.0.1.136:443`; port 80 не слушается. `/healthz` и `/readyz` вернули 200.
+  PAM account — `user`, используется текущий системный Linux password, который
+  не записывается; optional Bearer не задан.
+- SQLite: `quick_check=ok`, foreign-key violations 0, catalog state completed.
+  Exact source/target hash и size verification прошла; temp remnants нет;
+  legacy data сохранены. Restart idempotent и не изменил 2/2/4/2/4 counts.
+- LinuxCNC stat до/после остался `file=""`,
+  `state/mode/interp/exec=1/1/1/2`: WSM не загружал и не запускал программу.
+- Production HTTPS проверен headless Firefox ESR/WebDriver BiDi: guest, PAM
+  login `user`, ready/catalog/UI и logout прошли. Записаны desktop `1366x768` и
+  mobile `390x844` screenshots в `/tmp/wsm-catalog-evidence.ZSP7Ft`.
+- Первый visual run обнаружил G-code viewport 0 px. Commit
+  `18411e613b380c4b73837003b96c949a21661041` заменил catalog editor grid→flex;
+  после redeploy/rerun видны подсвеченный G-code и tree. Authenticated desktop
+  assert: 37 virtual rows, первая `%`, viewport `1030x516` для файла 1.7 MiB.
+- Screenshot SHA-256 login desktop/mobile:
+  `fbf1e313ec372d6f87473860a8e87263c4682868e0357a4903426088d2087773` /
+  `cdb6610b62b4c4bcd4812efa50d6ebf13e81a278cb8616ecc1cb259db368f0ae`;
+  authenticated desktop/mobile:
+  `0b4c7f29b2761fb78fe0dedb7aac6d1a91bcfc99ab93f89ef5d797bf6c6c305d` /
+  `d036fa0664c7be11ff074d7ca42a2074d4a20102a9a0b0669d97b8901cb04ebc`.
+- На момент первого cutover внешними оставались отдельный LAN client, DHCP
+  reservation, полный keyboard-only flow, controlled 10 GiB browser perf и
+  ручной QtDragon inspection. Keyboard flow закрыт следующим этапом.
+
+## Этап 15 — keyboard acceptance, QtDragon audit и focus release
+
+- Один App integration scenario прошёл только keyboard events через PAM login
+  view, roving catalog tree, upload dialog/file choice, G-code preview literal
+  search, line jump и UI logout. Вместе с tree/modal/viewer component suites это
+  закрывает `CAT-P0-020` и `CAT-AC-11`; frontend итог — 15 files / 87 tests.
+- Тест обнаружил две реальные регрессии. `Modal` фиксировал инициатор после
+  portal child `autoFocus` и возвращал focus в удалённый node; теперь инициатор
+  запоминается до commit, а fallback идёт в `#catalog-editor`. Line-jump input
+  имел изменяющийся React key и remount после Enter; теперь это controlled input
+  без потери focus.
+- Commit `12aa6a2adf3c9908a2120c03ed310aa40ac1fecc` прошёл frontend
+  lint/typecheck/87 tests/build, обычные и PAM-tagged Go test/vet, PAM race
+  (`internal/service` 83.571 s), `gofmt` и `go mod tidy -diff`.
+- Clean production binary Go 1.26.5/cgo/`production,pam`, 14,933,016 bytes,
+  SHA-256 `ee2f2afe0e0f3cf50ca79a57a36d94c4f1cbd971ea85474b599e11dd7bd9872a`
+  установлен как `/opt/websetupmanager/releases/12aa6a2adf3c`. Symlink switched
+  atomically; предыдущий release сохранён. Unit active от `user`, `NRestarts=0`,
+  direct 443; `/healthz` и `/readyz` вернули 200, guest session —
+  `authenticated=false`, `loginRequired=true`; TCP/80 по-прежнему закрыт.
+- Read-only audit работающего QtDragon подтвердил PID/INI/local
+  `_CORVUS_FILE_MANAGER`, exact `PROGRAM_PREFIX` и тем же `QFileSystemModel`
+  видимую цепочку `linuxcnc/nc_files/Импортировано/adssad` с читаемыми строками
+  `1002.ngc` и `1003.ngc`. Вкладка File не открывалась, input/selection не
+  отправлялись, LinuxCNC ничего не загрузил и не исполнил.
+- Все `CAT-P0-001`–`CAT-P0-024` и `CAT-AC-01`–`CAT-AC-12` имеют `V` в актуальной
+  матрице. LAN/DHCP, target-hardware performance и ручной screenshot скрытой
+  QtDragon File tab остаются дополнительной qualification, а не незакрытыми
+  текущими AC.
 
 ## Discovery и этап 1 — каркас приложения
 
@@ -204,11 +352,10 @@ evidence новой catalog-модели. Актуальные требован�
   `internal/service` завершился за 53.682 s. Полные PAM-tagged Go test/race/vet
   также прошли. Отдельный non-PAM remote binary ожидаемо завершился с exit 1 и
   stable `AUTHENTICATION_UNAVAILABLE`.
-- Frontend lint/typecheck прошли; Vitest — 12 files/83 tests; TypeScript/Vite
+- Frontend lint/typecheck прошли; Vitest — 15 files/87 tests; TypeScript/Vite
   production build прошёл. Полный `scripts/build.sh` и
   `CGO_ENABLED=1 -tags "production pam"` Go build прошли.
-- Build и установленный `/opt/websetupmanager/current/bin/websetupmanager`
-  совпадают: SHA-256
+- На этапе 8 build и установленный pre-catalog binary совпадали: SHA-256
   `5df67ec084ec30e0f253f6fd38f565adbe9e4eb8656edc180f3fa2454be8469d`;
   metadata подтверждает Go 1.26.5/cgo/`production,pam`, runtime — `libpam.so.0`.
 - `/etc/pam.d/websetupmanager` root-owned `0644`, env root-owned `0600`, TLS key
