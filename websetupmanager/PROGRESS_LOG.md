@@ -225,7 +225,19 @@ evidence новой catalog-модели. Актуальные требован�
   Sheet / mobile — `f83cedd4ab5b494717b45d5acf3724a520e65ffbcb9c11f0241edb08e08ef971` /
   `feadf0f6a31790df77376fb34657f533788242ef00d993caa48d38c76c6d536d` /
   `7ea399e3695d3922e71bd4170a14648a01f8de3c92f72e421fc1dd2acc9d0aa0`.
-  Deployment фиксируется отдельной release generation после feature commit.
+- Feature commit `266917d3ed04b3245f7e0f3461128a6d0d0bea0d` пересобран из
+  committed clean source; PAM binary SHA-256
+  `5d50c3b708eff7ba2262d3958d7caa9c533745d351a76de99d24d4c120cfc202`
+  установлен отдельной root-owned release
+  `/opt/websetupmanager/releases/266917d3ed04`. Symlink переключён атомарно,
+  предыдущая release сохранена. Service active от `user`, `NRestarts=0`, direct
+  443; port 80 закрыт, 8443 не изменён, health/ready 200, guest contract —
+  `authenticated=false`, `loginRequired=true`.
+- Post-deploy Firefox на `https://microb.int/` прошёл PAM login, catalog/G-code,
+  ready и logout; 37 rows, первая `%`, viewport `1030x625`. Evidence:
+  `/tmp/wsm-production-auth-refinement.OfbZwm`; authenticated desktop/mobile
+  SHA-256 `ec322875a2a8aceadd719cd61623ac76a6b71010949f9c91066c75d7edf6310b` /
+  `854acd9fe3036114e2b280cbd8f7cb64b99b584be0818d98a208484ee7ccbc0d`.
 
 ## Discovery и этап 1 — каркас приложения
 

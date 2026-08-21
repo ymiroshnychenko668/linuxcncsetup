@@ -50,9 +50,9 @@ walkthrough остаются дополнительной qualification. Точ�
 
 Production generation от 2026-08-21:
 
-- release `/opt/websetupmanager/releases/12aa6a2adf3c`, source commit
-  `12aa6a2adf3c9908a2120c03ed310aa40ac1fecc`, binary SHA-256
-  `ee2f2afe0e0f3cf50ca79a57a36d94c4f1cbd971ea85474b599e11dd7bd9872a`;
+- release `/opt/websetupmanager/releases/266917d3ed04`, source commit
+  `266917d3ed04b3245f7e0f3461128a6d0d0bea0d`, binary SHA-256
+  `5d50c3b708eff7ba2262d3958d7caa9c533745d351a76de99d24d4c120cfc202`;
 - cold backup `/var/backups/websetupmanager/pre-catalog-20260821T145214Z`;
   четыре archive checksum прошли сверку, полный extract/diff —
   `RESTORE_CHECK_OK`;
@@ -70,8 +70,12 @@ Production generation от 2026-08-21:
   `1030x516` на desktop `1366x768`; также проверен mobile `390x844`.
 - commit `12aa6a2adf3c9908a2120c03ed310aa40ac1fecc` исправил возврат focus
   после portal dialog и перехода к строке. Полный keyboard-only App flow и
-  87 frontend tests прошли; текущий release после restart снова отдал
+  87 frontend tests прошли; тот release после restart снова отдал
   `/healthz=200`, `/readyz=200` и guest PAM contract.
+- commit `266917d3ed04b3245f7e0f3461128a6d0d0bea0d` внедрил left-tree,
+  inline Sheet, direct picker и быстрый 64-КиБ prefix. Финальный production
+  Firefox прошёл PAM login, 37 virtual rows, desktop/mobile render и logout;
+  current release после restart имеет `NRestarts=0`, health/ready 200.
 - read-only QtDragon audit той же `QFileSystemModel` подтвердил доступную
   цепочку `linuxcnc/nc_files/Импортировано/adssad` и строки `1002.ngc`/
   `1003.ngc`; вкладка File и selection работающего LinuxCNC не изменялись.
@@ -161,7 +165,7 @@ Catalog-specific automated suites подтверждают folder/setup CRUD, si
 components, direct placement, exact file preconditions, Range/ETag, path/race
 protection, durable recovery, actual subprocess SIGKILL, sparse 10 GiB Range и
 0/1/N no-data-loss migration с provenance/manual-review. Frontend lint/typecheck,
-15 files / 87 tests и Vite production build прошли. Сквозной keyboard-only flow
+15 files / 103 tests и Vite production build прошли. Сквозной keyboard-only flow
 закрывает login/tree/upload/preview-search/line-jump/logout и focus return;
 production visual smoke дополнительно подтверждает layout. Controlled target
 performance остаётся отдельной qualification.
@@ -182,7 +186,7 @@ CGO_ENABLED=1 go vet -tags pam ./...
 CGO_ENABLED=1 go build -tags "production pam" ./cmd/websetupmanager
 ```
 
-Frontend lint и typecheck прошли; Vitest — 15 files/87 tests; Vite production
+Frontend lint и typecheck прошли; Vitest — 15 files/103 tests; Vite production
 build прошёл и встроен в Go binary. Полный `scripts/build.sh` также прошёл.
 Для финального focus-only release его шаги повторены отдельно; clean detached
 worktree выполнил `npm ci`, Vite build и production PAM Go build.
@@ -190,9 +194,9 @@ worktree выполнил `npm ci`, Vite build и production PAM Go build.
 `AUTHENTICATION_UNAVAILABLE`. Текущий amd64 artifact собран Go 1.26.5 с
 `CGO_ENABLED=1`, tags `production,pam`, использует системный `libpam.so.0` и
 имеет SHA-256
-`ee2f2afe0e0f3cf50ca79a57a36d94c4f1cbd971ea85474b599e11dd7bd9872a` и установлен
-как `/opt/websetupmanager/releases/12aa6a2adf3c` из source commit
-`12aa6a2adf3c9908a2120c03ed310aa40ac1fecc`.
+`5d50c3b708eff7ba2262d3958d7caa9c533745d351a76de99d24d4c120cfc202` и установлен
+как `/opt/websetupmanager/releases/266917d3ed04` из source commit
+`266917d3ed04b3245f7e0f3461128a6d0d0bea0d`.
 
 Catalog `websetupmanager.service` enabled/active от пользователя `user`, слушает
 `https://microb.int:443`, а `/healthz` и `/readyz` возвращают 200. Listener или

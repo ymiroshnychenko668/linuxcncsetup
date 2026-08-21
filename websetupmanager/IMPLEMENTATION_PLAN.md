@@ -71,9 +71,9 @@ browser не может выбрать другой каталог хоста.
 
 ## Фактическая production generation
 
-- Release: `/opt/websetupmanager/releases/12aa6a2adf3c`; source commit
-  `12aa6a2adf3c9908a2120c03ed310aa40ac1fecc`; SHA-256 binary
-  `ee2f2afe0e0f3cf50ca79a57a36d94c4f1cbd971ea85474b599e11dd7bd9872a`.
+- Release: `/opt/websetupmanager/releases/266917d3ed04`; source commit
+  `266917d3ed04b3245f7e0f3461128a6d0d0bea0d`; SHA-256 binary
+  `5d50c3b708eff7ba2262d3958d7caa9c533745d351a76de99d24d4c120cfc202`.
 - Cold generation:
   `/var/backups/websetupmanager/pre-catalog-20260821T145214Z`; все четыре archive
   проверены по записанным SHA-256, полный extract/diff завершился marker
@@ -101,6 +101,11 @@ browser не может выбрать другой каталог хоста.
   remount-ит spinbutton. Commit `12aa6a2adf3c9908a2120c03ed310aa40ac1fecc`
   прошёл 15 files / 87 tests, production build и установлен отдельным release;
   post-restart `/healthz`/`/readyz` и guest login contract снова вернули 200.
+- Refinement commit `266917d3ed04b3245f7e0f3461128a6d0d0bea0d` прошёл
+  15 files / 103 tests, Go PAM/race/vet, production build и disposable Firefox
+  visual smoke. После atomic release switch production PAM login/catalog/logout
+  снова прошли; 37 virtual rows, первая `%`, viewport `1030x625`, health/ready
+  200, `NRestarts=0`, TCP/80 отсутствует.
 - Read-only QtDragon audit подтвердил running `g540.ini`, local
   `_CORVUS_FILE_MANAGER`, тот же `PROGRAM_PREFIX` и точную видимую моделью
   цепочку `linuxcnc/nc_files/Импортировано/adssad` со строками `1002.ngc` и
@@ -111,6 +116,13 @@ browser не может выбрать другой каталог хоста.
   authenticated desktop/mobile —
   `0b4c7f29b2761fb78fe0dedb7aac6d1a91bcfc99ab93f89ef5d797bf6c6c305d` /
   `d036fa0664c7be11ff074d7ca42a2074d4a20102a9a0b0669d97b8901cb04ebc`.
+- Refinement evidence: local UI `/tmp/wsm-ui-evidence-csp.OedI4k` (program /
+  inline Sheet / mobile SHA-256 `f83cedd4ab5b494717b45d5acf3724a520e65ffbcb9c11f0241edb08e08ef971` /
+  `feadf0f6a31790df77376fb34657f533788242ef00d993caa48d38c76c6d536d` /
+  `7ea399e3695d3922e71bd4170a14648a01f8de3c92f72e421fc1dd2acc9d0aa0`);
+  production PAM `/tmp/wsm-production-auth-refinement.OfbZwm` authenticated
+  desktop/mobile SHA-256 `ec322875a2a8aceadd719cd61623ac76a6b71010949f9c91066c75d7edf6310b` /
+  `854acd9fe3036114e2b280cbd8f7cb64b99b584be0818d98a208484ee7ccbc0d`.
 - Отдельной target qualification, не входящей в текущие `CAT-AC`, остаются
   проверка с другого LAN client, DHCP reservation, controlled 10 GiB browser
   performance и ручной визуальный поиск файлов в QtDragon.
@@ -818,10 +830,10 @@ live evidence in `M-TLS`.
 - `CGO_ENABLED=1 go test -tags pam ./...` — passed;
 - `CGO_ENABLED=1 go test -race -tags pam ./...` — passed;
 - `CGO_ENABLED=1 go vet -tags pam ./...` — passed;
-- frontend lint/typecheck — passed; Vitest — 15 files/87 tests passed;
+- frontend lint/typecheck — passed; Vitest — 15 files/103 tests passed;
   TypeScript/Vite production build — passed;
-- полный `scripts/build.sh` baseline прошёл; финальный focus-only commit повторил
-  lint/typecheck/87 tests/build и все Go gates отдельно, а clean detached
+- полный `scripts/build.sh` baseline прошёл; refinement commit повторил
+  lint/typecheck/103 tests/build и все Go gates отдельно, а committed clean
   worktree — `npm ci` и production frontend/Go build;
 - `CGO_ENABLED=1 go build -tags "production pam"` — passed; installed amd64
   binary metadata фиксирует Go 1.26.5, `CGO_ENABLED=1`, tags `production,pam`, а
@@ -829,9 +841,9 @@ live evidence in `M-TLS`.
 - отдельная non-PAM remote-сборка завершилась fail-closed: exit 1 и stable
   `AUTHENTICATION_UNAVAILABLE`;
 - SHA-256 clean build и установленного catalog binary совпадает:
-  `ee2f2afe0e0f3cf50ca79a57a36d94c4f1cbd971ea85474b599e11dd7bd9872a`;
-  release `/opt/websetupmanager/releases/12aa6a2adf3c` from source commit
-  `12aa6a2adf3c9908a2120c03ed310aa40ac1fecc`;
+  `5d50c3b708eff7ba2262d3958d7caa9c533745d351a76de99d24d4c120cfc202`;
+  release `/opt/websetupmanager/releases/266917d3ed04` from source commit
+  `266917d3ed04b3245f7e0f3461128a6d0d0bea0d`;
 - `websetupmanager.service` — enabled/active, `User=user`, direct TLS listener
   `10.0.1.136:443`; live `/healthz` и `/readyz` — 200;
 - `M-TLS` — guest/API gate, normal PAM login/logout, hash-only remembered login
