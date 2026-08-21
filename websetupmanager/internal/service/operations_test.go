@@ -108,10 +108,13 @@ func TestPersistentJobsProgressCancellationAndTerminalStability(t *testing.T) {
 	}
 	started := make(chan struct{})
 	h.service.launchJob(job.ID, func(jobCtx context.Context, progress func(domain.JobProgress) error) (any, error) {
-		close(started)
 		if err := progress(domain.JobProgress{CompletedBytes: 25, TotalBytes: 100}); err != nil {
 			return nil, err
 		}
+		// Signal only after the durable progress update. Closing this channel
+		// before progress returned allowed the cancellation request to win the
+		// DB race and made the expected 25-byte checkpoint nondeterministic.
+		close(started)
 		<-jobCtx.Done()
 		return nil, jobCtx.Err()
 	})
