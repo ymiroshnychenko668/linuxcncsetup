@@ -14,10 +14,11 @@ interface Props {
 export function SetupSheetViewer({ setup, artifact, contentUrl, onClose, onReplace }: Props) {
   const surfaceRef = useRef<HTMLDivElement>(null)
   const [failed, setFailed] = useState(false)
-  const [htmlReady, setHTMLReady] = useState(false)
+  const [htmlDocument, setHTMLDocument] = useState<{ source: string; objectURL: string }>()
   const [htmlScale, setHTMLScale] = useState(1)
   const contentURL = contentUrl ?? `/api/v1/setups/${encodeURIComponent(setup.setupId)}/setup-sheet/content`
   const versionedContentURL = `${contentURL}?version=${encodeURIComponent(artifact.version)}`
+  const htmlReady = htmlDocument?.source === versionedContentURL
   const handleError = useCallback(() => setFailed(true), [])
   const requestFullscreen = useCallback(() => {
     void surfaceRef.current?.requestFullscreen?.()
@@ -25,34 +26,43 @@ export function SetupSheetViewer({ setup, artifact, contentUrl, onClose, onRepla
 
   useEffect(() => {
     setFailed(false)
-    setHTMLReady(false)
+    setHTMLDocument(undefined)
     setHTMLScale(1)
     if (artifact.mediaType === 'application/pdf') return
 
     const controller = new AbortController()
-    void fetch(contentURL, {
-      method: 'HEAD',
+    let objectURL: string | undefined
+    void fetch(versionedContentURL, {
+      method: 'GET',
       headers: {
         Accept: 'text/html',
         'If-Match': `"${artifact.version}"`,
       },
       credentials: 'same-origin',
       cache: 'no-store',
+      redirect: 'error',
+      referrerPolicy: 'no-referrer',
       signal: controller.signal,
-    }).then((response) => {
+    }).then(async (response) => {
       const contentType = response.headers.get('content-type')?.toLowerCase() ?? ''
       if (!response.ok
         || response.headers.get('etag') !== `"${artifact.version}"`
         || !contentType.startsWith('text/html')) {
         throw new Error('SETUP_SHEET_VERSION_MISMATCH')
       }
-      if (!controller.signal.aborted) setHTMLReady(true)
+      const sanitizedDocument = await response.blob()
+      if (controller.signal.aborted) return
+      objectURL = URL.createObjectURL(new Blob([sanitizedDocument], { type: 'text/html;charset=utf-8' }))
+      setHTMLDocument({ source: versionedContentURL, objectURL })
     }).catch((reason: unknown) => {
       if (controller.signal.aborted || (reason instanceof DOMException && reason.name === 'AbortError')) return
       setFailed(true)
     })
-    return () => controller.abort()
-  }, [artifact.mediaType, artifact.version, contentURL])
+    return () => {
+      controller.abort()
+      if (objectURL) URL.revokeObjectURL(objectURL)
+    }
+  }, [artifact.mediaType, artifact.version, versionedContentURL])
 
   return (
     <Modal
@@ -89,7 +99,7 @@ export function SetupSheetViewer({ setup, artifact, contentUrl, onClose, onRepla
                 <iframe
                   className="html-sheet-frame"
                   title={`Setup Sheet ${artifact.displayName}`}
-                  src={versionedContentURL}
+                  src={htmlDocument.objectURL}
                   sandbox=""
                   referrerPolicy="no-referrer"
                   onError={handleError}

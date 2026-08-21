@@ -18,29 +18,39 @@ const setup: Setup = {
 describe('SetupSheetViewer', () => {
   afterEach(() => vi.unstubAllGlobals())
 
-  it('preflights an exact version and streams it into a scriptless originless iframe', async () => {
+  it('fetches an exact sanitized version and opens a credentialless originless iframe', async () => {
     const close = vi.fn()
-    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(new Response(null, {
+    const createObjectURL = vi.fn(() => 'blob:https://microb.int/sanitized-sheet')
+    const revokeObjectURL = vi.fn()
+    vi.stubGlobal('URL', { createObjectURL, revokeObjectURL })
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(new Response(
+      '<!doctype html><meta http-equiv="Content-Security-Policy" content="default-src none"><p>Safe</p>', {
       status: 200, headers: { 'content-type': 'text/html; charset=utf-8', etag: `"${sheet.version}"` },
-    }))
+      },
+    ))
     vi.stubGlobal('fetch', fetchMock)
-    render(<SetupSheetViewer setup={setup} artifact={sheet} onClose={close} onReplace={vi.fn()} />)
+    const { unmount } = render(<SetupSheetViewer setup={setup} artifact={sheet} onClose={close} onReplace={vi.fn()} />)
     const frame = await screen.findByTitle('Setup Sheet instructions.html')
     const [requestURL, requestInit] = fetchMock.mock.calls[0]
-    expect(requestURL).toBe(`/api/v1/setups/${setup.setupId}/setup-sheet/content`)
-    expect(requestInit?.method).toBe('HEAD')
+    expect(requestURL).toBe(`/api/v1/setups/${setup.setupId}/setup-sheet/content?version=${sheet.version}`)
+    expect(requestInit?.method).toBe('GET')
     expect(requestInit?.credentials).toBe('same-origin')
     expect(requestInit?.cache).toBe('no-store')
+    expect(requestInit?.redirect).toBe('error')
+    expect(requestInit?.referrerPolicy).toBe('no-referrer')
     expect(new Headers(requestInit?.headers).get('If-Match')).toBe(`"${sheet.version}"`)
+    expect(createObjectURL).toHaveBeenCalledOnce()
     expect(frame).toHaveAttribute('sandbox', '')
     expect(frame).toHaveAttribute('referrerpolicy', 'no-referrer')
-    expect(frame).toHaveAttribute('src', `/api/v1/setups/${setup.setupId}/setup-sheet/content?version=${sheet.version}`)
+    expect(frame).toHaveAttribute('src', 'blob:https://microb.int/sanitized-sheet')
     expect(frame).not.toHaveAttribute('srcdoc')
     expect(screen.getByLabelText('Масштаб HTML Setup Sheet')).toHaveTextContent('100%')
     await userEvent.click(screen.getByRole('button', { name: 'Увеличить масштаб' }))
     expect(screen.getByLabelText('Масштаб HTML Setup Sheet')).toHaveTextContent('125%')
     await userEvent.click(screen.getByRole('button', { name: 'Закрыть' }))
     expect(close).toHaveBeenCalledOnce()
+    unmount()
+    expect(revokeObjectURL).toHaveBeenCalledWith('blob:https://microb.int/sanitized-sheet')
   })
 
   it('shows a replace action instead of rendering a stale or failed HTML response', async () => {
