@@ -23,15 +23,24 @@ const mocks = vi.hoisted(() => ({
   deleteCatalogComponent: vi.fn(),
 }))
 
+const previewMode = vi.hoisted(() => ({ real: false }))
+
 vi.mock('./api', async (loadOriginal) => ({
   ...await loadOriginal<typeof import('./api')>(),
   ...mocks,
   newIdempotencyKey: () => 'test-idempotency-key',
 }))
 
-vi.mock('./components/GCodePreview', () => ({
-  GCodePreview: ({ artifact, contentUrl }: { artifact: { displayName: string }; contentUrl: string }) => <div data-testid="gcode-preview">Preview: {artifact.displayName} · {contentUrl}</div>,
-}))
+vi.mock('./components/GCodePreview', async (loadOriginal) => {
+  const actual = await loadOriginal<typeof import('./components/GCodePreview')>()
+  const ActualGCodePreview = actual.GCodePreview
+  return {
+    ...actual,
+    GCodePreview: (props: Parameters<typeof ActualGCodePreview>[0]) => previewMode.real
+      ? <ActualGCodePreview {...props} />
+      : <div data-testid="gcode-preview">Preview: {props.artifact.displayName} · {props.contentUrl}</div>,
+  }
+})
 
 vi.mock('./components/SetupSheetViewer', () => ({
   SetupSheetViewer: ({ artifact, contentUrl, onClose }: { artifact: { displayName: string }; contentUrl: string; onClose: () => void }) => <div role="dialog" aria-label="Setup Sheet viewer"><span>{artifact.displayName} · {contentUrl}</span><button type="button" onClick={onClose}>Закрыть</button></div>,
@@ -67,6 +76,7 @@ const snapshot: CatalogSnapshot = {
 }
 
 beforeEach(() => {
+  previewMode.real = false
   Object.values(mocks).forEach((mock) => mock.mockReset())
   mocks.getAuthSession.mockResolvedValue({ authenticated: true, loginRequired: false, user: null, csrfToken: 'local-token' })
   mocks.login.mockResolvedValue({ authenticated: true, loginRequired: true, user: { username: 'operator' }, csrfToken: 'remote-token' })
@@ -95,6 +105,176 @@ beforeEach(() => {
 afterEach(() => vi.unstubAllGlobals())
 
 describe('catalog workbench', () => {
+  it('completes login, tree navigation, upload, preview search, line jump, and logout by keyboard', async () => {
+    previewMode.real = true
+    const user = userEvent.setup()
+    const gcode = new TextEncoder().encode('G0 X0\nG1 X10\nM3 S1000\nM30')
+
+    class PreviewWorker {
+      private listener?: (event: MessageEvent<unknown>) => void
+      addEventListener(_type: string, listener: EventListener) { this.listener = listener as (event: MessageEvent<unknown>) => void }
+      removeEventListener() { this.listener = undefined }
+      terminate() { this.listener = undefined }
+      postMessage(message: { type: string; requestId: string; query?: string }) {
+        if (message.type === 'index') {
+          queueMicrotask(() => this.listener?.({ data: {
+            type: 'indexResult', requestId: message.requestId, lineCount: 4,
+            entries: [{ line: 1, byteOffset: 0 }],
+          } } as MessageEvent<unknown>))
+        }
+        if (message.type === 'search') {
+          const lineNumbers = message.query === 'M30' ? Float64Array.from([4]) : new Float64Array()
+          queueMicrotask(() => this.listener?.({ data: {
+            type: 'searchResult', requestId: message.requestId, totalMatches: lineNumbers.length,
+            lineNumbers, matchOffset: 0, truncated: false,
+          } } as MessageEvent<unknown>))
+        }
+      }
+    }
+    vi.stubGlobal('Worker', PreviewWorker)
+    vi.stubGlobal('fetch', vi.fn().mockImplementation((_url: string, init?: RequestInit) => {
+      const headers = init?.headers as Record<string, string> | undefined
+      const match = /^bytes=(\d+)-(\d+)$/.exec(headers?.Range ?? '')
+      if (!match) throw new Error(`unexpected range ${headers?.Range}`)
+      const start = Number(match[1])
+      const end = Number(match[2])
+      return Promise.resolve(new Response(gcode.slice(start, end + 1), {
+        status: 206,
+        headers: { etag: headers?.['If-Match'] ?? '' },
+      }))
+    }))
+
+    const initialSetup: CatalogSetup = {
+      ...catalogSetup,
+      program: { ...catalogSetup.program!, byteSize: gcode.byteLength },
+    }
+    mocks.getAuthSession.mockResolvedValueOnce({ authenticated: false, loginRequired: true, user: null })
+    mocks.getCatalog.mockResolvedValue({ ...snapshot, setups: [initialSetup] })
+    const created: CatalogSetup = {
+      ...initialSetup,
+      setupId: 'keyboard-setup',
+      name: 'Keyboard Flow',
+      revision: 1,
+      program: null,
+      setupSheet: null,
+      programRelativePath: undefined,
+      setupSheetRelativePath: undefined,
+    }
+    const withProgram: CatalogSetup = {
+      ...created,
+      revision: 2,
+      program: {
+        ...catalogSetup.program!,
+        artifactId: 'keyboard-program',
+        displayName: 'keyboard.ngc',
+        byteSize: gcode.byteLength,
+        version: 'keyboard-version',
+        relativePath: 'Заказы/2026/keyboard.ngc',
+      },
+      programRelativePath: 'Заказы/2026/keyboard.ngc',
+    }
+    mocks.createCatalogSetup.mockResolvedValue(created)
+    mocks.putCatalogComponent.mockResolvedValue(withProgram)
+
+    render(<App />)
+
+    const username = await screen.findByRole('textbox', { name: 'Имя пользователя' })
+    expect(username).toHaveFocus()
+    await user.type(username, 'operator')
+    await user.tab()
+    const password = screen.getByLabelText('Пароль')
+    expect(password).toHaveFocus()
+    await user.type(password, 'system-secret')
+    await user.tab()
+    expect(screen.getByRole('checkbox', { name: /Запомнить меня/ })).toHaveFocus()
+    await user.tab()
+    const loginButton = screen.getByRole('button', { name: 'Открыть каталог сетапов' })
+    expect(loginButton).toHaveFocus()
+    await user.keyboard('{Enter}')
+
+    const editor = await screen.findByLabelText('Просмотр сетапа')
+    await waitFor(() => expect(editor).toHaveFocus())
+    const treeSetup = await screen.findByRole('treeitem', { name: /Кронштейн/ })
+    for (let step = 0; step < 40 && document.activeElement !== treeSetup; step += 1) await user.tab()
+    expect(treeSetup).toHaveFocus()
+    await user.keyboard('{ArrowLeft}')
+    expect(screen.getByRole('treeitem', { name: '2026' })).toHaveFocus()
+    await user.keyboard('{ArrowRight}{ArrowRight}{Enter}')
+    expect(treeSetup).toHaveFocus()
+    expect(treeSetup).toHaveAttribute('aria-selected', 'true')
+
+    await user.tab()
+    expect(document.body).toHaveFocus()
+    await user.tab()
+    expect(screen.getByRole('link', { name: 'К просмотру G-code' })).toHaveFocus()
+    await user.tab()
+    const uploadButton = screen.getByRole('button', { name: 'Загрузить' })
+    expect(uploadButton).toHaveFocus()
+    await user.keyboard('{Enter}')
+
+    const dialog = await screen.findByRole('dialog', { name: 'Загрузить сетап' })
+    expect(dialog).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Закрыть диалог' })).toHaveFocus()
+    await user.tab()
+    expect(screen.getByLabelText('Каталог LinuxCNC')).toHaveFocus()
+    await user.tab()
+    const setupName = screen.getByLabelText('Название сетапа')
+    expect(setupName).toHaveFocus()
+    await user.type(setupName, 'Keyboard Flow')
+    await user.tab()
+    expect(screen.getByLabelText(/Описание/)).toHaveFocus()
+    await user.tab()
+    const programInput = screen.getByLabelText('G-code программа')
+    expect(programInput).toHaveFocus()
+    const program = new File([gcode], 'keyboard.ngc', { type: 'text/plain' })
+    await user.upload(programInput, program)
+    await user.tab()
+    expect(screen.getByLabelText('Setup Sheet')).toHaveFocus()
+    await user.tab()
+    expect(screen.getByRole('button', { name: 'Отмена' })).toHaveFocus()
+    await user.tab()
+    const saveButton = screen.getByRole('button', { name: 'Создать и загрузить' })
+    expect(saveButton).toHaveFocus()
+    await user.keyboard('{Enter}')
+
+    await waitFor(() => expect(mocks.putCatalogComponent).toHaveBeenCalledWith(
+      expect.objectContaining({ setupId: 'keyboard-setup' }),
+      'program',
+      program,
+      'test-idempotency-key',
+      expect.any(Object),
+    ))
+    await waitFor(() => expect(uploadButton).toHaveFocus())
+    expect(await screen.findByRole('heading', { name: 'keyboard.ngc' })).toBeInTheDocument()
+    expect(screen.getByText('M30')).toBeInTheDocument()
+
+    const search = screen.getByRole('searchbox', { name: 'Поиск' })
+    for (let step = 0; step < 30 && document.activeElement !== search; step += 1) await user.tab()
+    expect(search).toHaveFocus()
+    await user.type(search, 'M30')
+    await user.keyboard('{Enter}')
+    expect(await screen.findByRole('button', { name: 'Совпадение 1, строка 4' })).toHaveAttribute('aria-current', 'true')
+
+    await user.tab({ shift: true })
+    expect(screen.getByRole('button', { name: 'Перейти' })).toHaveFocus()
+    await user.tab({ shift: true })
+    const line = screen.getByRole('spinbutton', { name: 'Строка' })
+    expect(line).toHaveFocus()
+    await user.clear(line)
+    await user.type(line, '2')
+    await user.keyboard('{Enter}')
+    await waitFor(() => expect(screen.getByRole('spinbutton', { name: 'Строка' })).toHaveValue(2))
+    expect(screen.getByRole('spinbutton', { name: 'Строка' })).toHaveFocus()
+
+    const logoutButton = screen.getByRole('button', { name: 'Выйти' })
+    for (let step = 0; step < 25 && document.activeElement !== logoutButton; step += 1) await user.tab({ shift: true })
+    expect(logoutButton).toHaveFocus()
+    await user.keyboard('{Enter}')
+    expect(await screen.findByRole('status')).toHaveTextContent('Вы вышли из Web Setup Manager')
+    expect(screen.getByRole('textbox', { name: 'Имя пользователя' })).toHaveFocus()
+    expect(mocks.logout).toHaveBeenCalledTimes(1)
+  }, 45_000)
+
   it('authenticates before loading the catalog and enters the compact workbench', async () => {
     mocks.getAuthSession.mockResolvedValueOnce({ authenticated: false, loginRequired: true, user: null })
     const user = userEvent.setup()

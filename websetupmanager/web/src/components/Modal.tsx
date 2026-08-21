@@ -51,6 +51,16 @@ export function Modal({
   const dialogRef = useRef<HTMLElement>(null)
   const onCloseRef = useRef(onClose)
   const closeDisabledRef = useRef(closeDisabled)
+  const previouslyFocusedRef = useRef<HTMLElement | null | undefined>(undefined)
+
+  // React applies a descendant's autoFocus during the commit before this
+  // component's effect runs. Capture the initiator while rendering so the
+  // portal cannot replace it before we remember where focus must return.
+  if (previouslyFocusedRef.current === undefined) {
+    previouslyFocusedRef.current = document.activeElement instanceof HTMLElement
+      ? document.activeElement
+      : null
+  }
 
   onCloseRef.current = onClose
   closeDisabledRef.current = closeDisabled
@@ -58,7 +68,7 @@ export function Modal({
   useEffect(() => {
     const explicitReturnTarget = returnFocusRef?.current
     const previouslyFocused = explicitReturnTarget
-      ?? (document.activeElement instanceof HTMLElement ? document.activeElement : null)
+      ?? previouslyFocusedRef.current
     const previousOverflow = document.body.style.overflow
     document.body.style.overflow = 'hidden'
 
@@ -128,7 +138,8 @@ export function Modal({
       // A successful mutation may legitimately replace the button that opened
       // the dialog. Never leave focus attached to the removed portal subtree;
       // return to the stable application landmark in that case.
-      const applicationMain = document.getElementById('main-content')
+      const applicationMain = document.getElementById('catalog-editor')
+        ?? document.getElementById('main-content')
       if (applicationMain instanceof HTMLElement && applicationMain.isConnected) {
         applicationMain.focus()
       }

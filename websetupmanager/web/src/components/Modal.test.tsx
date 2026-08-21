@@ -60,6 +60,44 @@ describe('Modal', () => {
     returnTarget.remove()
   })
 
+  it('captures the initiator before a portal child applies autoFocus', () => {
+    const trigger = document.createElement('button')
+    trigger.textContent = 'Загрузить'
+    document.body.appendChild(trigger)
+    trigger.focus()
+
+    const { unmount } = render(
+      <Modal title="Загрузить сетап" onClose={vi.fn()}>
+        <input aria-label="Название сетапа" autoFocus />
+      </Modal>,
+    )
+
+    expect(screen.getByRole('button', { name: 'Закрыть диалог' })).toHaveFocus()
+    unmount()
+    expect(trigger).toHaveFocus()
+    trigger.remove()
+  })
+
+  it('prefers the stable catalog editor when the initiating control was removed', () => {
+    const main = document.createElement('main')
+    main.id = 'main-content'
+    main.tabIndex = -1
+    const editor = document.createElement('section')
+    editor.id = 'catalog-editor'
+    editor.tabIndex = -1
+    const trigger = document.createElement('button')
+    main.append(editor, trigger)
+    document.body.appendChild(main)
+    trigger.focus()
+
+    const { unmount } = render(<Modal title="Загрузка" onClose={vi.fn()}><input autoFocus /></Modal>)
+    trigger.remove()
+    unmount()
+
+    expect(editor).toHaveFocus()
+    main.remove()
+  })
+
   it('returns focus to the application landmark when a mutation replaces its initiator', () => {
     const main = document.createElement('main')
     main.id = 'main-content'

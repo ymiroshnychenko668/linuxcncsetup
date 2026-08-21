@@ -145,6 +145,7 @@ export function GCodePreview({ setup, artifact, contentUrl, compact = false, onO
   const [entries, setEntries] = useState<SparseLineEntry[]>([{ line: 1, byteOffset: 0 }])
   const [lineCount, setLineCount] = useState(1)
   const [firstLine, setFirstLine] = useState(() => Math.max(1, Math.floor(initialLine)))
+  const [lineInput, setLineInput] = useState(() => String(Math.max(1, Math.floor(initialLine))))
   const [wrap, setWrap] = useState(false)
   const [indexProgress, setIndexProgress] = useState(0)
   const [error, setError] = useState<string>()
@@ -173,6 +174,10 @@ export function GCodePreview({ setup, artifact, contentUrl, compact = false, onO
     setFirstLine(restored)
     if (viewportRef.current) viewportRef.current.scrollTop = scrollTopForLine(restored, lineCount)
   }, [artifact.artifactId, initialLine, lineCount])
+
+  useEffect(() => {
+    setLineInput(String(Math.max(1, Math.floor(initialLine))))
+  }, [artifact.artifactId, initialLine])
 
   useEffect(() => {
     if (!viewportRef.current) return
@@ -300,6 +305,7 @@ export function GCodePreview({ setup, artifact, contentUrl, compact = false, onO
   const goToLine = useCallback((line: number) => {
     const safe = Math.max(1, Math.min(lineCount, Math.trunc(line)))
     setFirstLine(safe)
+    setLineInput(String(safe))
     onLineChanged?.(safe)
     if (viewportRef.current) viewportRef.current.scrollTop = scrollTopForLine(safe, lineCount)
   }, [lineCount, onLineChanged])
@@ -392,8 +398,8 @@ export function GCodePreview({ setup, artifact, contentUrl, compact = false, onO
       </div> : null}
       {artifact.byteSize === 0 ? <div className="preview-empty" role="status">Программа пуста.</div> : null}
       <div className="preview-tools">
-        <form onSubmit={(event) => { event.preventDefault(); const data = new FormData(event.currentTarget); goToLine(Number(data.get('line'))) }}>
-          <label>Строка <input key={`${artifact.artifactId}-${initialLine}`} name="line" type="number" min={1} max={lineCount} defaultValue={Math.max(1, Math.floor(initialLine))} /></label>
+        <form onSubmit={(event) => { event.preventDefault(); goToLine(Number(lineInput)) }}>
+          <label>Строка <input name="line" type="number" min={1} max={lineCount} value={lineInput} onChange={(event) => setLineInput(event.target.value)} /></label>
           <button type="submit" className="button button--quiet">Перейти</button>
         </form>
         <form role="search" onSubmit={submitSearch}>
