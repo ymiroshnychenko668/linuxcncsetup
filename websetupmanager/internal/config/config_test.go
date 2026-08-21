@@ -9,8 +9,10 @@ import (
 
 func validTestConfig() Config {
 	return Config{
-		LibraryDir: "/library", StateDir: "/state", ListenAddress: DefaultListenAddress,
-		LibraryAlias: "Setups", GCodeExtensions: []string{".ngc"}, RecentSetupsLimit: 30,
+		LibraryDir: "/library", StateDir: "/state", ProgramRoot: "/programs",
+		LinuxCNCINI: "/machine.ini", ProgramRootDisplay: DefaultProgramRootDisplay,
+		ListenAddress: DefaultListenAddress,
+		LibraryAlias:  "Setups", GCodeExtensions: []string{".ngc"}, RecentSetupsLimit: 30,
 		MaxParallelHeavyJobs: 2, ArtifactFileMode: 0o640, ShutdownTimeout: DefaultShutdownTimeout,
 		ReadHeaderTimeout: DefaultReadHeaderTimeout, ReadTimeout: DefaultReadTimeout,
 		IdleTimeout: DefaultIdleTimeout, MaxHeaderBytes: DefaultMaxHeaderBytes,
@@ -28,6 +30,8 @@ func TestLoadDefaultsAndNormalizesExtensions(t *testing.T) {
 	state := t.TempDir()
 	t.Setenv("WEB_SETUP_MANAGER_LIBRARY_DIR", library)
 	t.Setenv("WEB_SETUP_MANAGER_STATE_DIR", state)
+	t.Setenv("WEB_SETUP_MANAGER_PROGRAM_ROOT", filepath.Join(t.TempDir(), "programs"))
+	t.Setenv("WEB_SETUP_MANAGER_LINUXCNC_INI", filepath.Join(t.TempDir(), "machine.ini"))
 	t.Setenv("WEB_SETUP_MANAGER_GCODE_EXTENSIONS", ".NGC, .tap")
 
 	configuration, err := Load()
@@ -134,6 +138,36 @@ func TestValidateCanonicalizesNumericListenPort(t *testing.T) {
 	}
 	if configuration.ListenAddress != "127.0.0.1:80" {
 		t.Fatalf("canonical listen address = %q", configuration.ListenAddress)
+	}
+}
+
+func TestValidateRejectsPhysicalProgramRootDisplay(t *testing.T) {
+	for _, display := range []string{
+		"/home/operator/linuxcnc/nc_files",
+		`C:\\LinuxCNC\\nc_files`,
+		`\\\\server\\share`,
+		"//server/share",
+		"file://machine/programs",
+		"../programs",
+		"LinuxCNC\nprograms",
+	} {
+		t.Run(display, func(t *testing.T) {
+			configuration := validTestConfig()
+			configuration.ProgramRootDisplay = display
+			if err := configuration.Validate(); err == nil {
+				t.Fatalf("physical/unsafe public display %q was accepted", display)
+			}
+		})
+	}
+
+	for _, display := range []string{"~/linuxcnc/nc_files", "Программы LinuxCNC", "User/programs"} {
+		t.Run("safe-"+display, func(t *testing.T) {
+			configuration := validTestConfig()
+			configuration.ProgramRootDisplay = display
+			if err := configuration.Validate(); err != nil {
+				t.Fatalf("safe public display %q rejected: %v", display, err)
+			}
+		})
 	}
 }
 

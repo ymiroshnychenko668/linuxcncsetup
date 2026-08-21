@@ -35,15 +35,19 @@ const (
 	DefaultLoginWindow         = 10 * time.Minute
 	DefaultAuthSessionCapacity = 128
 	DefaultPAMService          = "websetupmanager"
+	DefaultProgramRootDisplay  = "~/linuxcnc/nc_files"
 )
 
-var defaultGCodeExtensions = []string{".gcode", ".nc", ".ngc", ".tap", ".cnc"}
+var defaultGCodeExtensions = []string{".ngc", ".nc", ".tap"}
 
 // Config contains only startup-controlled settings. Physical storage settings
 // are never writable through the public HTTP API.
 type Config struct {
 	LibraryDir                string
 	StateDir                  string
+	ProgramRoot               string
+	LinuxCNCINI               string
+	ProgramRootDisplay        string
 	ListenAddress             string
 	LibraryAlias              string
 	GCodeExtensions           []string
@@ -87,6 +91,9 @@ func Load() (Config, error) {
 	c := Config{
 		LibraryDir:            strings.TrimSpace(os.Getenv("WEB_SETUP_MANAGER_LIBRARY_DIR")),
 		StateDir:              envOr("WEB_SETUP_MANAGER_STATE_DIR", stateDir),
+		ProgramRoot:           strings.TrimSpace(os.Getenv("WEB_SETUP_MANAGER_PROGRAM_ROOT")),
+		LinuxCNCINI:           strings.TrimSpace(os.Getenv("WEB_SETUP_MANAGER_LINUXCNC_INI")),
+		ProgramRootDisplay:    envOr("WEB_SETUP_MANAGER_PROGRAM_ROOT_DISPLAY", DefaultProgramRootDisplay),
 		ListenAddress:         envOr("WEB_SETUP_MANAGER_LISTEN_ADDRESS", DefaultListenAddress),
 		LibraryAlias:          envOr("WEB_SETUP_MANAGER_LIBRARY_ALIAS", DefaultLibraryAlias),
 		GCodeExtensions:       append([]string(nil), defaultGCodeExtensions...),
@@ -183,13 +190,23 @@ func (c *Config) Validate() error {
 	if c.LibraryDir == "" {
 		return errors.New("WEB_SETUP_MANAGER_LIBRARY_DIR is required")
 	}
-	for name, value := range map[string]string{
-		"WEB_SETUP_MANAGER_LIBRARY_DIR": c.LibraryDir,
-		"WEB_SETUP_MANAGER_STATE_DIR":   c.StateDir,
+	for _, item := range []struct{ name, value string }{
+		{"WEB_SETUP_MANAGER_LIBRARY_DIR", c.LibraryDir},
+		{"WEB_SETUP_MANAGER_STATE_DIR", c.StateDir},
+		{"WEB_SETUP_MANAGER_PROGRAM_ROOT", c.ProgramRoot},
+		{"WEB_SETUP_MANAGER_LINUXCNC_INI", c.LinuxCNCINI},
 	} {
+		name, value := item.name, item.value
+		if value == "" {
+			return fmt.Errorf("%s is required", name)
+		}
 		if !filepath.IsAbs(value) {
 			return fmt.Errorf("%s must be absolute", name)
 		}
+	}
+	c.ProgramRootDisplay = strings.TrimSpace(c.ProgramRootDisplay)
+	if !validPublicRootDisplay(c.ProgramRootDisplay) {
+		return errors.New("WEB_SETUP_MANAGER_PROGRAM_ROOT_DISPLAY must be a safe relative display hint of 1-200 characters")
 	}
 	if strings.TrimSpace(c.LibraryAlias) == "" || len([]rune(c.LibraryAlias)) > 100 {
 		return errors.New("WEB_SETUP_MANAGER_LIBRARY_ALIAS must contain 1-100 characters")
@@ -298,7 +315,17 @@ func (c *Config) ValidateRoots() error {
 	if err != nil {
 		return errors.New("state directory is unavailable")
 	}
-	for label, directory := range map[string]string{"library": library, "state": state} {
+	program := ""
+	if c.ProgramRoot != "" {
+		program, err = canonicalDirectory(c.ProgramRoot)
+		if err != nil {
+			return errors.New("LinuxCNC program root is unavailable")
+		}
+	}
+	for label, directory := range map[string]string{"library": library, "state": state, "program root": program} {
+		if directory == "" {
+			continue
+		}
 		info, statErr := os.Stat(directory)
 		if statErr != nil || info.Mode().Perm()&0o022 != 0 {
 			return fmt.Errorf("%s directory permissions are unsafe", label)
@@ -307,14 +334,23 @@ func (c *Config) ValidateRoots() error {
 	if pathsOverlap(library, state) {
 		return errors.New("library and state directories must be disjoint")
 	}
+	if program != "" && (pathsOverlap(program, state) || pathsOverlap(program, library)) {
+		return errors.New("program root, library and state directories must be disjoint")
+	}
 	c.LibraryDir = library
 	c.StateDir = state
+	c.ProgramRoot = program
 	return nil
 }
 
 // ValidateFiles checks optional TLS material without returning host paths in
 // errors. Storage contents are validated by the fd-relative storage package.
 func (c Config) ValidateFiles() error {
+	if c.LinuxCNCINI != "" {
+		if err := c.validateLinuxCNCINI(); err != nil {
+			return err
+		}
+	}
 	if c.TLSCertFile == "" {
 		return nil
 	}
@@ -352,6 +388,49 @@ func (c Config) ValidateFiles() error {
 		if statErr != nil || closeErr != nil || !openedInfo.Mode().IsRegular() || !os.SameFile(info, openedInfo) {
 			return fmt.Errorf("%s changed during validation", name)
 		}
+	}
+	return nil
+}
+
+// validateLinuxCNCINI binds the writable catalog to the active machine's
+// PROGRAM_PREFIX. It never returns either host path in an error.
+func (c Config) validateLinuxCNCINI() error {
+	if !filepath.IsAbs(c.LinuxCNCINI) || c.ProgramRoot == "" {
+		return errors.New("LinuxCNC INI configuration is invalid")
+	}
+	contents, err := readSafeLinuxCNCINI(c.LinuxCNCINI, 8<<20)
+	if err != nil {
+		return errors.New("LinuxCNC INI is unavailable")
+	}
+	prefix := ""
+	section := ""
+	for _, raw := range strings.Split(string(contents), "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
+			continue
+		}
+		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
+			section = strings.ToUpper(strings.TrimSpace(line[1 : len(line)-1]))
+			continue
+		}
+		if section != "DISPLAY" {
+			continue
+		}
+		key, value, found := strings.Cut(line, "=")
+		if found && strings.EqualFold(strings.TrimSpace(key), "PROGRAM_PREFIX") {
+			prefix = strings.TrimSpace(value)
+			if comment := strings.IndexAny(prefix, "#;"); comment >= 0 {
+				prefix = strings.TrimSpace(prefix[:comment])
+			}
+			break
+		}
+	}
+	if prefix == "" || !filepath.IsAbs(prefix) {
+		return errors.New("LinuxCNC INI has no absolute DISPLAY PROGRAM_PREFIX")
+	}
+	resolved, err := canonicalDirectory(prefix)
+	if err != nil || resolved != c.ProgramRoot {
+		return errors.New("LinuxCNC PROGRAM_PREFIX does not match the configured program root")
 	}
 	return nil
 }
@@ -397,6 +476,34 @@ func validExtension(value string) bool {
 			if character < '0' || character > '9' {
 				return false
 			}
+		}
+	}
+	return true
+}
+
+// validPublicRootDisplay accepts only an operator-facing relative hint. The
+// value is returned by the public API, so an absolute Unix/Windows path, UNC
+// authority or URI must fail closed even when supplied accidentally by an
+// administrator. A leading "~/" is intentionally allowed for the documented
+// LinuxCNC user-folder notation; it is display text and is never resolved.
+func validPublicRootDisplay(value string) bool {
+	if value == "" || len([]rune(value)) > 200 || filepath.IsAbs(value) ||
+		strings.HasPrefix(value, "//") || strings.HasPrefix(value, `\\`) ||
+		strings.Contains(value, `\`) || strings.Contains(value, "://") {
+		return false
+	}
+	if len(value) >= 2 && value[1] == ':' &&
+		(value[0] >= 'a' && value[0] <= 'z' || value[0] >= 'A' && value[0] <= 'Z') {
+		return false
+	}
+	for _, character := range value {
+		if character < 0x20 || character == 0x7f {
+			return false
+		}
+	}
+	for _, segment := range strings.Split(value, "/") {
+		if segment == "" || segment == "." || segment == ".." {
+			return false
 		}
 	}
 	return true
