@@ -1,18 +1,174 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"errors"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/ymiroshnychenko668/linuxcncsetup/websetupmanager/internal/auth"
 	"github.com/ymiroshnychenko668/linuxcncsetup/websetupmanager/internal/config"
 	"github.com/ymiroshnychenko668/linuxcncsetup/websetupmanager/internal/database"
 )
+
+func TestComposeReadinessRunsInOrderAndPropagatesFirstFailure(t *testing.T) {
+	type contextKey string
+	ctx := context.WithValue(context.Background(), contextKey("probe"), "same-context")
+	wantErr := errors.New("catalog root unavailable")
+	calls := make([]string, 0, 3)
+	check := func(name string, result error) func(context.Context) error {
+		return func(received context.Context) error {
+			if received.Value(contextKey("probe")) != "same-context" {
+				t.Fatal("readiness check did not receive the caller context")
+			}
+			calls = append(calls, name)
+			return result
+		}
+	}
+	probe := composeReadiness(
+		check("legacy-roots", nil),
+		check("catalog-root", wantErr),
+		check("active-ini", nil),
+	)
+	if err := probe.Check(ctx); !errors.Is(err, wantErr) {
+		t.Fatalf("readiness error = %v, want %v", err, wantErr)
+	}
+	if got := strings.Join(calls, ","); got != "legacy-roots,catalog-root" {
+		t.Fatalf("readiness order = %q", got)
+	}
+}
+
+func TestComposeReadinessSucceedsOnlyAfterEveryDependency(t *testing.T) {
+	calls := 0
+	probe := composeReadiness(
+		func(context.Context) error { calls++; return nil },
+		func(context.Context) error { calls++; return nil },
+		func(context.Context) error { calls++; return nil },
+	)
+	if err := probe.Check(context.Background()); err != nil {
+		t.Fatalf("readiness = %v", err)
+	}
+	if calls != 3 {
+		t.Fatalf("readiness checks = %d, want 3", calls)
+	}
+}
+
+func TestComposeReadinessFailsClosedForCancellationAndMissingDependency(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	calls := 0
+	probe := composeReadiness(func(context.Context) error { calls++; return nil })
+	if err := probe.Check(ctx); !errors.Is(err, context.Canceled) || calls != 0 {
+		t.Fatalf("cancelled readiness = %v, calls = %d", err, calls)
+	}
+
+	probe = composeReadiness(nil)
+	if err := probe.Check(context.Background()); err == nil {
+		t.Fatal("missing readiness dependency was accepted")
+	}
+	probe = composeReadiness()
+	if err := probe.Check(context.Background()); err == nil {
+		t.Fatal("empty readiness dependency list was accepted")
+	}
+}
+
+func TestRecoverBeforeListenUsesSafeFixedOrder(t *testing.T) {
+	type contextKey string
+	ctx := context.WithValue(context.Background(), contextKey("startup"), "same-context")
+	calls := make([]string, 0, 5)
+	step := func(name string) func(context.Context) error {
+		return func(received context.Context) error {
+			if received.Value(contextKey("startup")) != "same-context" {
+				t.Fatal("startup step did not receive the caller context")
+			}
+			calls = append(calls, name)
+			return nil
+		}
+	}
+	err := recoverBeforeListen(ctx, startupRecoveryDependencies{
+		recoverLegacyOperations:  step("legacy-operations"),
+		recoverLegacyImports:     step("legacy-imports"),
+		inspectLegacyContent:     step("legacy-inspection"),
+		recoverCatalogOperations: step("catalog-operations"),
+		migrateLegacyCatalog:     step("catalog-migration"),
+	})
+	if err != nil {
+		t.Fatalf("startup recovery = %v", err)
+	}
+	if got := strings.Join(calls, ","); got != "legacy-operations,legacy-imports,legacy-inspection,catalog-operations,catalog-migration" {
+		t.Fatalf("startup recovery order = %q", got)
+	}
+}
+
+func TestRecoverBeforeListenStopsAtFirstFailure(t *testing.T) {
+	wantErr := errors.New("catalog journal is inconsistent")
+	calls := make([]string, 0, 5)
+	step := func(name string, result error) func(context.Context) error {
+		return func(context.Context) error {
+			calls = append(calls, name)
+			return result
+		}
+	}
+	err := recoverBeforeListen(context.Background(), startupRecoveryDependencies{
+		recoverLegacyOperations:  step("legacy-operations", nil),
+		recoverLegacyImports:     step("legacy-imports", nil),
+		inspectLegacyContent:     step("legacy-inspection", nil),
+		recoverCatalogOperations: step("catalog-operations", wantErr),
+		migrateLegacyCatalog:     step("catalog-migration", nil),
+	})
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("startup recovery error = %v, want %v", err, wantErr)
+	}
+	if got := strings.Join(calls, ","); got != "legacy-operations,legacy-imports,legacy-inspection,catalog-operations" {
+		t.Fatalf("startup recovery after failure = %q", got)
+	}
+}
+
+func TestRecoverBeforeListenPropagatesMigrationFailure(t *testing.T) {
+	wantErr := errors.New("legacy entries require manual review")
+	completed := 0
+	success := func(context.Context) error { completed++; return nil }
+	err := recoverBeforeListen(context.Background(), startupRecoveryDependencies{
+		recoverLegacyOperations:  success,
+		recoverLegacyImports:     success,
+		inspectLegacyContent:     success,
+		recoverCatalogOperations: success,
+		migrateLegacyCatalog: func(context.Context) error {
+			completed++
+			return wantErr
+		},
+	})
+	if !errors.Is(err, wantErr) || completed != 5 {
+		t.Fatalf("migration failure = %v, completed steps = %d", err, completed)
+	}
+}
+
+func TestRecoverBeforeListenFailsClosedForCancellationAndMissingStep(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	calls := 0
+	first := func(context.Context) error {
+		calls++
+		cancel()
+		return nil
+	}
+	err := recoverBeforeListen(ctx, startupRecoveryDependencies{
+		recoverLegacyOperations: first,
+		recoverLegacyImports:    func(context.Context) error { calls++; return nil },
+	})
+	if !errors.Is(err, context.Canceled) || calls != 1 {
+		t.Fatalf("cancelled startup recovery = %v, calls = %d", err, calls)
+	}
+
+	err = recoverBeforeListen(context.Background(), startupRecoveryDependencies{})
+	if err == nil {
+		t.Fatal("missing startup recovery step was accepted")
+	}
+}
 
 func TestNewWebServerAppliesResourceTimeouts(t *testing.T) {
 	settings := config.Config{

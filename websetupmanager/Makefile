@@ -49,7 +49,13 @@ vet:
 	CGO_ENABLED=1 $(GO) vet -tags pam ./...
 
 fmt-check:
-	@test -z "$$(rg --files -g '*.go' | xargs "$(GOFMT)" -l)"
+	@set -eu; \
+	if command -v rg >/dev/null 2>&1; then \
+		unformatted="$$(rg --files -g '*.go' | xargs "$(GOFMT)" -l)"; \
+	else \
+		unformatted="$$(find . -type f -name '*.go' -exec "$(GOFMT)" -l {} +)"; \
+	fi; \
+	test -z "$$unformatted" || { printf '%s\n' "$$unformatted"; exit 1; }
 
 quality: fmt-check vet test-backend test-pam test-race lint typecheck test-frontend build
 

@@ -115,8 +115,15 @@ func run(logger *slog.Logger) error {
 	if err := objects.CleanupStaging(); err != nil {
 		return errors.New("staging recovery failed")
 	}
+	catalog, err := storage.NewCatalogStore(settings.ProgramRoot, objects, settings.ArtifactFileMode)
+	if err != nil {
+		return errors.New("LinuxCNC program catalog initialization failed")
+	}
+	defer catalog.Close()
 	application, err := service.New(service.Options{
-		Database: db, Objects: objects, LibraryID: roots.LibraryID(),
+		Database: db, Objects: objects, Catalog: catalog, LibraryID: roots.LibraryID(),
+		CatalogRootLabel:          settings.LibraryAlias,
+		CatalogRootDisplay:        settings.ProgramRootDisplay,
 		GCodeExtensions:           settings.GCodeExtensions,
 		RequireSetupSheetForReady: settings.RequireSetupSheetForReady,
 		RecentLimit:               settings.RecentSetupsLimit,
@@ -131,24 +138,38 @@ func run(logger *slog.Logger) error {
 		return errors.New("setup service initialization failed")
 	}
 	defer application.Close()
-	_, recoverErr := application.RecoverOperations(signalContext)
-	if recoverErr == nil {
-		_, recoverErr = application.RecoverImports(signalContext)
-	}
-	if recoverErr == nil {
-		// Reconcile every durable reference before ready-state so a restart
-		// cannot briefly expose a missing or externally replaced artifact as
-		// ready/current until the periodic maintenance pass catches up.
-		_, recoverErr = application.InspectManagedContent(signalContext)
-	}
+	recoverErr := recoverBeforeListen(signalContext, startupRecoveryDependencies{
+		recoverLegacyOperations: func(ctx context.Context) error {
+			_, err := application.RecoverOperations(ctx)
+			return err
+		},
+		recoverLegacyImports: func(ctx context.Context) error {
+			_, err := application.RecoverImports(ctx)
+			return err
+		},
+		inspectLegacyContent: func(ctx context.Context) error {
+			// Every legacy reference is identity-checked before it can become a
+			// migration source. Missing/replaced bytes therefore cannot briefly
+			// appear as valid catalog content after a restart.
+			_, err := application.InspectManagedContent(ctx)
+			return err
+		},
+		recoverCatalogOperations: application.RecoverCatalogOperations,
+		migrateLegacyCatalog:     application.MigrateLegacyCatalog,
+	})
 	if recoverErr != nil {
-		return errors.New("setup operation recovery failed")
+		return newOperationalError("STATE_RECOVERY_FAILED", "durable setup state recovery or migration failed", recoverErr)
 	}
 
 	frontend, err := webassets.FS()
 	if err != nil {
 		return errors.New("embedded frontend initialization failed")
 	}
+	storageReadiness := composeReadiness(
+		func(context.Context) error { return roots.Check() },
+		func(context.Context) error { return catalog.Check() },
+		func(context.Context) error { return settings.ValidateFiles() },
+	)
 	handler, err := httpapi.NewWithServiceAuthenticated(httpapi.Config{
 		ListenAddress: settings.ListenAddress, LibraryID: roots.LibraryID(), LibraryAlias: settings.LibraryAlias,
 		GCodeExtensions: settings.GCodeExtensions, RequireSetupSheetForReady: settings.RequireSetupSheetForReady,
@@ -159,7 +180,11 @@ func run(logger *slog.Logger) error {
 		AuthRememberTimeout:      settings.AuthRememberTimeout,
 		AuthConcurrency:          settings.AuthConcurrency,
 		RemoteAuthToken:          settings.RemoteAuthToken,
-	}, httpapi.CheckFunc(db.Ping), httpapi.CheckFunc(func(context.Context) error { return roots.Check() }), application, frontend, authentication, logger)
+		// The old setup/validation API is intentionally unavailable in the
+		// production catalog application. It remains opt-in for compatibility
+		// tests and controlled offline migration tooling only.
+		EnableLegacyAPI: false,
+	}, httpapi.CheckFunc(db.Ping), storageReadiness, application, frontend, authentication, logger)
 	if err != nil {
 		return errors.New("HTTP application initialization failed")
 	}
@@ -217,6 +242,67 @@ func run(logger *slog.Logger) error {
 	logger.Info("service stopped", "operation", "shutdown", "duration_ms", time.Since(shutdownStarted).Milliseconds(),
 		"bytes", 0, "result", "succeeded", "error_code", "")
 	return serveErr
+}
+
+// composeReadiness returns one fail-closed readiness probe. Checks run in the
+// supplied order and the first failure is returned unchanged so callers can
+// preserve cancellation and dependency error identity. A missing check is a
+// configuration failure rather than an implicit success.
+func composeReadiness(checks ...func(context.Context) error) httpapi.CheckFunc {
+	return func(ctx context.Context) error {
+		if len(checks) == 0 {
+			return errors.New("readiness dependency is unavailable")
+		}
+		for _, check := range checks {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if check == nil {
+				return errors.New("readiness dependency is unavailable")
+			}
+			if err := check(ctx); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+}
+
+type startupRecoveryDependencies struct {
+	recoverLegacyOperations  func(context.Context) error
+	recoverLegacyImports     func(context.Context) error
+	inspectLegacyContent     func(context.Context) error
+	recoverCatalogOperations func(context.Context) error
+	migrateLegacyCatalog     func(context.Context) error
+}
+
+// recoverBeforeListen fixes every durable source and destination state before
+// migration, and finishes migration before the caller may create a listener.
+// The fixed ordering prevents migration from reading an interrupted legacy
+// object or writing into a catalog whose own journal has not been reconciled.
+func recoverBeforeListen(ctx context.Context, dependencies startupRecoveryDependencies) error {
+	steps := []struct {
+		name string
+		run  func(context.Context) error
+	}{
+		{name: "legacy operation recovery", run: dependencies.recoverLegacyOperations},
+		{name: "legacy import recovery", run: dependencies.recoverLegacyImports},
+		{name: "legacy content inspection", run: dependencies.inspectLegacyContent},
+		{name: "catalog operation recovery", run: dependencies.recoverCatalogOperations},
+		{name: "legacy catalog migration", run: dependencies.migrateLegacyCatalog},
+	}
+	for _, step := range steps {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if step.run == nil {
+			return errors.New("startup recovery dependency is unavailable")
+		}
+		if err := step.run(ctx); err != nil {
+			return fmt.Errorf("%s failed: %w", step.name, err)
+		}
+	}
+	return nil
 }
 
 func validateAuthenticationRuntime(settings config.Config) error {
