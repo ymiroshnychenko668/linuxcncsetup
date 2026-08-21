@@ -46,6 +46,18 @@ func TestLoadDefaultsAndNormalizesExtensions(t *testing.T) {
 	}
 }
 
+func TestValidateRejectsExecutableAndNonLinuxCNCExtensions(t *testing.T) {
+	for _, extension := range []string{".py", ".gcode", ".cnc", ".jpg"} {
+		t.Run(extension, func(t *testing.T) {
+			configuration := validTestConfig()
+			configuration.GCodeExtensions = []string{extension}
+			if err := configuration.Validate(); err == nil {
+				t.Fatalf("unsafe catalog extension %q was accepted", extension)
+			}
+		})
+	}
+}
+
 func TestValidateRejectsUnsafeRemoteAndExecutableMode(t *testing.T) {
 	valid := validTestConfig()
 
@@ -325,5 +337,33 @@ func TestValidateFilesRejectsWorldReadablePrivateKey(t *testing.T) {
 	}
 	if err := configuration.ValidateFiles(); err != nil {
 		t.Fatalf("group-readable private key rejected: %v", err)
+	}
+}
+
+func TestValidateFilesRejectsLinuxCNCINIAncestorSymlink(t *testing.T) {
+	root := t.TempDir()
+	program := filepath.Join(root, "programs")
+	realParent := filepath.Join(root, "machine")
+	if err := os.Mkdir(program, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(realParent, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	ini := filepath.Join(realParent, "machine.ini")
+	if err := os.WriteFile(ini, []byte("[DISPLAY]\nPROGRAM_PREFIX = "+program+"\n"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	direct := Config{LinuxCNCINI: ini, ProgramRoot: program}
+	if err := direct.ValidateFiles(); err != nil {
+		t.Fatalf("safe INI rejected: %v", err)
+	}
+	linkedParent := filepath.Join(root, "machine-link")
+	if err := os.Symlink(realParent, linkedParent); err != nil {
+		t.Fatal(err)
+	}
+	linked := Config{LinuxCNCINI: filepath.Join(linkedParent, "machine.ini"), ProgramRoot: program}
+	if err := linked.ValidateFiles(); err == nil || strings.Contains(err.Error(), root) {
+		t.Fatalf("ancestor symlink INI error = %v", err)
 	}
 }

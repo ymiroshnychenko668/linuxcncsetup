@@ -74,7 +74,14 @@ func (d *DB) RecoverInterrupted(ctx context.Context) (_ RecoveryResult, finalErr
 	result.IdempotencyClaims, err = execCount(ctx, tx, `
 		UPDATE idempotency_requests
 		   SET state = 'conflict', error_code = ?
-		 WHERE state = 'in_progress'`, interruptedErrorCode)
+		 WHERE state = 'in_progress'
+		   AND NOT EXISTS (
+		       SELECT 1 FROM catalog_operations operation
+		        WHERE operation.library_id = idempotency_requests.library_id
+		          AND operation.idempotency_key = idempotency_requests.key
+		          AND operation.request_hash = idempotency_requests.request_hash
+		          AND operation.state IN ('intent', 'storage_applied', 'db_applied')
+		   )`, interruptedErrorCode)
 	if err != nil {
 		return RecoveryResult{}, fmt.Errorf("recover idempotency requests: %w", err)
 	}

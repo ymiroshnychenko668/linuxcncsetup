@@ -54,6 +54,13 @@ func TestOpenMigratesFullInitialSchema(t *testing.T) {
 	want := []string{
 		"audit_events",
 		"auth_sessions",
+		"catalog_files",
+		"catalog_folders",
+		"catalog_legacy_file_manifest",
+		"catalog_legacy_migrations",
+		"catalog_operations",
+		"catalog_setups",
+		"catalog_state",
 		"current_setup",
 		"delete_confirmations",
 		"idempotency_requests",

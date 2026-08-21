@@ -36,6 +36,7 @@ const (
 	CodeValidationNotFound   ErrorCode = "VALIDATION_NOT_FOUND"
 	CodeConfirmationInvalid  ErrorCode = "CONFIRMATION_INVALID"
 	CodeInvalidRange         ErrorCode = "INVALID_RANGE"
+	CodePreconditionRequired ErrorCode = "PRECONDITION_REQUIRED"
 
 	CodeInvalidID       ErrorCode = "INVALID_ID"
 	CodeInvalidName     ErrorCode = "INVALID_NAME"

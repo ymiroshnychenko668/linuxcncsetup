@@ -40,6 +40,10 @@ const (
 
 var defaultGCodeExtensions = []string{".ngc", ".nc", ".tap"}
 
+var safeGCodeExtensions = map[string]struct{}{
+	".ngc": {}, ".nc": {}, ".tap": {},
+}
+
 // Config contains only startup-controlled settings. Physical storage settings
 // are never writable through the public HTTP API.
 type Config struct {
@@ -295,6 +299,9 @@ func (c *Config) Validate() error {
 		if !validExtension(extension) {
 			return errors.New("G-code extensions must be dot-prefixed ASCII alphanumeric values")
 		}
+		if _, safe := safeGCodeExtensions[extension]; !safe {
+			return errors.New("G-code extensions must be selected from .ngc, .nc and .tap")
+		}
 		if _, duplicate := seen[extension]; duplicate {
 			return errors.New("G-code extensions must be unique")
 		}
@@ -323,7 +330,12 @@ func (c *Config) ValidateRoots() error {
 			return errors.New("LinuxCNC program root is unavailable")
 		}
 	}
-	for label, directory := range map[string]string{"library": library, "state": state, "program root": program} {
+	for _, root := range []struct{ label, directory string }{
+		{label: "library", directory: library},
+		{label: "state", directory: state},
+		{label: "program root", directory: program},
+	} {
+		label, directory := root.label, root.directory
 		if directory == "" {
 			continue
 		}

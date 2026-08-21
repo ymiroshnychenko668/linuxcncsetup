@@ -31,10 +31,17 @@ const (
 	maximumSetupPageSize   = 200
 )
 
+var safeCatalogProgramExtensions = map[string]struct{}{
+	".ngc": {}, ".nc": {}, ".tap": {},
+}
+
 type Options struct {
 	Database                  *database.DB
 	Objects                   *storage.Store
+	Catalog                   *storage.CatalogStore
 	LibraryID                 string
+	CatalogRootLabel          string
+	CatalogRootDisplay        string
 	GCodeExtensions           []string
 	RequireSetupSheetForReady bool
 	RecentLimit               int
@@ -49,8 +56,12 @@ type Options struct {
 type Service struct {
 	db                        *sql.DB
 	objects                   *storage.Store
+	catalog                   *storage.CatalogStore
 	libraryID                 string
+	catalogRootLabel          string
+	catalogRootDisplay        string
 	gcode                     *domain.GCodeValidator
+	catalogProgramExtensions  map[string]struct{}
 	requireSetupSheetForReady bool
 	recentLimit               int
 	importTotalLimit          int64
@@ -81,6 +92,15 @@ func New(options Options) (*Service, error) {
 	if options.Database == nil || options.Objects == nil || strings.TrimSpace(options.LibraryID) == "" {
 		return nil, errors.New("database, object store and library ID are required")
 	}
+	if len(options.GCodeExtensions) == 0 {
+		options.GCodeExtensions = []string{".ngc", ".nc", ".tap"}
+	}
+	for _, configured := range options.GCodeExtensions {
+		extension := strings.ToLower(strings.TrimSpace(configured))
+		if _, safe := safeCatalogProgramExtensions[extension]; !safe {
+			return nil, errors.New("catalog G-code extension is outside the safe LinuxCNC set")
+		}
+	}
 	validator, err := domain.NewGCodeValidator(options.GCodeExtensions)
 	if err != nil {
 		return nil, err
@@ -103,6 +123,17 @@ func New(options Options) (*Service, error) {
 	if options.Logger == nil {
 		options.Logger = slog.New(slog.DiscardHandler)
 	}
+	if options.CatalogRootLabel == "" {
+		options.CatalogRootLabel = "LinuxCNC"
+	}
+	if options.CatalogRootDisplay == "" {
+		options.CatalogRootDisplay = "~/linuxcnc/nc_files"
+	}
+	catalogExtensions := options.GCodeExtensions
+	catalogExtensionSet := make(map[string]struct{}, len(catalogExtensions))
+	for _, extension := range catalogExtensions {
+		catalogExtensionSet[strings.ToLower(strings.TrimSpace(extension))] = struct{}{}
+	}
 	if options.RecentLimit < 1 || options.RecentLimit > 1000 ||
 		options.MaxParallelHeavyJobs < 1 || options.MaxParallelHeavyJobs > 16 ||
 		options.ImportTotalLimit < 0 || options.IdempotencyTTL <= 0 ||
@@ -110,9 +141,11 @@ func New(options Options) (*Service, error) {
 		return nil, errors.New("invalid service limits")
 	}
 	return &Service{
-		db: options.Database.SQL(), objects: options.Objects, libraryID: options.LibraryID,
-		gcode: validator, requireSetupSheetForReady: options.RequireSetupSheetForReady,
-		recentLimit: options.RecentLimit, importTotalLimit: options.ImportTotalLimit,
+		db: options.Database.SQL(), objects: options.Objects, catalog: options.Catalog, libraryID: options.LibraryID,
+		catalogRootLabel: options.CatalogRootLabel, catalogRootDisplay: options.CatalogRootDisplay,
+		gcode: validator, catalogProgramExtensions: catalogExtensionSet,
+		requireSetupSheetForReady: options.RequireSetupSheetForReady,
+		recentLimit:               options.RecentLimit, importTotalLimit: options.ImportTotalLimit,
 		idempotencyTTL:        options.IdempotencyTTL,
 		deleteConfirmationTTL: options.DeleteConfirmationTTL,
 		importSessionExpiry:   options.ImportSessionExpiry,
