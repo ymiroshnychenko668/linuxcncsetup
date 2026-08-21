@@ -1,15 +1,44 @@
 # Web Setup Manager — progress log
 
-Последнее обновление: 2026-08-20. Ветка: `codex/web-setup-manager`.
+Последнее обновление: 2026-08-21. Ветка: `codex/web-setup-manager`.
 
 Лог отделяет успешные автоматические проверки development environment от
 непроведённой target qualification. Статусы требований и точное evidence
 находятся в [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md).
 
-Важно: результаты этапов 1–7 ниже относятся к baseline до добавления
-PAM/browser-session auth. Они сохраняются как история, но не считаются
-самостоятельным evidence новой auth-версии; повторный integrated прогон и live
-deployment записаны в этапе 8.
+Важно: этапы 1–8 ниже относятся к superseded managed-library продукту. Они
+сохраняются как история реализованной техники и PAM deployment, но не являются
+evidence новой catalog-модели. Актуальные требования и статусы находятся в
+[PRODUCT_REQUIREMENTS.ru.md](PRODUCT_REQUIREMENTS.ru.md) и в верхней части
+[IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md).
+
+## Этап 9 — product direction reset и LinuxCNC catalog
+
+- Владелец станка отверг validation/readiness workflow, multi-program Setup и
+  dashboard/card UI. Новая модель: компактный catalog/upload tool, один Setup =
+  `0..1` программа + `0..1` Setup Sheet, неполный Setup допустим, folders
+  соответствуют filesystem.
+- Read-only discovery подтвердил, что LinuxCNC 2.9.10 сейчас запущен от `user`
+  с `/home/user/linuxcnc/configs/corvuscnc/g540.ini`; фактический
+  `PROGRAM_PREFIX` и сохранённый QtDragon user directory —
+  `/home/user/linuxcnc/nc_files`. Root пуст, real ext4 directory `user:user`;
+  отдельный `/home/user/linuxcnc/nc_programs` существует, но не используется.
+- Текущая deployed legacy-версия хранит bytes в
+  `~/.local/share/websetupmanager/library/objects` и потому не делает программы
+  видимыми в QtDragon. Unit также имеет `ProtectHome=read-only` и пока разрешает
+  запись только в state/library roots.
+- Созданы актуальные требования
+  [PRODUCT_REQUIREMENTS.ru.md](PRODUCT_REQUIREMENTS.ru.md) и безопасный
+  [MIGRATION_PLAN.md](MIGRATION_PLAN.md). Исходные 221 P0 и `AC-01`–`AC-20`
+  помечены архивными; pass новой модели ими не заявляется.
+- Зафиксированы config contract `PROGRAM_ROOT`/`LINUXCNC_INI`/display hint,
+  каталоговые IDs/relative paths, singular file roles, direct atomic named
+  publish и left-viewer/right-tree UX.
+- Backend direct-catalog storage/API и frontend compact tree/split переданы в
+  реализацию параллельно. На момент этой записи integrated tests, migration,
+  production build и deployment новой модели ещё не заявлены зелёными.
+- Существующие legacy objects, SQLite и production service не изменялись этим
+  документационным этапом.
 
 ## Discovery и этап 1 — каркас приложения
 

@@ -1,54 +1,54 @@
 # Web Setup Manager — руководство оператора и администратора
 
-Документ относится к первой production-версии. Web Setup Manager управляет
-сетапами, а не произвольными файлами. Никогда не изменяйте внутренние
-`objects`, `staging`, SQLite или library marker вручную при запущенном сервисе.
+Документ описывает актуальную catalog-версию из
+[PRODUCT_REQUIREMENTS.ru.md](PRODUCT_REQUIREMENTS.ru.md). Web Setup Manager
+работает только внутри одного настроенного LinuxCNC `PROGRAM_PREFIX` и не даёт
+произвольный доступ к остальной filesystem. Исторические managed `objects` и
+SQLite нельзя изменять вручную во время migration/rollback window.
 
-## 1. Состояния и безопасный рабочий цикл
+## 1. Каталог и безопасный рабочий цикл
 
-- `draft` — новый или изменённый сетап; его нужно проверить;
-- `ready` — конкретная revision прошла встроенные проверки текста/доступности;
-- `attention` — содержимое исчезло, повреждено или изменено извне;
-- `archived` — сетап скрыт из рабочего списка, но сохранён для восстановления.
+Setup содержит не более одной G-code-программы и не более одной PDF/HTML Setup
+Sheet. Он может быть неполным. В текущей версии нет `draft/ready/attention`,
+validation или `current setup`: приложение не оценивает технологическую
+готовность и не блокирует upload из-за отсутствующей sheet.
 
-`ready` не означает, что LinuxCNC проверил траекторию или безопасность обработки.
-Выбор текущего сетапа только закрепляет ссылку в UI/audit. Он ничего не запускает
-и не копирует. Нормальный цикл: создать/импортировать → проверить → изучить
-G-code и Setup Sheet → явно подтвердить current. После изменения состава снова
-выполните validation.
+На фактическом станке:
+
+```text
+LinuxCNC INI:   /home/user/linuxcnc/configs/corvuscnc/g540.ini
+PROGRAM_PREFIX: /home/user/linuxcnc/nc_files
+QtDragon:       User → <каталог> → <программа>.ngc
+```
 
 ### Работа оператора
 
-1. На экране библиотеки используйте поиск, фильтры и сортировку по сетапам.
-   Кнопка «Создать сетап» создаёт пустой `draft`; мастер импорта принимает сразу
-   несколько G-code и не более одной общей PDF/HTML Setup Sheet. Перед загрузкой
-   проверьте предложенные basename/роли и устраните показанные совпадения имён.
-2. Во время импорта и других долгих операций следите за persistent job и
-   byte/item progress. Операцию можно отменить. Для частично загруженного
-   импорта явно выберите: повторить ошибочные файлы, исключить их, сохранить
-   подтверждённый частичный `draft` или отменить всю сессию.
-3. В карточке задайте основную программу, при необходимости переименуйте,
-   замените или удалите программы и Setup Sheet. Изменения выполняются для
-   показанной revision; при конфликте сначала загрузите актуальную карточку и
-   проверьте сохранённый ввод. Любое изменение готового сетапа снова требует
-   validation.
-4. Запустите validation и исправьте перечисленные причины неготовности. Только
-   успешная проверка неизменившейся revision переводит сетап в `ready`.
-   `attention` нельзя снимать редактированием метаданных: проверьте/замените
-   изменённый artifact и повторите полную проверку.
-5. Просматривайте G-code с номерами строк, переходом и literal-поиском; большие
-   программы загружаются Range-блоками. Setup Sheet открывается как canvas PDF
-   либо очищенный HTML в sandbox. Сообщение об изменившейся версии означает,
-   что нужно закрыть viewer, обновить карточку и проверить содержимое заново.
-   HTML любого допустимого общего размера читается потоково; один структурный
-   token больше 1 MiB отклоняется до публикации с `INVALID_CONTENT`.
-6. «Выбрать текущим» требует явного подтверждения и только сохраняет ссылку:
-   LinuxCNC и G-code не запускаются. Перед обработкой оператор отдельно
-   проверяет станок, оснастку, ноль, траекторию и применимую программу.
-7. Обычное удаление — архивирование. Архив можно восстановить; если содержимое
-   изменилось, он вернётся с `attention`. Необратимое удаление требует сначала
-   отдельный delete-plan/token, затем точный ввод отображаемого имени. После
-   подтверждения восстановление возможно только из согласованной cold backup.
+1. Справа раскройте compact tree folders/setups или создайте нужный folder.
+   Физические folders находятся под `PROGRAM_PREFIX`; `ngcgui_lib` зарезервирован
+   LinuxCNC и не используется для пользовательских сетапов.
+2. Создайте Setup в выбранном folder. Пустой Setup допустим. Добавьте одну
+   `.ngc`, `.nc` или `.tap` программу и при необходимости одну PDF/HTML Setup
+   Sheet. Вторая программа/sheet означает replace, а не добавление composition.
+3. До подтверждения upload проверьте operator-facing destination, например
+   `Программы → Заказы → Клиент → detail.ngc`. Backend не принимает absolute
+   path от browser и не может выйти выше настроенного root.
+4. После успеха программа физически опубликована под
+   `/home/user/linuxcnc/nc_files/<относительный каталог>/...`. Откройте штатный
+   QtDragon file manager, перейдите из `User` по тому же дереву и выберите файл
+   вручную.
+5. Слева просматривайте выбранную программу с номерами строк, переходом и
+   literal-поиском. Большие файлы читаются Range-блоками. Setup Sheet открывается
+   как canvas PDF либо очищенный HTML в sandbox.
+6. При version/revision conflict сначала обновите tree/viewer и сравните
+   актуальный файл. Приложение не перезаписывает внешнее изменение молча.
+7. Удаление/перемещение catalog entity меняет именованный файл/каталог только
+   после явного подтверждения. Восстановление удалённых данных возможно из
+   согласованной cold backup.
+
+Upload, selection и preview **не открывают и не запускают программу в
+LinuxCNC**. Перед обработкой оператор отдельно проверяет станок, оснастку,
+tool table, ноль, траекторию и сам G-code. Security-проверки имени, типа,
+размера и safe path не являются проверкой корректности обработки.
 
 ## 2. Установка
 
@@ -60,8 +60,9 @@ atomic rename, `fsync`, sparse files и 64-bit offsets. Production binary
 
 1. Получите release binary из доверенного источника и проверьте опубликованный
    checksum/signature.
-2. Установите binary, выберите отдельного non-root Linux-пользователя оператора
-   с PAM-паролем и создайте два существующих непересекающихся каталога. В
+2. Установите binary, выберите non-root Linux-пользователя оператора
+   с PAM-паролем, state/legacy-library roots и существующий LinuxCNC
+   `PROGRAM_PREFIX`. В
    примере это `cncoperator`; в remote mode процесс обязан работать от того же
    пользователя, который задан как `WEB_SETUP_MANAGER_ALLOWED_USER`.
    Встроенного логина/пароля Web Setup Manager не существует. Команды установки
@@ -73,6 +74,7 @@ sudo useradd --create-home --shell /bin/bash cncoperator
 sudo passwd cncoperator
 sudo install -d -o cncoperator -g cncoperator -m 0750 /var/lib/websetupmanager
 sudo install -d -o cncoperator -g cncoperator -m 0750 /srv/websetupmanager/library
+sudo install -d -o cncoperator -g cncoperator -m 0750 /home/cncoperator/linuxcnc/nc_files
 sudo install -o root -g root -m 0644 deploy/pam.d/websetupmanager /etc/pam.d/websetupmanager
 ```
 
@@ -91,16 +93,34 @@ sudo install -o root -g root -m 0644 deploy/pam.d/websetupmanager /etc/pam.d/web
 эквивалентную policy по правилам этого дистрибутива; ослаблять account checks
 нельзя.
 
-`library_dir` и `state_dir` обязаны быть absolute real directories, writable
-пользователем сервиса, не symlink, не совпадать и не быть вложенными друг в
-друга. Не используйте `/`, home другого пользователя или каталог LinuxCNC как
-root библиотеки.
+`library_dir`, `state_dir` и `PROGRAM_ROOT` обязаны быть absolute real
+directories, writable пользователем сервиса и не symlink. `PROGRAM_ROOT` обязан
+совпасть с `PROGRAM_PREFIX` active INI. Не используйте `/`, home другого
+пользователя или каталог LinuxCNC как **legacy library root**; только отдельный
+`PROGRAM_ROOT` намеренно указывает в LinuxCNC tree.
+
+На текущем host `/home/user/linuxcnc/nc_files` обнаружен с mode `0775`. Catalog
+Backend намеренно отвергает group/other-writable root, поэтому перед первым
+catalog deployment администратор должен проверить владельца/пустоту и сузить
+права без изменения содержимого:
+
+```bash
+sudo chown user:user /home/user/linuxcnc/nc_files
+sudo chmod 0750 /home/user/linuxcnc/nc_files
+```
+
+LinuxCNC и Web Setup Manager работают от того же `user`, поэтому owner access
+сохраняется. Не применяйте recursive `chmod/chown` к существующей библиотеке
+без отдельного manifest/backup.
 
 Пример `/etc/websetupmanager.env` (права `0600`, root-owned):
 
 ```text
 WEB_SETUP_MANAGER_LIBRARY_DIR=/srv/websetupmanager/library
 WEB_SETUP_MANAGER_STATE_DIR=/var/lib/websetupmanager
+WEB_SETUP_MANAGER_PROGRAM_ROOT=/home/cncoperator/linuxcnc/nc_files
+WEB_SETUP_MANAGER_LINUXCNC_INI=/home/cncoperator/linuxcnc/configs/machine/machine.ini
+WEB_SETUP_MANAGER_PROGRAM_ROOT_DISPLAY=~/linuxcnc/nc_files
 WEB_SETUP_MANAGER_LISTEN_ADDRESS=127.0.0.1:8080
 WEB_SETUP_MANAGER_ARTIFACT_UPLOAD_LIMIT=0
 WEB_SETUP_MANAGER_IMPORT_TOTAL_LIMIT=0
@@ -116,7 +136,7 @@ WEB_SETUP_MANAGER_IMPORT_TOTAL_LIMIT=0
 [Unit]
 Description=Web Setup Manager
 After=local-fs.target
-RequiresMountsFor=/srv/websetupmanager/library /var/lib/websetupmanager
+RequiresMountsFor=/srv/websetupmanager/library /var/lib/websetupmanager /home/cncoperator/linuxcnc/nc_files
 
 [Service]
 Type=simple
@@ -129,12 +149,17 @@ RestartSec=3s
 TimeoutStopSec=30s
 PrivateTmp=true
 ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths=/srv/websetupmanager/library /var/lib/websetupmanager
+ProtectHome=read-only
+ReadWritePaths=/srv/websetupmanager/library /var/lib/websetupmanager /home/cncoperator/linuxcnc/nc_files
 
 [Install]
 WantedBy=multi-user.target
 ```
+
+Для фактического host используйте versioned templates
+[websetupmanager.service](deploy/systemd/websetupmanager.service) и
+[websetupmanager.env.example](deploy/systemd/websetupmanager.env.example), не
+переписывая пути из generic примера вручную.
 
 `NoNewPrivileges=true` намеренно отсутствует: распространённый `pam_unix`
 использует привилегированный helper для безопасной проверки shadow password.
@@ -151,10 +176,10 @@ curl --fail --silent http://127.0.0.1:8080/readyz
 ```
 
 Оба запроса должны вернуть HTTP 200. `/healthz` — liveness процесса;
-`/readyz` — SQLite и оба удерживаемых storage roots. Не направляйте production
-процесс на каталоги тестов или другой library marker. Readiness не ожидает
-первый background SHA-256/cleanup/GC cycle; для maintenance/restore дождитесь
-JSON-log `operation=reconcile,result=succeeded`.
+`/readyz` — SQLite/state, program root и совпадение active INI. Не направляйте
+production процесс на каталог тестов, другой `PROGRAM_PREFIX` или другой legacy
+library marker. Во время migration readiness не заменяет проверку migration
+manifest; выполните отдельный сценарий из [MIGRATION_PLAN.md](MIGRATION_PLAN.md).
 
 ## 3. Конфигурация
 
@@ -164,16 +189,19 @@ roots. Byte limits задаются целым числом байт (`107374182
 
 | Переменная | Default | Назначение/ограничение |
 |---|---:|---|
-| `WEB_SETUP_MANAGER_LIBRARY_DIR` | обязательно | managed immutable content |
+| `WEB_SETUP_MANAGER_PROGRAM_ROOT` | обязательно | canonical LinuxCNC `PROGRAM_PREFIX`; единственный writable catalog root |
+| `WEB_SETUP_MANAGER_LINUXCNC_INI` | обязательно | active real regular INI; его `PROGRAM_PREFIX` должен совпасть с root |
+| `WEB_SETUP_MANAGER_PROGRAM_ROOT_DISPLAY` | `~/linuxcnc/nc_files` | безопасный location hint для оператора |
+| `WEB_SETUP_MANAGER_LIBRARY_DIR` | transition: обязательно | legacy objects для migration/rollback, не destination новых upload |
 | `WEB_SETUP_MANAGER_STATE_DIR` | XDG/local state | SQLite, staging, indexes |
 | `WEB_SETUP_MANAGER_LISTEN_ADDRESS` | `127.0.0.1:8080` | `host:port` |
 | `WEB_SETUP_MANAGER_LIBRARY_ALIAS` | `Сетапы` | публичное имя библиотеки |
-| `WEB_SETUP_MANAGER_GCODE_EXTENSIONS` | `.gcode,.nc,.ngc,.tap,.cnc` | comma-separated hints |
+| `WEB_SETUP_MANAGER_GCODE_EXTENSIONS` | legacy default | catalog allowlist должен соответствовать active INI; текущий host: `.ngc,.nc,.tap` |
 | `WEB_SETUP_MANAGER_RECENT_SETUPS_LIMIT` | `30` | `1..1000` |
 | `WEB_SETUP_MANAGER_MAX_PARALLEL_HEAVY_JOBS` | `2` | `1..16` |
 | `WEB_SETUP_MANAGER_ARTIFACT_UPLOAD_LIMIT` | `0` | максимум одного файла; 0 = без app-limit |
 | `WEB_SETUP_MANAGER_IMPORT_TOTAL_LIMIT` | `0` | максимум сессии; 0 = без app-limit |
-| `WEB_SETUP_MANAGER_REQUIRE_SETUP_SHEET_FOR_READY` | `false` | sheet блокирует ready при `true` |
+| `WEB_SETUP_MANAGER_REQUIRE_SETUP_SHEET_FOR_READY` | legacy only | catalog version не имеет ready/validation gate |
 | `WEB_SETUP_MANAGER_ARTIFACT_FILE_MODE` | `0640` | execution bits запрещены |
 | `WEB_SETUP_MANAGER_SHUTDOWN_TIMEOUT` | `15s` | graceful shutdown budget |
 | `WEB_SETUP_MANAGER_READ_HEADER_TIMEOUT` | `10s` | HTTP headers |
@@ -264,26 +292,31 @@ loopback/Unix-isolated network и ограничьте доступ firewall. Tr
 отбрасывать client-supplied forwarding/auth headers, передавать session cookie
 и optional Bearer, сохранять внешний `Host` и обеспечивать точное совпадение
 HTTPS `Origin` с ним для login/logout/mutation checks. Сначала проверьте guest
-session response, login, capabilities, тестовую draft mutation и logout; не
+session response, login, capabilities, тестовое создание пустого catalog Setup
+и logout; не
 отключайте Host/Origin/CSRF проверки.
 
 ## 5. Резервное копирование
 
-Самый безопасный P0 backup — **cold copy двух roots как одной версии**. Не
-копируйте только `websetupmanager.sqlite3`: база ссылается на objects и library
-identity marker. Не используйте файловый API приложения как backup API.
+Самый безопасный backup — **cold copy state, legacy library и всего program
+root как одной generation**. Не копируйте только `websetupmanager.sqlite3`:
+catalog rows ссылаются на именованные файлы, а migration history — на legacy
+objects/library marker. Не используйте catalog API как backup API.
 
-1. Убедитесь, что jobs завершены или отменены.
+1. Убедитесь, что upload/move/delete завершены или отменены.
 2. Остановите сервис и дождитесь clean exit.
-3. Скопируйте целиком `state_dir` и `library_dir` в отдельный versioned каталог,
-   сохранив ownership, permissions и timestamps.
-4. Проверьте backup checksum/manifest и возможность чтения; затем запустите
-   сервис и проверьте readiness.
+3. Скопируйте целиком `state_dir`, legacy `library_dir`, `PROGRAM_ROOT`, active
+   INI и service config в отдельный versioned каталог, сохранив ownership,
+   permissions, xattrs и timestamps.
+4. Проверьте checksum/manifest каждого regular file и отдельно перечислите
+   symlink/special entries; затем запустите сервис и проверьте readiness.
 
 ```bash
 sudo systemctl stop websetupmanager
-sudo rsync -aHAX --numeric-ids /var/lib/websetupmanager/ /backup/wsm-2026-08-20/state/
-sudo rsync -aHAX --numeric-ids /srv/websetupmanager/library/ /backup/wsm-2026-08-20/library/
+sudo rsync -aHAX --numeric-ids /var/lib/websetupmanager/ /backup/wsm-2026-08-21/state/
+sudo rsync -aHAX --numeric-ids /srv/websetupmanager/library/ /backup/wsm-2026-08-21/library/
+sudo rsync -aHAX --numeric-ids /home/cncoperator/linuxcnc/nc_files/ /backup/wsm-2026-08-21/program-root/
+sudo install -D -m 0640 /home/cncoperator/linuxcnc/configs/machine/machine.ini /backup/wsm-2026-08-21/config/machine.ini
 sudo systemctl start websetupmanager
 curl --fail --silent http://127.0.0.1:8080/readyz
 ```
@@ -299,28 +332,28 @@ authentication state: password/raw cookie там нет, но matching browser t
 ## 6. Восстановление
 
 1. Остановите Backend и сохраните повреждённые roots отдельно для анализа.
-2. Восстанавливайте matching `state` и `library` из одного backup generation в
-   пустые disjoint каталоги. Не смешивайте DB от одного backup с objects другого.
+2. Восстанавливайте matching `state`, `library` и `program-root` из одной backup
+   generation. Не смешивайте DB одной generation с program files/objects другой.
 3. Восстановите владельца/права, убедитесь, что roots и TLS files не symlink.
-4. Запустите сервис. До открытия listener он выполнит SQLite `quick_check`,
-   migrations, import/journal recovery и bounded identity-проверку managed
-   ссылок. Сразу после listener в фоне запускаются полная SHA-256 сверка,
-   expired cleanup и reference-safe GC; они не блокируют `/healthz`.
-5. Проверьте `/readyz`, библиотеку, current setup, один G-code Range preview и
-   Setup Sheet. При копировании в новые каталоги inode/ctime закономерно
-   меняются: первый background reconcile повторно привязывает объект только
-   после совпадения полного SHA-256 и оставляет затронутый сетап `attention`.
-   Дождитесь JSON-log `operation=reconcile,result=succeeded`, затем выполните
-   validation; несовпавшие или отсутствующие bytes не принимаются.
+4. Проверьте, что restored root совпадает с `PROGRAM_PREFIX` active INI, затем
+   запустите сервис. Startup выполняет SQLite `quick_check`, checksummed
+   migrations, cleanup собственных temp и catalog identity reconciliation.
+5. Проверьте `/readyz`, дерево folders, один G-code Range preview, Setup Sheet и
+   фактический файл в QtDragon. При копировании inode/ctime меняются; Backend
+   принимает новую physical identity только после совпадения ожидаемого полного
+   SHA-256. Несовпавший или отсутствующий файл остаётся явным conflict и не
+   заменяется объектом с тем же именем.
 
 ```bash
 sudo systemctl stop websetupmanager
 sudo mv /var/lib/websetupmanager /var/lib/websetupmanager.failed
 sudo mv /srv/websetupmanager/library /srv/websetupmanager/library.failed
-sudo install -d -o cncoperator -g cncoperator -m 0750 /var/lib/websetupmanager /srv/websetupmanager/library
-sudo rsync -aHAX --numeric-ids /backup/wsm-2026-08-20/state/ /var/lib/websetupmanager/
-sudo rsync -aHAX --numeric-ids /backup/wsm-2026-08-20/library/ /srv/websetupmanager/library/
-sudo chown -R cncoperator:cncoperator /var/lib/websetupmanager /srv/websetupmanager/library
+sudo mv /home/cncoperator/linuxcnc/nc_files /home/cncoperator/linuxcnc/nc_files.failed
+sudo install -d -o cncoperator -g cncoperator -m 0750 /var/lib/websetupmanager /srv/websetupmanager/library /home/cncoperator/linuxcnc/nc_files
+sudo rsync -aHAX --numeric-ids /backup/wsm-2026-08-21/state/ /var/lib/websetupmanager/
+sudo rsync -aHAX --numeric-ids /backup/wsm-2026-08-21/library/ /srv/websetupmanager/library/
+sudo rsync -aHAX --numeric-ids /backup/wsm-2026-08-21/program-root/ /home/cncoperator/linuxcnc/nc_files/
+sudo chown -R cncoperator:cncoperator /var/lib/websetupmanager /srv/websetupmanager/library /home/cncoperator/linuxcnc/nc_files
 sudo systemctl start websetupmanager
 ```
 
@@ -331,31 +364,23 @@ backup либо передайте сохранённые roots разработ
 
 ## 7. Recovery, reconciliation и GC
 
-Startup до listener удаляет безопасные остатки staging, согласует import/journal
-records и выполняет identity-проверку managed ссылок. После listener первый
-background-проход полностью сверяет SHA-256, очищает expired
-idempotency/import/delete-confirmation records и запускает GC. Далее identity,
-cleanup и GC выполняются каждые `WEB_SETUP_MANAGER_RECONCILE_INTERVAL`, а
-полный SHA-256 scrub — раз в сутки. Поэтому большая библиотека не перечитывается
-целиком каждую минуту и не задерживает liveness endpoint.
+Startup до listener удаляет только собственные безопасно распознанные staging
+остатки, согласует незавершённые catalog mutations и проверяет удерживаемый root.
+Он не удаляет неизвестные files/folders под `PROGRAM_ROOT`. Periodic reconcile
+сравнивает ожидаемую relative path и file identity; дорогой digest нужен при
+неоднозначной смене identity, а не для validation G-code.
 
-GC удаляет только immutable object без ссылок и без активной journal/reservation.
-Дубликаты могут разделять object, поэтому физический объём после удаления может
-не уменьшиться. Не удаляйте `objects/*`, `.object-staging`, `staging`, `indexes`
-или rows SQLite вручную. Публичного endpoint принудительного GC нет; безопасный
-ручной запуск — controlled restart, успешный `/readyz` и завершение первого
-background maintenance event в JSON-log.
+Новые upload создают hidden exclusive temp в target filesystem, синхронизируют
+bytes и публикуют atomic rename. До rename конечное имя отсутствует/содержит
+старую полную версию; после rename наблюдается новая полная версия. Crash до
+SQLite commit при restart приводит к deterministic recovery/conflict, а не к
+тихому success. Повторите операцию только после проверки tree, relative path и
+фактических bytes.
 
-При внезапном shutdown незавершённая логическая revision не считается
-завершённой. Для import/upload/validation/duplicate/restore доменный commit и
-terminal persistent job фиксируются вместе: до commit новая revision/копия/
-status невидимы и действительно прерванный job получает
-`PROCESS_INTERRUPTED`; после commit job уже содержит стабильный terminal result.
-Recovery может пометить неоднозначную незавершённую journal/reservation запись
-как `conflict`, но не угадывает success по одному физическому object. Оператор
-должен сверить setup, job и audit, затем повторить безопасную операцию либо
-восстановить backup. Current setup не снимается автоматически, но блокирующее
-состояние отображается, если он перестал быть ready.
+Legacy `objects/*`, `.object-staging`, `staging`, `indexes` и старые rows
+сохраняются до завершения [MIGRATION_PLAN.md](MIGRATION_PLAN.md). Legacy GC не
+должен удалять object, упомянутый migration manifest/rollback generation. Не
+запускайте ручной cleanup этих каталогов.
 
 ## 8. Логи и аудит
 
@@ -368,8 +393,9 @@ journalctl -u websetupmanager -f --output=cat
 ```
 
 HTTP записи содержат безопасные request/entity/job IDs, route, status,
-duration, bytes и stable error code. Доменные create/import/validate/current/
-replace/duplicate/archive/restore/permanent-delete имеют audit events в SQLite.
+duration, bytes и stable error code. Catalog folder/setup create/rename/move/
+delete и program/sheet add/replace/delete имеют audit events в SQLite. Legacy
+import/validation/current/archive events могут оставаться только историей.
 Логи не должны содержать password, raw session cookie, Bearer token, G-code,
 SQL, storage key или absolute path.
 Если это обнаружено, ограничьте доступ к журналу, сохраните forensic copy и
@@ -378,10 +404,12 @@ SQL, storage key или absolute path.
 ## 9. Upgrade и rollback
 
 1. Прочитайте release notes и убедитесь, что target architecture поддержан.
-2. Сделайте проверенный cold backup обоих roots.
+2. Сделайте проверенный cold backup всей generation: state, legacy library и
+   program root.
 3. Остановите сервис; сохраните старый binary.
 4. Атомарно установите новый binary и запустите сервис.
-5. Проверьте health/readiness, logs, library/current, preview и тестовую mutation.
+5. Проверьте health/readiness, logs, catalog tree, destination, preview и
+   тестовый no-replace upload.
 
 ```bash
 sudo systemctl stop websetupmanager
@@ -393,8 +421,8 @@ curl --fail --silent http://127.0.0.1:8080/readyz
 
 Migrations embedded, checksummed и выполняются до ready. Автоматического
 downgrade нет. Если новая версия успела применить несовместимую migration,
-нельзя просто вернуть старый binary: остановите сервис и восстановите оба roots
-из pre-upgrade backup. Старый binary без restore допустим только когда release
+нельзя просто вернуть старый binary: остановите сервис и восстановите всю
+generation из pre-upgrade backup. Старый binary без restore допустим только когда release
 notes явно подтверждают schema compatibility.
 
 ## 10. Incident runbook
@@ -407,11 +435,11 @@ notes явно подтверждают schema compatibility.
 | startup сообщает account mismatch | сделать `User=`/`Group=` unit равными `ALLOWED_USER`; не запускать от root или другого account |
 | login отклонён/ограничен | проверить точное имя `ALLOWED_USER`, Linux password/account policy, HTTPS Origin и дождаться throttle window; не логировать password |
 | startup сообщает второй процесс | найти владельца unit/lock; не удалять lock при живом процессе |
-| import/download завис | проверить network/disk; отменить job; sliding I/O idle timeout завершит stall/slow client |
-| `INSUFFICIENT_STORAGE` | освободить место вне managed roots или расширить FS; повторить operation |
-| setup стал `attention` | прекратить использование; reconcile, проверить/заменить artifact, validate снова |
+| upload/download завис | проверить network/disk; отменить request/job; sliding I/O idle timeout завершит stall/slow client |
+| `INSUFFICIENT_STORAGE` | освободить место вне `PROGRAM_ROOT`/state или расширить FS; повторить operation |
+| program/sheet показывает conflict | обновить tree/viewer, сравнить relative path/version и только затем явно replace |
 | HTML upload вернул `INVALID_CONTENT` | проверить standalone UTF-8 HTML; разбить text/attribute token >1 MiB на bounded elements; не отключать sanitizer |
-| revision conflict | обновить карточку, проверить новый состав, повторить сохранённый ввод |
+| revision conflict | обновить tree/setup, проверить новое имя/место/состав, повторить сохранённый ввод |
 | corrupt/migration checksum | остановить, сохранить roots, восстановить matching backup; не пересоздавать DB |
 | после crash job имеет `PROCESS_INTERRUPTED`/`conflict` | сверить setup revision, terminal job и audit; повторить с новым key только незавершённую operation; при сомнении остановить сервис и restore backup |
 | подозрение на symlink/FIFO/socket | остановить, сохранить forensic copy; не открывать объект shell-инструментом от root |
@@ -420,21 +448,21 @@ notes явно подтверждают schema compatibility.
 | TLS certificate истекает | установить новую regular-file пару, проверить ownership, controlled restart |
 
 После любого восстановления запишите время, версию binary, backup generation,
-результат readiness и проверенные setup IDs. Не подтверждайте `ready` или current,
-пока оператор не просмотрел артефакты и не выполнил validation заново.
+результат readiness, проверенные setup IDs/relative paths и один фактический
+QtDragon lookup. Readiness не заменяет просмотр программы оператором.
 
 ## 11. Границы development qualification
 
-В development environment автотесты проверяют domain/API/storage/UI
-инварианты, sparse 10 GiB backend Range и SHA-verified cold-copy rebind.
+Историческая managed-library версия имела автотесты domain/API/storage/UI,
+sparse 10 GiB backend Range и SHA-verified cold-copy rebind.
 Headless Firefox проверил загрузку same-origin API/assets и loading-state, но это
 не controlled browser acceptance и не заменяет qualification на целевом станке.
-Development suite также проверил durable pre-commit recovery, post-commit
-terminal job/replay для replace/duplicate/validation/restore и настоящий
-subprocess SIGKILL rollback для archive/delete/current. Это не заменяет
-повторяемый power-loss drill import/replace/duplicate на target filesystem.
+Исторический suite также проверил durable pre-commit recovery, post-commit
+terminal job/replay и несколько SIGKILL сценариев. Это не является доказательством
+direct named-file publish, folder operations или migration новой catalog-модели.
 
-После PAM integration обычные и PAM-tagged Go suites/race/vet прошли; отдельный
+До смены product direction PAM integration, обычные/PAM-tagged Go suites,
+race/vet прошли; отдельный
 non-PAM remote binary подтвердил fail-closed
 `AUTHENTICATION_UNAVAILABLE`. Frontend lint/typecheck, 12 files/83 tests и Vite
 production build прошли; `scripts/build.sh` прошёл целиком. Production binary
@@ -448,6 +476,11 @@ row. SHA-256 установленного binary:
 `5df67ec084ec30e0f253f6fd38f565adbe9e4eb8656edc180f3fa2454be8469d`.
 Текущий certificate self-signed с SAN `microb.int` и `10.0.1.136`; его доверие
 на управляемом browser/client остаётся отдельным deployment действием.
+
+Это evidence можно переиспользовать как auth foundation, но новую версию нельзя
+назвать qualified, пока не пройдут catalog schema/API/storage/frontend tests,
+live upload в `/home/user/linuxcnc/nc_files`, QtDragon visibility без изменения
+loaded program и no-data-loss migration/rollback drill.
 
 До признания target qualification завершённой отдельно выполните:
 

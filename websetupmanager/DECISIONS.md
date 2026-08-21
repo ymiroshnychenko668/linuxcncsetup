@@ -1,7 +1,110 @@
 # Web Setup Manager — decisions
 
-Неоднозначности требований фиксируются здесь до реализации. Решения выбирают
-минимальную безопасную P0-модель и не добавляют файловый менеджер или P1/P2.
+Неоднозначности требований фиксируются здесь до реализации. Решения `D-001`–
+`D-020` сохраняют историю первой managed-library версии. Прямое продуктовое
+решение владельца станка от 2026-08-21 имеет больший приоритет и зафиксировано в
+`D-021`–`D-024` и
+[PRODUCT_REQUIREMENTS.ru.md](PRODUCT_REQUIREMENTS.ru.md). Старое решение нельзя
+использовать для восстановления multi-program/validation/dashboard UX вопреки
+новой модели.
+
+## D-021: catalog tool заменяет managed setup library
+
+Текущий продукт — узкий каталог и upload-инструмент для одного LinuxCNC
+`PROGRAM_PREFIX`, а не workflow проверки технологической готовности. Setup
+остаётся основной сущностью, но имеет `0..1` G-code-программу и `0..1` Setup
+Sheet и может быть неполным. Validation, `draft/ready/attention/archived` и
+`current setup` не являются текущими операторскими состояниями или gate.
+
+Файловые каталоги теперь являются разрешённым способом группировки Setup, но
+это не означает универсальный файловый менеджер: Backend имеет ровно один
+настроенный root, public API работает только с catalog folder/setup IDs и
+нормализованными относительными путями. Он не принимает произвольный absolute
+path и не открывает остальную filesystem.
+
+Основной UI — компактный split в духе Visual Studio Code: G-code/Setup Sheet
+viewer слева, дерево catalog folders/setups справа. Большие library cards,
+pinned current area и validation banners относятся к старому UX и не должны
+занимать основной viewport.
+
+Этим решением полностью заменены `D-003`, `D-004` и `D-011`; части `D-009`,
+`D-012`, `D-013`, `D-016` и `D-020` применимы только если не возвращают
+устаревшую композицию/workflow.
+
+## D-022: именованные программы публикуются в реальный PROGRAM_PREFIX
+
+Фактически LinuxCNC 2.9.10 запущен от `user` с INI
+`/home/user/linuxcnc/configs/corvuscnc/g540.ini`. Его `[DISPLAY]
+PROGRAM_PREFIX` равен `/home/user/linuxcnc/nc_files`; QtDragon запоминает тот же
+каталог и показывает вложенные directories. Поэтому новые G-code payload
+публикуются как обычные именованные файлы непосредственно под этим root.
+
+Configuration contract:
+
+```text
+WEB_SETUP_MANAGER_PROGRAM_ROOT=/home/user/linuxcnc/nc_files
+WEB_SETUP_MANAGER_LINUXCNC_INI=/home/user/linuxcnc/configs/corvuscnc/g540.ini
+WEB_SETUP_MANAGER_PROGRAM_ROOT_DISPLAY=~/linuxcnc/nc_files
+```
+
+Startup canonicalizes обе настройки и требует совпадения root с INI. UI/API
+показывают безопасный `rootDisplay` и relative path, достаточные для навигации
+оператора, но не раскрывают другой host path. Зарезервированный INI-путь
+`ngcgui_lib` не доступен catalog mutations. Разрешены `.ngc`, `.nc`, `.tap` и
+PDF/HTML sheet; `.py` и image filters не являются upload-типами приложения.
+
+Web Setup Manager никогда не вызывает `ACTION.OPEN_PROGRAM`, LinuxCNC NML или
+run command. Atomic publish делает файл видимым в QtDragon, а его загрузка и
+исполнение остаются отдельным явным действием оператора на станке.
+
+## D-023: filesystem payload и SQLite identity разделены
+
+Именованные program/sheet files — operator-visible payload source of truth;
+SQLite — источник устойчивых catalog folder/setup IDs, связей, revision,
+expected file identity/version, idempotency и audit. Content-addressed objects
+старой версии остаются migration source и rollback data, но не destination
+новых upload.
+
+Catalog storage использует held root FD, beneath/no-symlink resolution,
+regular-file checks, streaming exclusive temp, target free-space checks,
+`fsync` и atomic rename. Create всегда no-replace; replace/delete требуют
+expected revision/version. Security/name/extension checks не называются
+validation сетапа и не делают утверждений о корректности G-code.
+
+Physical folders соответствуют catalog hierarchy. Public contract использует
+`/api/v1/catalog`, relative paths и opaque IDs, а не `/fs`. Setup/payload
+cardinality закрепляется unique `(setup_id, role)`, где role равен `program` или
+`setup_sheet`.
+
+## D-024: migration сохраняет legacy data и требует manifest
+
+Переход выполняется forward-only additive schema migration и atomic copy из
+legacy objects в именованные файлы. Legacy Setup с несколькими программами
+разделяется на несколько catalog setups; общая sheet копируется для каждой
+полученной однозначной пары. Пустой или sheet-only legacy Setup остаётся
+неполным Setup. Collision не перезаписывается, а получает deterministic rename
+или manual-review outcome.
+
+До проверки count/size/SHA-256 manifest, restart stability, path-security suite,
+QtDragon visibility и backup/restore старые objects и tables не удаляются.
+Cold backup во время transition включает `state_dir`, legacy `library_dir` и
+весь `PROGRAM_ROOT`. Полная процедура находится в
+[MIGRATION_PLAN.md](MIGRATION_PLAN.md).
+
+## Статус исторических решений
+
+| Решение | Статус в catalog-версии |
+|---|---|
+| `D-001`, `D-005`–`D-008`, `D-014`, `D-015`, `D-017`, `D-019` | сохраняется в непротиворечащей части |
+| `D-002` | state/legacy roots сохраняются; добавлен отдельный `PROGRAM_ROOT` |
+| `D-003`, `D-004`, `D-011` | заменены `D-021`–`D-023` |
+| `D-009`, `D-010`, `D-012`, `D-013`, `D-016`, `D-020` | частично применимы к новым catalog mutations; legacy workflow не нормативен |
+| `D-018` | backup boundary расширен до `PROGRAM_ROOT`; legacy текст ниже исторический |
+
+## Исторический журнал D-001–D-020
+
+Текст ниже сохранён без переписывания исходной мотивации. При конфликте
+применяются `D-021`–`D-024`.
 
 ## D-001: production baseline
 

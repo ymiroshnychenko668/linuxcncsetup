@@ -1,18 +1,186 @@
 # Web Setup Manager — implementation plan и матрица покрытия
 
-Последнее обновление: 2026-08-20. Ветка: `codex/web-setup-manager`.
-Normative source: [functional-requirements.ru.md](functional-requirements.ru.md).
+Последнее обновление: 2026-08-21. Ветка: `codex/web-setup-manager`.
+Текущий normative source:
+[PRODUCT_REQUIREMENTS.ru.md](PRODUCT_REQUIREMENTS.ru.md).
 
-Документ одновременно фиксирует реализованную архитектуру и честное состояние
-приёмки. В source перечислен **ровно 221 P0 ID**; ниже каждый приведён отдельной
-строкой. Статусы:
+Прямая продуктовая корректировка заменила multi-program managed library на
+LinuxCNC catalog: один Setup имеет не более одной программы и одной Setup Sheet,
+может быть неполным, группируется физическими folders под `PROGRAM_PREFIX` и не
+имеет validation/readiness/current workflow. Старый план и матрица 221 P0 /
+`AC-01`–`AC-20` сохранены ниже в свёрнутом историческом разделе, но больше не
+являются заявлением о текущей приёмке.
 
-- `V` — verified: указанный автоматический тест прошёл в development environment
-  либо явно названный recorded code audit завершён;
-- `I` — implementation present, но указанный manual scenario ещё не записан как
-  пройденный; это не pass;
-- `P` — частично проверено автоматически, осталась явно указанная часть;
-- `X` — target/external qualification pending; development evidence не заменяет её.
+## Актуальная архитектура
+
+```text
+┌──────────────────────────── React SPA ─────────────────────────────┐
+│  G-code / Setup Sheet viewer (слева) │ catalog tree (справа)       │
+└──────────────────── same-origin /api/v1/catalog ───────────────────┘
+                               │
+                     PAM session + CSRF
+                               │
+                         Go catalog API
+                 ┌─────────────┴─────────────┐
+                 │                           │
+       SQLite IDs/revisions/audit     held PROGRAM_ROOT FD
+                                      named program/sheet files
+                                                │
+                                  LinuxCNC PROGRAM_PREFIX / QtDragon
+```
+
+Backend не имеет endpoint исполнения и не обращается к LinuxCNC NML. Он только
+проверяет active INI, безопасно публикует файл в `PROGRAM_ROOT` и сообщает
+operator-facing relative location. Физический root фиксирован server config;
+browser не может выбрать другой каталог хоста.
+
+## Этапы текущей реализации
+
+| Этап | Результат | Статус на 2026-08-21 |
+|---|---|---|
+| 0. Direction reset | новый normative source, decisions, host discovery, migration boundary | выполнено в документации |
+| 1. Catalog backend | config/INI match, schema, folders/setups, singular files, scoped API | в работе; pass ещё не заявлен |
+| 2. Direct filesystem storage | root-FD traversal, atomic named publish, conflicts/recovery | в работе; security gate ещё не записан |
+| 3. Compact frontend | left viewer/right tree, destination-first upload, folder operations | в работе; browser acceptance ещё не записан |
+| 4. Legacy migration | additive schema + no-replace copy/manifest | запланировано; legacy objects сохраняются |
+| 5. Integrated verification | Go/race/vet, frontend, security, build, live QtDragon/PAM | не выполнено для новой catalog-модели |
+| 6. Deployment | unit/env write exception for actual root, smoke and rollback evidence | не выполнено для новой catalog-модели |
+
+Подробная безопасная последовательность преобразования данных находится в
+[MIGRATION_PLAN.md](MIGRATION_PLAN.md).
+
+## Актуальная модель данных
+
+| Entity | Обязательные данные и invariants |
+|---|---|
+| `catalog_folders` | opaque ID, nullable parent, display/normalized name, revision; hierarchy соответствует real directories под root |
+| `catalog_setups` | opaque ID, nullable folder, display name, revision; неполный Setup допустим |
+| `catalog_files` | setup ID, unique role `program` или `setup_sheet`, relative basename/path, size/digest, inode/version identity; максимум один файл каждой роли |
+| auth/session/audit/idempotency | переиспользуются без хранения password/raw remembered token или абсолютного program root в public data |
+| legacy tables/objects | read-only migration/rollback source до отдельного подтверждённого cleanup |
+
+`rootDisplay` — server-configured operator-facing строка
+`~/linuxcnc/nc_files`; `relativePath` разрешён внутри root. Ни одно из них не
+является входом для выбора произвольного filesystem root.
+
+## Актуальная структура API
+
+Публичный namespace — `/api/v1/catalog`, не `/fs`. Контракт перехода:
+
+| Method/path | Назначение |
+|---|---|
+| `GET /api/v1/catalog` | дерево folders/setups, destination `rootLabel`/`rootDisplay` и generation |
+| `POST /api/v1/catalog/folders` | создать физический folder под root |
+| `PATCH/DELETE /api/v1/catalog/folders/{folderId}` | rename/move/delete пустого folder с expected revision |
+| `POST /api/v1/catalog/setups` | создать полный или неполный Setup в folder/root |
+| `PATCH/DELETE /api/v1/catalog/setups/{setupId}` | rename/move и безопасное удаление Setup; detail уже входит в catalog snapshot |
+| `PUT/DELETE /api/v1/catalog/setups/{setupId}/program` | streaming add/replace/delete единственной программы |
+| `HEAD/GET /api/v1/catalog/setups/{setupId}/program/content` | Range/ETag preview программы |
+| `PUT/DELETE /api/v1/catalog/setups/{setupId}/setup-sheet` | streaming add/replace/delete единственной sheet |
+| `HEAD/GET /api/v1/catalog/setups/{setupId}/setup-sheet/content` | version-bound безопасный viewer content |
+
+Mutations используют opaque IDs, expected revision, server-verified сохранённую
+file version, session CSRF и idempotency там, где browser/network retry может
+повторить filesystem effect.
+Ответы содержат `relativePath`/`rootDisplay`, но не canonical absolute root,
+storage key, inode/device или staging name.
+
+## Актуальная storage strategy
+
+- `PROGRAM_ROOT` и `LINUXCNC_INI` canonicalize до listener; INI
+  `PROGRAM_PREFIX` обязан совпасть с root.
+- Root удерживается открытым directory FD. Каждый component разрешается beneath
+  без symlink; reserved `ngcgui_lib`, traversal, absolute/NUL, hardlink и special
+  files отклоняются.
+- Program allowlist на фактическом станке: `.ngc`, `.nc`, `.tap`; sheet:
+  PDF/standalone HTML. `.py` и image-to-gcode filter inputs не принимаются.
+- Upload потоково пишет exclusive hidden regular temp в target filesystem,
+  проверяет лимит/free space/identity, синхронизирует file, публикует atomic
+  rename и синхронизирует directory.
+- Create использует no-replace. Replace/delete связаны с expected revision и
+  file version; конфликт не уничтожает новые внешние bytes.
+- Startup очищает только собственные stale temp по проверяемому шаблону. Он не
+  удаляет неизвестные entries или legacy objects.
+- Systemd сохраняет `ProtectHome=read-only`, добавляя только точный
+  `ReadWritePaths=/home/user/linuxcnc/nc_files`.
+
+## Актуальная тестовая стратегия
+
+| Gate | Обязательное evidence перед pass |
+|---|---|
+| Config/INI | actual `g540.ini` match, mismatch/missing/symlink/wrong-root fail-closed tests |
+| Domain/API | folder hierarchy, incomplete setup, singular cardinality, revision/idempotency/conflict tests |
+| Storage security | external sentinel, traversal, symlink/hardlink/FIFO/socket/device, swap races, no-replace and crash-temp recovery |
+| Upload | constant-memory streaming, free-space/limit/cancel/disconnect, atomic create/replace and byte-for-byte target verification |
+| Viewer | Range/ETag, sparse large G-code, bounded Worker/search, PDF/HTML isolation |
+| Frontend | compact split/tree, destination before upload, empty/offline/conflict, keyboard/focus and singular upload flow |
+| No execution | route/call-site audit and live assertion that WSM interactions do not change loaded LinuxCNC program |
+| Migration | legacy 0/1/N-program fixtures, sheet fan-out, collision/manual review, manifest/hash, restart and rollback |
+| Production | gofmt/vet/test/race, PAM-tagged suite, lint/typecheck/Vitest/Vite, binary build, health/ready, PAM and QtDragon visibility smoke |
+
+## Матрица CAT-P0
+
+`D` означает documented only, `W` — implementation work in progress, `P` —
+частичное legacy evidence требует catalog regression, `V` — verified именно для
+новой модели. На момент этого обновления ни один новый integrated gate не
+объявляется пройденным заранее.
+
+| ID | Planned evidence | Статус |
+|---|---|---|
+| `CAT-P0-001` | frontend split/tree component + browser screenshot | W |
+| `CAT-P0-002` | density/resizable split/visual walkthrough | W |
+| `CAT-P0-003` | folder API/tree reload/component tests | W |
+| `CAT-P0-004` | schema unique role + API second-file conflict tests | W |
+| `CAT-P0-005` | empty/program-only/sheet-only domain and UI tests | W |
+| `CAT-P0-006` | upload dialog destination and success location tests | W |
+| `CAT-P0-007` | atomic target publish + live QtDragon visibility | W |
+| `CAT-P0-008` | absence-of-execute audit + live loaded-file invariant | P |
+| `CAT-P0-009` | folder/setup CRUD/move/concurrency/security suite | W |
+| `CAT-P0-010` | singular streaming add/replace/delete tests | W |
+| `CAT-P0-011` | retained viewer suite through new catalog content routes | P |
+| `CAT-P0-012` | retained safe viewer suite through new routes | P |
+| `CAT-P0-013` | route audit + traversal/sentinel tests | W |
+| `CAT-P0-014` | DTO/error/log leak tests | W |
+| `CAT-P0-015` | catalog-root path/race security suite | W |
+| `CAT-P0-016` | streaming/atomic/cancel/crash/restart suite | W |
+| `CAT-P0-017` | no-replace and external-version conflict suite | W |
+| `CAT-P0-018` | active-extension/reserved/special-file tests | W |
+| `CAT-P0-019` | tree filter and retained-context states | W |
+| `CAT-P0-020` | component focus tests + controlled no-mouse walkthrough | W |
+| `CAT-P0-021` | existing PAM suite + catalog integrated remote smoke | P |
+| `CAT-P0-022` | health/ready root/INI/storage integration tests | W |
+| `CAT-P0-023` | three-root cold backup/restore drill | D |
+| `CAT-P0-024` | no-delete migration manifest/hash/rollback suite | D |
+
+## Матрица CAT-AC
+
+| AC | Status / remaining evidence |
+|---|---|
+| `CAT-AC-01` | P — actual host/root/INI discovered; startup contract tests pending |
+| `CAT-AC-02` | W — physical folder create/reload implementation and test |
+| `CAT-AC-03` | W — incomplete setup combinations and absence of validation UI |
+| `CAT-AC-04` | W — atomic upload plus live QtDragon/manual-load invariant |
+| `CAT-AC-05` | W — singular replace/conflict flow |
+| `CAT-AC-06` | P — viewer implementation exists historically; catalog-route regression pending |
+| `CAT-AC-07` | W — compact layout and destination-first visual acceptance |
+| `CAT-AC-08` | W — catalog-root attack/race suite |
+| `CAT-AC-09` | W — disconnect/cancel/crash atomicity and temp recovery |
+| `CAT-AC-10` | W — external modification/version conflict |
+| `CAT-AC-11` | W — full keyboard-only flow |
+| `CAT-AC-12` | W — clean integrated quality gates and deployed smoke |
+
+## Историческая implementation/evidence matrix (до 2026-08-21)
+
+<details>
+<summary>Показать старый план и покрытие 221 P0 / AC-01–AC-20</summary>
+
+Статусы ниже относятся только к архивному
+[functional-requirements.ru.md](functional-requirements.ru.md):
+
+- `V` — verified в прежней managed-library версии;
+- `I` — implementation present, manual scenario не записан;
+- `P` — partial;
+- `X` — target/external qualification pending.
 
 ## Архитектура
 
@@ -597,3 +765,5 @@ Formatting, final `git diff --check` and clean-worktree checks выполняю�
 
 Full target Definition of Done cannot be called complete until the explicit `X`
 and AC partial scenarios above have recorded evidence or an approved deviation.
+
+</details>
