@@ -37,7 +37,9 @@ type httpAcceptanceHarness struct {
 	database   *database.DB
 	roots      *storage.Roots
 	store      *storage.Store
+	catalog    *storage.CatalogStore
 	libraryDir string
+	programDir string
 	rootDir    string
 }
 
@@ -53,11 +55,16 @@ func newHTTPAcceptanceHarness(t *testing.T) *httpAcceptanceHarness {
 	}
 	libraryDir := filepath.Join(rootDir, "lib")
 	stateDir := filepath.Join(rootDir, "state")
+	programDir := filepath.Join(rootDir, "programs")
 	if err := os.Mkdir(libraryDir, 0o750); err != nil {
 		_ = os.RemoveAll(rootDir)
 		t.Fatal(err)
 	}
 	if err := os.Mkdir(stateDir, 0o700); err != nil {
+		_ = os.RemoveAll(rootDir)
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(programDir, 0o750); err != nil {
 		_ = os.RemoveAll(rootDir)
 		t.Fatal(err)
 	}
@@ -85,11 +92,20 @@ func newHTTPAcceptanceHarness(t *testing.T) *httpAcceptanceHarness {
 		_ = os.RemoveAll(rootDir)
 		t.Fatal(err)
 	}
+	catalog, err := storage.NewCatalogStore(programDir, store, 0o640)
+	if err != nil {
+		_ = db.Close()
+		_ = roots.Close()
+		_ = os.RemoveAll(rootDir)
+		t.Fatal(err)
+	}
 	manager, err := service.New(service.Options{
-		Database: db, Objects: store, LibraryID: roots.LibraryID(),
+		Database: db, Objects: store, Catalog: catalog, LibraryID: roots.LibraryID(),
+		CatalogRootLabel: "Программы LinuxCNC", CatalogRootDisplay: "~/linuxcnc/nc_files",
 		GCodeExtensions: []string{".ngc", ".nc"}, RecentLimit: 30,
 	})
 	if err != nil {
+		_ = catalog.Close()
 		_ = db.Close()
 		_ = roots.Close()
 		_ = os.RemoveAll(rootDir)
@@ -101,20 +117,25 @@ func newHTTPAcceptanceHarness(t *testing.T) *httpAcceptanceHarness {
 	server, err := NewWithService(Config{
 		ListenAddress: "127.0.0.1:8080", LibraryID: roots.LibraryID(),
 		LibraryAlias: "Acceptance", GCodeExtensions: []string{".ngc", ".nc"},
+		EnableLegacyAPI: true,
 	}, CheckFunc(db.Ping), CheckFunc(func(context.Context) error { return roots.Check() }), manager, static, nil)
 	if err != nil {
 		manager.Close()
+		_ = catalog.Close()
 		_ = db.Close()
 		_ = roots.Close()
 		_ = os.RemoveAll(rootDir)
 		t.Fatal(err)
 	}
 	h := &httpAcceptanceHarness{
-		server: server, service: manager, database: db, roots: roots, store: store,
-		libraryDir: libraryDir, rootDir: rootDir,
+		server: server, service: manager, database: db, roots: roots, store: store, catalog: catalog,
+		libraryDir: libraryDir, programDir: programDir, rootDir: rootDir,
 	}
 	t.Cleanup(func() {
 		manager.Close()
+		if err := catalog.Close(); err != nil {
+			t.Errorf("close catalog: %v", err)
+		}
 		if err := db.Close(); err != nil {
 			t.Errorf("close acceptance database: %v", err)
 		}

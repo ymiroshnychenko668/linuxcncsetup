@@ -672,6 +672,10 @@ func TestSafeRouteContextIdentifiesLongUploadOperations(t *testing.T) {
 	for _, test := range []struct {
 		path, route, setupID, jobID string
 	}{
+		{"/api/v1/catalog", "catalog", "", ""},
+		{"/api/v1/catalog/folders/" + id, "catalog-folder", "", ""},
+		{"/api/v1/catalog/setups/" + id + "/program/content", "catalog-setup-program-content", id, ""},
+		{"/api/v1/catalog/setups/" + id + "/setup-sheet", "catalog-setup-setup-sheet", id, ""},
 		{"/api/v1/jobs/" + id + "/upload", "job-upload", "", id},
 		{"/api/v1/setups/" + id + "/upload-jobs", "setup-upload-jobs", id, ""},
 		{"/api/v1/setups/name-check", "setup-name-check", "", ""},

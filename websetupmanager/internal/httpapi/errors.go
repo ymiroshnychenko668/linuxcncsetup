@@ -40,6 +40,8 @@ func domainErrorStatus(code domain.ErrorCode) (int, bool) {
 		return http.StatusServiceUnavailable, true
 	case domain.CodeConfirmationExpired:
 		return http.StatusGone, false
+	case domain.CodePreconditionRequired:
+		return http.StatusPreconditionRequired, false
 	case domain.CodeInvalidID, domain.CodeInvalidName, domain.CodeInvalidRevision,
 		domain.CodeInvalidContent, domain.CodeUploadIncomplete, domain.CodeConfirmationInvalid,
 		domain.CodeInvalidRange:

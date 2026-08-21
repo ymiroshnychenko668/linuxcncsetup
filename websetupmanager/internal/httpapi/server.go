@@ -57,6 +57,9 @@ type Config struct {
 	AuthRememberTimeout       time.Duration
 	AuthConcurrency           int
 	RemoteAuthToken           string
+	// EnableLegacyAPI keeps the pre-catalog setup workflow available only for
+	// compatibility tests and controlled migrations. Production leaves it false.
+	EnableLegacyAPI bool
 }
 
 // AuthDependencies contains the remote-browser authentication dependencies.
@@ -316,6 +319,12 @@ func safeRouteContext(requestPath string) (route, setupID, artifactID, importID,
 		return "auth-session", "", "", "", ""
 	case "/api/v1/auth/logout":
 		return "auth-logout", "", "", "", ""
+	case "/api/v1/catalog":
+		return "catalog", "", "", "", ""
+	case "/api/v1/catalog/folders":
+		return "catalog-folders", "", "", "", ""
+	case "/api/v1/catalog/setups":
+		return "catalog-setups", "", "", "", ""
 	case "/api/v1/setups":
 		return "setups", "", "", "", ""
 	case "/api/v1/setups/name-check":
@@ -332,6 +341,25 @@ func safeRouteContext(requestPath string) (route, setupID, artifactID, importID,
 		return "ui-state", "", "", "", ""
 	case "/api/v1/jobs":
 		return "jobs", "", "", "", ""
+	}
+	if len(segments) >= 5 && segments[0] == "api" && segments[1] == "v1" &&
+		segments[2] == "catalog" && segments[3] == "folders" && safeEntityID(segments[4]) {
+		return "catalog-folder", "", "", "", ""
+	}
+	if len(segments) >= 5 && segments[0] == "api" && segments[1] == "v1" &&
+		segments[2] == "catalog" && segments[3] == "setups" && safeEntityID(segments[4]) {
+		setupID = segments[4]
+		route = "catalog-setup"
+		if len(segments) >= 6 {
+			switch segments[5] {
+			case "program", "setup-sheet":
+				route = "catalog-setup-" + segments[5]
+				if len(segments) == 7 && segments[6] == "content" {
+					route += "-content"
+				}
+			}
+		}
+		return route, setupID, "", "", ""
 	}
 	if len(segments) >= 4 && segments[0] == "api" && segments[1] == "v1" &&
 		segments[2] == "setup-imports" && safeEntityID(segments[3]) {
@@ -408,10 +436,13 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, requestID string)
 	case "/api/v1/auth/logout":
 		s.logout(w, r, requestID)
 	default:
-		if strings.HasPrefix(r.URL.Path, "/api/v1/setups/") && s.routeContent(w, r, requestID) {
+		if strings.HasPrefix(r.URL.Path, "/api/v1/catalog") && s.routeCatalog(w, r, requestID) {
 			return
 		}
-		if s.service != nil && strings.HasPrefix(r.URL.Path, "/api/v1/") && s.routeDomain(w, r, requestID) {
+		if s.config.EnableLegacyAPI && strings.HasPrefix(r.URL.Path, "/api/v1/setups/") && s.routeContent(w, r, requestID) {
+			return
+		}
+		if s.config.EnableLegacyAPI && s.service != nil && strings.HasPrefix(r.URL.Path, "/api/v1/") && s.routeDomain(w, r, requestID) {
 			return
 		}
 		if strings.HasPrefix(r.URL.Path, "/api/") || r.URL.Path == "/fs" || strings.HasPrefix(r.URL.Path, "/fs/") {
@@ -472,10 +503,12 @@ func (s *Server) capabilities(w http.ResponseWriter, r *http.Request, requestID 
 		"libraryId":                 s.config.LibraryID,
 		"libraryAlias":              s.config.LibraryAlias,
 		"gcodeExtensions":           s.config.GCodeExtensions,
-		"requireSetupSheetForReady": s.config.RequireSetupSheetForReady,
+		"requireSetupSheetForReady": false,
 		"csrfToken":                 csrfToken,
 		"features": map[string]bool{
-			"setupLibrary": true,
+			"setupCatalog": true,
+			"setupLibrary": false,
+			"validation":   false,
 			"fileBrowser":  false,
 			"linuxcncRun":  false,
 			"offline":      true,

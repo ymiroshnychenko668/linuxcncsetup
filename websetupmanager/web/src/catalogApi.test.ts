@@ -103,6 +103,7 @@ describe('catalog API contract', () => {
     expect(jsonRequestBody(calls[2])).toEqual({ folderId: 'folder/encoded', name: 'Кронштейн', description: '' })
     expect(jsonRequestBody(calls[3])).toEqual({ expectedRevision: 3, name: 'Кронштейн 2', folderId: null })
     expect(new Headers(calls[4]?.[1].headers).get('Idempotency-Key')).toBe('component-delete-key')
+    expect(new Headers(calls[4]?.[1].headers).get('If-Match')).toBe('"version-1"')
     expect(calls.every(([, init]) => new Headers(init.headers).get('X-CSRF-Token') === 'csrf-token')).toBe(true)
   })
 
@@ -142,10 +143,35 @@ describe('catalog API contract', () => {
     expect(request.withCredentials).toBe(true)
     expect(request.headers.get('Content-Type')).toBe('text/x-gcode')
     expect(request.headers.get('X-File-Name')).toBe(encodeURIComponent(file.name))
+    expect(request.headers.get('If-Match')).toBe('"version-1"')
+    expect(request.headers.has('If-None-Match')).toBe(false)
     expect(request.headers.get('Idempotency-Key')).toBe('upload-key')
     request.respond(200, { ...setupPayload, revision: 4 })
     await expect(pending).resolves.toMatchObject({ setupId: 'setup/encoded', revision: 4 })
     expect(catalogContentURL('setup/encoded', 'setup-sheet')).toBe('/api/v1/catalog/setups/setup%2Fencoded/setup-sheet/content')
+  })
+
+  it('uses an explicit create-only precondition for an absent component', () => {
+    class FakeXMLHttpRequest extends EventTarget {
+      static latest: FakeXMLHttpRequest
+      readonly upload = new EventTarget()
+      readonly headers = new Map<string, string>()
+      status = 0
+      responseText = ''
+      withCredentials = false
+      open(): void {}
+      send(): void {}
+      abort(): void { this.dispatchEvent(new Event('abort')) }
+      setRequestHeader(name: string, value: string): void { this.headers.set(name, value) }
+      getResponseHeader(): string | null { return null }
+      constructor() { super(); FakeXMLHttpRequest.latest = this }
+    }
+    vi.stubGlobal('XMLHttpRequest', FakeXMLHttpRequest)
+    setCsrfToken('csrf-token')
+    const setup = { ...setupPayload, program: null } as CatalogSetup
+    void putCatalogComponent(setup, 'program', new File(['M2\n'], 'new.ngc'), 'create-key')
+    expect(FakeXMLHttpRequest.latest.headers.get('If-None-Match')).toBe('*')
+    expect(FakeXMLHttpRequest.latest.headers.has('If-Match')).toBe(false)
   })
 
   it('rejects malformed catalog artifacts before exposing them to the workbench', async () => {

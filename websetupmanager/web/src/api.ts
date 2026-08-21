@@ -665,11 +665,15 @@ export function putCatalogComponent(
   options: UploadOptions = {},
 ): Promise<CatalogSetup> {
   const query = new URLSearchParams({ expectedRevision: String(setup.revision) })
+  const existing = component === 'program' ? setup.program : setup.setupSheet
+  const filePrecondition: Readonly<Record<string, string>> = existing
+    ? { 'If-Match': `"${existing.version}"` }
+    : { 'If-None-Match': '*' }
   return xhrUpload(
     `/api/v1/catalog/setups/${encodeURIComponent(setup.setupId)}/${component}?${query}`,
     'PUT', file, file.size, key, normalizeCatalogSetup, options,
     file.type || 'application/octet-stream',
-    { 'X-File-Name': encodeURIComponent(file.name) },
+    { 'X-File-Name': encodeURIComponent(file.name), ...filePrecondition },
   )
 }
 
@@ -679,9 +683,20 @@ export async function deleteCatalogComponent(
   key = newIdempotencyKey(),
 ): Promise<CatalogSetup> {
   const query = new URLSearchParams({ expectedRevision: String(setup.revision) })
+  const existing = component === 'program' ? setup.program : setup.setupSheet
+  if (!existing) {
+    throw new ApiError({
+      message: 'The setup component is no longer present.',
+      status: 409,
+      code: 'ARTIFACT_NOT_FOUND',
+    })
+  }
   return normalizeCatalogSetup(await apiRequest<unknown>(
     `/api/v1/catalog/setups/${encodeURIComponent(setup.setupId)}/${component}?${query}`,
-    { method: 'DELETE', headers: { 'Idempotency-Key': key } },
+    { method: 'DELETE', headers: {
+      'Idempotency-Key': key,
+      'If-Match': `"${existing.version}"`,
+    } },
   ))
 }
 
