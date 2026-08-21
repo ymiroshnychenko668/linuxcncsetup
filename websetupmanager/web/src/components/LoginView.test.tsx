@@ -55,7 +55,7 @@ describe('LoginView', () => {
     await user.type(screen.getByLabelText('Имя пользователя'), 'operator')
     await user.type(screen.getByLabelText('Пароль'), 'secret')
 
-    const submit = screen.getByRole('button', { name: 'Открыть библиотеку сетапов' })
+    const submit = screen.getByRole('button', { name: 'Открыть каталог сетапов' })
     await user.click(submit)
     expect(screen.getByRole('button', { name: 'Выполняется вход…' })).toBeDisabled()
     expect(screen.getByLabelText('Имя пользователя')).toBeDisabled()
@@ -82,7 +82,7 @@ describe('LoginView', () => {
     const user = userEvent.setup()
     await user.type(screen.getByLabelText('Имя пользователя'), 'unknown')
     await user.type(screen.getByLabelText('Пароль'), 'wrong')
-    await user.click(screen.getByRole('button', { name: 'Открыть библиотеку сетапов' }))
+    await user.click(screen.getByRole('button', { name: 'Открыть каталог сетапов' }))
 
     expect(await screen.findByRole('alert')).toHaveTextContent('Имя пользователя или пароль не приняты')
     expect(screen.getByLabelText('Имя пользователя')).toHaveValue('unknown')

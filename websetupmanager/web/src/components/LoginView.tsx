@@ -65,10 +65,10 @@ export function LoginView({ message, onAuthenticated }: LoginViewProps) {
     <section className="login-view" aria-labelledby="login-title">
       <div className="login-view__intro">
         <p className="eyebrow">Доступ к рабочему месту</p>
-        <h1>Производственные сетапы в одном управляемом пространстве</h1>
+        <h1>Каталог программ этого станка</h1>
         <p>
-          Войдите под своей учётной записью Linux, чтобы открыть библиотеку,
-          карточки сетапов и безопасный просмотр программ.
+          Войдите под своей учётной записью Linux, чтобы загружать программы
+          в каталог LinuxCNC, группировать сетапы и просматривать G-code.
         </p>
         <div className="login-view__security">
           <span aria-hidden="true">●</span>
@@ -141,7 +141,7 @@ export function LoginView({ message, onAuthenticated }: LoginViewProps) {
 
           <button className="button button--primary login-form__submit" type="submit" disabled={submitting}>
             {submitting ? <span className="spinner spinner--small" aria-hidden="true" /> : null}
-            {submitting ? 'Выполняется вход…' : 'Открыть библиотеку сетапов'}
+            {submitting ? 'Выполняется вход…' : 'Открыть каталог сетапов'}
           </button>
         </form>
 

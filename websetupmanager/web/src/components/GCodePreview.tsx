@@ -32,6 +32,8 @@ type WorkerResponse =
 interface Props {
   setup: Setup
   artifact: Artifact
+  contentUrl?: string
+  compact?: boolean
   onOpenSetupSheet?: () => void
   onArtifactChanged?: () => void
   initialLine?: number
@@ -130,8 +132,11 @@ function lineForScrollTop(scrollTop: number, scrollHeight: number, clientHeight:
   return Math.floor((Math.max(0, scrollTop) / maximumScroll) * (lastWindowLine - 1)) + 1
 }
 
-export function GCodePreview({ setup, artifact, onOpenSetupSheet, onArtifactChanged, initialLine = 1, onLineChanged }: Props) {
-  const url = useMemo(() => contentURL(setup.setupId, artifact.artifactId), [artifact.artifactId, setup.setupId])
+export function GCodePreview({ setup, artifact, contentUrl, compact = false, onOpenSetupSheet, onArtifactChanged, initialLine = 1, onLineChanged }: Props) {
+  const url = useMemo(
+    () => contentUrl ?? contentURL(setup.setupId, artifact.artifactId),
+    [artifact.artifactId, contentUrl, setup.setupId],
+  )
   const workerRef = useRef<Worker | null>(null)
   const viewportRef = useRef<HTMLDivElement>(null)
   const artifactChangedRef = useRef(onArtifactChanged)
@@ -365,15 +370,15 @@ export function GCodePreview({ setup, artifact, onOpenSetupSheet, onArtifactChan
 
   const hasSheet = setup.artifacts.some((item) => item.role === 'setup_sheet')
   return (
-    <section className="gcode-preview" aria-labelledby="preview-title">
-      <header className="preview-header">
+    <section className={`gcode-preview${compact ? ' gcode-preview--compact' : ''}`} aria-labelledby="preview-title">
+      <header className={`preview-header${compact ? ' preview-header--compact' : ''}`}>
         <div>
-          <p className="eyebrow">G-code preview · revision {setup.revision}</p>
+          {!compact ? <p className="eyebrow">G-code preview · revision {setup.revision}</p> : null}
           <h2 id="preview-title">{artifact.displayName}</h2>
-          <p>{setup.name} · {artifact.byteSize.toLocaleString()} байт · версия {artifact.version.slice(0, 12)}… {artifact.primary ? '· Основная программа' : ''}</p>
+          {!compact ? <p>{setup.name} · {artifact.byteSize.toLocaleString()} байт · версия {artifact.version.slice(0, 12)}… {artifact.primary ? '· Основная программа' : ''}</p> : null}
         </div>
         <div className="preview-header__actions">
-          <button type="button" className="button button--quiet" disabled={!hasSheet} onClick={onOpenSetupSheet}>Setup Sheet</button>
+          {!compact ? <button type="button" className="button button--quiet" disabled={!hasSheet} onClick={onOpenSetupSheet}>Setup Sheet</button> : null}
           <label className="toggle"><input type="checkbox" checked={wrap} onChange={(event) => setWrap(event.target.checked)} /> Перенос строк</label>
         </div>
       </header>

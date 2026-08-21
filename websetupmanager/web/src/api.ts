@@ -279,6 +279,7 @@ function xhrUpload<T>(
   normalize: (value: unknown) => T,
   options: UploadOptions = {},
   contentType?: string,
+  extraHeaders: Readonly<Record<string, string>> = {},
 ): Promise<T> {
   if (!csrfToken) {
     return Promise.reject(new ApiError({
@@ -309,6 +310,7 @@ function xhrUpload<T>(
     if (contentType) request.setRequestHeader('Content-Type', contentType)
     request.setRequestHeader('X-CSRF-Token', token)
     request.setRequestHeader('Idempotency-Key', key)
+    Object.entries(extraHeaders).forEach(([name, value]) => request.setRequestHeader(name, value))
     request.upload.addEventListener('progress', (event) => {
       options.onProgress?.(Math.min(event.loaded, totalBytes), totalBytes)
     })
@@ -357,6 +359,48 @@ function xhrUpload<T>(
   })
 }
 
+export interface CatalogDestination {
+  rootLabel: string
+  rootDisplay: string
+}
+
+export interface CatalogFolder {
+  folderId: string
+  parentFolderId?: string
+  name: string
+  relativePath: string
+  revision: number
+}
+
+export interface CatalogArtifact {
+  artifactId: string
+  displayName: string
+  mediaType: string
+  byteSize: number
+  version: string
+  relativePath: string
+}
+
+export interface CatalogSetup {
+  setupId: string
+  folderId?: string
+  name: string
+  description?: string
+  revision: number
+  program: CatalogArtifact | null
+  setupSheet: CatalogArtifact | null
+  programRelativePath?: string
+  setupSheetRelativePath?: string
+  updatedAt: string
+}
+
+export interface CatalogSnapshot {
+  destination: CatalogDestination
+  generation: string
+  folders: CatalogFolder[]
+  setups: CatalogSetup[]
+}
+
 async function jsonMutation<T>(path: string, method: string, body: unknown, key = newIdempotencyKey(), signal?: AbortSignal): Promise<T> {
   return apiRequest<T>(path, {
     method, signal, body: JSON.stringify(body),
@@ -381,6 +425,51 @@ function normalizeArtifact(value: unknown): Artifact {
     primary: value.primary === true,
     state: state as Artifact['state'],
     createdAt: requiredString(value.createdAt, 'createdAt'),
+    updatedAt: requiredString(value.updatedAt, 'updatedAt'),
+  }
+}
+
+function normalizeCatalogArtifact(value: unknown, field: string): CatalogArtifact {
+  if (!isRecord(value)) throw invalidResponse(`Invalid catalog ${field}.`)
+  return {
+    artifactId: requiredString(value.artifactId, `${field}.artifactId`),
+    displayName: requiredString(value.displayName, `${field}.displayName`),
+    mediaType: requiredString(value.mediaType, `${field}.mediaType`),
+    byteSize: requiredNumber(value.byteSize, `${field}.byteSize`),
+    version: requiredString(value.version, `${field}.version`),
+    relativePath: requiredString(value.relativePath, `${field}.relativePath`),
+  }
+}
+
+function normalizeCatalogFolder(value: unknown): CatalogFolder {
+  if (!isRecord(value)) throw invalidResponse('Invalid catalog folder.')
+  return {
+    folderId: requiredString(value.folderId, 'folderId'),
+    parentFolderId: asNonEmptyString(value.parentFolderId),
+    name: requiredString(value.name, 'folder name'),
+    relativePath: requiredString(value.relativePath, 'folder relativePath'),
+    revision: requiredNumber(value.revision, 'folder revision'),
+  }
+}
+
+function normalizeCatalogSetup(value: unknown): CatalogSetup {
+  if (!isRecord(value)) throw invalidResponse('Invalid catalog setup.')
+  const program = value.program === null || value.program === undefined
+    ? null
+    : normalizeCatalogArtifact(value.program, 'program')
+  const setupSheet = value.setupSheet === null || value.setupSheet === undefined
+    ? null
+    : normalizeCatalogArtifact(value.setupSheet, 'setupSheet')
+  return {
+    setupId: requiredString(value.setupId, 'setupId'),
+    folderId: asNonEmptyString(value.folderId),
+    name: requiredString(value.name, 'setup name'),
+    description: typeof value.description === 'string' ? value.description : undefined,
+    revision: requiredNumber(value.revision, 'setup revision'),
+    program,
+    setupSheet,
+    programRelativePath: asNonEmptyString(value.programRelativePath) ?? program?.relativePath,
+    setupSheetRelativePath: asNonEmptyString(value.setupSheetRelativePath) ?? setupSheet?.relativePath,
     updatedAt: requiredString(value.updatedAt, 'updatedAt'),
   }
 }
@@ -475,6 +564,125 @@ function normalizeImportSession(value: unknown): ImportSession {
     errorCode: asNonEmptyString(value.errorCode), expiresAt: requiredString(value.expiresAt, 'expiresAt'),
     createdAt: requiredString(value.createdAt, 'createdAt'), updatedAt: requiredString(value.updatedAt, 'updatedAt'),
   }
+}
+
+export async function getCatalog(signal?: AbortSignal): Promise<CatalogSnapshot> {
+  const value = await apiRequest<unknown>('/api/v1/catalog', { signal })
+  if (!isRecord(value) || !isRecord(value.destination)
+    || !Array.isArray(value.folders) || !Array.isArray(value.setups)) {
+    throw invalidResponse('Invalid catalog response.')
+  }
+  return {
+    destination: {
+      rootLabel: requiredString(value.destination.rootLabel, 'destination.rootLabel'),
+      rootDisplay: requiredString(value.destination.rootDisplay, 'destination.rootDisplay'),
+    },
+    generation: requiredString(value.generation, 'catalog generation'),
+    folders: value.folders.map(normalizeCatalogFolder),
+    setups: value.setups.map(normalizeCatalogSetup),
+  }
+}
+
+export async function createCatalogFolder(
+  parentFolderId: string | undefined,
+  name: string,
+  key = newIdempotencyKey(),
+): Promise<CatalogFolder> {
+  return normalizeCatalogFolder(await jsonMutation<unknown>('/api/v1/catalog/folders', 'POST', {
+    parentFolderId: parentFolderId ?? null,
+    name,
+  }, key))
+}
+
+export async function updateCatalogFolder(
+  folder: CatalogFolder,
+  changes: { name?: string; parentFolderId?: string | null },
+  key = newIdempotencyKey(),
+): Promise<CatalogFolder> {
+  return normalizeCatalogFolder(await jsonMutation<unknown>(
+    `/api/v1/catalog/folders/${encodeURIComponent(folder.folderId)}`,
+    'PATCH',
+    { expectedRevision: folder.revision, ...changes },
+    key,
+  ))
+}
+
+export async function deleteCatalogFolder(
+  folder: CatalogFolder,
+  key = newIdempotencyKey(),
+): Promise<void> {
+  const query = new URLSearchParams({ expectedRevision: String(folder.revision) })
+  await apiRequest<unknown>(`/api/v1/catalog/folders/${encodeURIComponent(folder.folderId)}?${query}`, {
+    method: 'DELETE', headers: { 'Idempotency-Key': key },
+  })
+}
+
+export async function createCatalogSetup(
+  input: { folderId?: string; name: string; description?: string },
+  key = newIdempotencyKey(),
+): Promise<CatalogSetup> {
+  return normalizeCatalogSetup(await jsonMutation<unknown>('/api/v1/catalog/setups', 'POST', {
+    folderId: input.folderId ?? null,
+    name: input.name,
+    description: input.description ?? '',
+  }, key))
+}
+
+export async function updateCatalogSetup(
+  setup: CatalogSetup,
+  changes: { name?: string; description?: string; folderId?: string | null },
+  key = newIdempotencyKey(),
+): Promise<CatalogSetup> {
+  return normalizeCatalogSetup(await jsonMutation<unknown>(
+    `/api/v1/catalog/setups/${encodeURIComponent(setup.setupId)}`,
+    'PATCH',
+    { expectedRevision: setup.revision, ...changes },
+    key,
+  ))
+}
+
+export async function deleteCatalogSetup(
+  setup: CatalogSetup,
+  key = newIdempotencyKey(),
+): Promise<void> {
+  const query = new URLSearchParams({ expectedRevision: String(setup.revision) })
+  await apiRequest<unknown>(`/api/v1/catalog/setups/${encodeURIComponent(setup.setupId)}?${query}`, {
+    method: 'DELETE', headers: { 'Idempotency-Key': key },
+  })
+}
+
+export type CatalogComponent = 'program' | 'setup-sheet'
+
+export function catalogContentURL(setupId: string, component: CatalogComponent): string {
+  return `/api/v1/catalog/setups/${encodeURIComponent(setupId)}/${component}/content`
+}
+
+export function putCatalogComponent(
+  setup: CatalogSetup,
+  component: CatalogComponent,
+  file: File,
+  key = newIdempotencyKey(),
+  options: UploadOptions = {},
+): Promise<CatalogSetup> {
+  const query = new URLSearchParams({ expectedRevision: String(setup.revision) })
+  return xhrUpload(
+    `/api/v1/catalog/setups/${encodeURIComponent(setup.setupId)}/${component}?${query}`,
+    'PUT', file, file.size, key, normalizeCatalogSetup, options,
+    file.type || 'application/octet-stream',
+    { 'X-File-Name': encodeURIComponent(file.name) },
+  )
+}
+
+export async function deleteCatalogComponent(
+  setup: CatalogSetup,
+  component: CatalogComponent,
+  key = newIdempotencyKey(),
+): Promise<CatalogSetup> {
+  const query = new URLSearchParams({ expectedRevision: String(setup.revision) })
+  return normalizeCatalogSetup(await apiRequest<unknown>(
+    `/api/v1/catalog/setups/${encodeURIComponent(setup.setupId)}/${component}?${query}`,
+    { method: 'DELETE', headers: { 'Idempotency-Key': key } },
+  ))
 }
 
 export interface SetupQuery {

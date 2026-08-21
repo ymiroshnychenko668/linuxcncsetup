@@ -6,16 +6,17 @@ import { PDFViewer } from './PDFViewer'
 interface Props {
   setup: Setup
   artifact: Artifact
+  contentUrl?: string
   onClose: () => void
   onReplace: () => void
 }
 
-export function SetupSheetViewer({ setup, artifact, onClose, onReplace }: Props) {
+export function SetupSheetViewer({ setup, artifact, contentUrl, onClose, onReplace }: Props) {
   const surfaceRef = useRef<HTMLDivElement>(null)
   const [failed, setFailed] = useState(false)
   const [htmlReady, setHTMLReady] = useState(false)
   const [htmlScale, setHTMLScale] = useState(1)
-  const contentURL = `/api/v1/setups/${encodeURIComponent(setup.setupId)}/setup-sheet/content`
+  const contentURL = contentUrl ?? `/api/v1/setups/${encodeURIComponent(setup.setupId)}/setup-sheet/content`
   const versionedContentURL = `${contentURL}?version=${encodeURIComponent(artifact.version)}`
   const handleError = useCallback(() => setFailed(true), [])
   const requestFullscreen = useCallback(() => {
