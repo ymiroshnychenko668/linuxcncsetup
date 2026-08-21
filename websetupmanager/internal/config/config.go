@@ -208,8 +208,9 @@ func (c *Config) Validate() error {
 	if !validPublicRootDisplay(c.ProgramRootDisplay) {
 		return errors.New("WEB_SETUP_MANAGER_PROGRAM_ROOT_DISPLAY must be a safe relative display hint of 1-200 characters")
 	}
-	if strings.TrimSpace(c.LibraryAlias) == "" || len([]rune(c.LibraryAlias)) > 100 {
-		return errors.New("WEB_SETUP_MANAGER_LIBRARY_ALIAS must contain 1-100 characters")
+	c.LibraryAlias = strings.TrimSpace(c.LibraryAlias)
+	if !validPublicLabel(c.LibraryAlias) {
+		return errors.New("WEB_SETUP_MANAGER_LIBRARY_ALIAS must be a safe public label of 1-100 characters")
 	}
 	if c.RecentSetupsLimit < 1 || c.RecentSetupsLimit > 1000 {
 		return errors.New("WEB_SETUP_MANAGER_RECENT_SETUPS_LIMIT must be between 1 and 1000")
@@ -503,6 +504,23 @@ func validPublicRootDisplay(value string) bool {
 	}
 	for _, segment := range strings.Split(value, "/") {
 		if segment == "" || segment == "." || segment == ".." {
+			return false
+		}
+	}
+	return true
+}
+
+// validPublicLabel protects API-visible labels from accidentally becoming a
+// disclosure channel for a configured host path. Labels are deliberately
+// single-segment display text; catalog navigation is represented separately.
+func validPublicLabel(value string) bool {
+	if value == "" || len([]rune(value)) > 100 || filepath.IsAbs(value) ||
+		strings.HasPrefix(value, "~") || strings.ContainsAny(value, `/\`) ||
+		strings.Contains(value, "://") {
+		return false
+	}
+	for _, character := range value {
+		if character < 0x20 || character == 0x7f {
 			return false
 		}
 	}

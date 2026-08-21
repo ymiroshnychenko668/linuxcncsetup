@@ -171,6 +171,35 @@ func TestValidateRejectsPhysicalProgramRootDisplay(t *testing.T) {
 	}
 }
 
+func TestValidateRejectsPathLikePublicLibraryAlias(t *testing.T) {
+	for _, alias := range []string{
+		"/home/operator/linuxcnc/nc_files",
+		`C:\\LinuxCNC\\nc_files`,
+		`\\\\server\\share`,
+		"file://machine/programs",
+		"~/linuxcnc/nc_files",
+		"LinuxCNC\nprograms",
+	} {
+		t.Run(alias, func(t *testing.T) {
+			configuration := validTestConfig()
+			configuration.LibraryAlias = alias
+			if err := configuration.Validate(); err == nil {
+				t.Fatalf("path-like/unsafe public alias %q was accepted", alias)
+			}
+		})
+	}
+
+	for _, alias := range []string{"Сетапы", "Программы LinuxCNC", "Workshop: programs"} {
+		t.Run("safe-"+alias, func(t *testing.T) {
+			configuration := validTestConfig()
+			configuration.LibraryAlias = alias
+			if err := configuration.Validate(); err != nil {
+				t.Fatalf("safe public alias %q rejected: %v", alias, err)
+			}
+		})
+	}
+}
+
 func TestValidateRootsRejectsOverlapAndSymlink(t *testing.T) {
 	library := t.TempDir()
 	state := filepath.Join(library, "state")
