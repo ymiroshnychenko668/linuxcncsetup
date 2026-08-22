@@ -1,4 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import Alert from '@mui/material/Alert'
+import Button from '@mui/material/Button'
+import CircularProgress from '@mui/material/CircularProgress'
+import IconButton from '@mui/material/IconButton'
 import type { Artifact, Setup } from '../domain'
 import { Modal } from './Modal'
 import { PDFViewer } from './PDFViewer'
@@ -77,19 +81,19 @@ export function SetupSheetViewer({ setup, artifact, contentUrl, onClose, onRepla
   const surface = (
     <div ref={surfaceRef} className="sheet-viewer-surface">
       {failed ? (
-        <div className="viewer-error" role="alert">
+        <Alert className="viewer-error" severity="error" role="alert" icon={false}>
           Setup Sheet не удалось показать. Документ мог быть повреждён или изменён.
-          <button type="button" className="button button--quiet" onClick={(event) => onReplace(event.currentTarget)}>Заменить документ</button>
-        </div>
+          <Button type="button" className="button button--quiet" variant="outlined" onClick={(event) => onReplace(event.currentTarget)}>Заменить документ</Button>
+        </Alert>
       ) : artifact.mediaType === 'application/pdf' ? (
         <PDFViewer artifact={artifact} url={contentURL} onError={handleError} />
       ) : (
         <div className="html-sheet-viewer">
           <div className="viewer-toolbar" role="toolbar" aria-label="Управление HTML Setup Sheet">
-            <button type="button" onClick={() => setHTMLScale((value) => Math.max(0.5, value - 0.25))} aria-label="Уменьшить масштаб">−</button>
+            <IconButton type="button" size="small" onClick={() => setHTMLScale((value) => Math.max(0.5, value - 0.25))} aria-label="Уменьшить масштаб">−</IconButton>
             <output aria-label="Масштаб HTML Setup Sheet">{Math.round(htmlScale * 100)}%</output>
-            <button type="button" onClick={() => setHTMLScale((value) => Math.min(4, value + 0.25))} aria-label="Увеличить масштаб">+</button>
-            {!htmlReady ? <span role="status">Загружаем Setup Sheet…</span> : null}
+            <IconButton type="button" size="small" onClick={() => setHTMLScale((value) => Math.min(4, value + 0.25))} aria-label="Увеличить масштаб">+</IconButton>
+            {!htmlReady ? <span role="status"><CircularProgress size="1em" aria-hidden="true" /> Загружаем Setup Sheet…</span> : null}
           </div>
           <div className="html-sheet-scroll" tabIndex={0} aria-label={`HTML Setup Sheet ${artifact.displayName}`}>
             {htmlReady ? (
@@ -121,9 +125,9 @@ export function SetupSheetViewer({ setup, artifact, contentUrl, onClose, onRepla
       className="sheet-viewer-modal"
       footer={(
         <>
-          <button type="button" className="button button--quiet" onClick={requestFullscreen}>На весь экран</button>
-          <button type="button" className="button button--quiet" onClick={(event) => onReplace(event.currentTarget)}>Заменить</button>
-          <button type="button" className="button button--primary" onClick={onClose}>Закрыть</button>
+          <Button type="button" className="button button--quiet" variant="outlined" onClick={requestFullscreen}>На весь экран</Button>
+          <Button type="button" className="button button--quiet" variant="outlined" onClick={(event) => onReplace(event.currentTarget)}>Заменить</Button>
+          <Button type="button" className="button button--primary" variant="contained" onClick={onClose}>Закрыть</Button>
         </>
       )}
     >

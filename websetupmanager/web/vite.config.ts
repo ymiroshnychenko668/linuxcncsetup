@@ -6,6 +6,17 @@ export default defineConfig({
   build: {
     outDir: 'dist',
     emptyOutDir: true,
+    rollupOptions: {
+      output: {
+        manualChunks(moduleId) {
+          const id = moduleId.replace(/\\/g, '/')
+          if (/\/node_modules\/(?:@mui|@emotion|react(?:-dom|-is)?|scheduler)\//.test(id)) {
+            return 'ui-vendor'
+          }
+          return undefined
+        },
+      },
+    },
   },
   server: {
     host: '127.0.0.1',

@@ -5,7 +5,13 @@ import {
   type ReactNode,
   type RefObject,
 } from 'react'
-import { createPortal } from 'react-dom'
+import Dialog from '@mui/material/Dialog'
+import DialogActions from '@mui/material/DialogActions'
+import DialogContent from '@mui/material/DialogContent'
+import DialogTitle from '@mui/material/DialogTitle'
+import Box from '@mui/material/Box'
+import IconButton from '@mui/material/IconButton'
+import Typography from '@mui/material/Typography'
 
 const focusableSelector = [
   'a[href]',
@@ -48,9 +54,7 @@ export function Modal({
 }: ModalProps) {
   const titleId = useId()
   const descriptionId = useId()
-  const dialogRef = useRef<HTMLElement>(null)
-  const onCloseRef = useRef(onClose)
-  const closeDisabledRef = useRef(closeDisabled)
+  const dialogRef = useRef<HTMLDivElement | null>(null)
   const previouslyFocusedRef = useRef<HTMLElement | null | undefined>(undefined)
 
   // React applies a descendant's autoFocus during the commit before this
@@ -62,36 +66,29 @@ export function Modal({
       : null
   }
 
-  onCloseRef.current = onClose
-  closeDisabledRef.current = closeDisabled
-
   useEffect(() => {
     const explicitReturnTarget = returnFocusRef?.current
     const previouslyFocused = explicitReturnTarget
       ?? previouslyFocusedRef.current
-    const previousOverflow = document.body.style.overflow
-    document.body.style.overflow = 'hidden'
-
-    const focusFirst = () => {
+    const focusFirst = (): boolean => {
+      const labelledElement = document.getElementById(titleId)
       const dialog = dialogRef.current
-      if (!dialog) return
+        ?? labelledElement?.closest<HTMLDivElement>('[role="dialog"]')
+      if (!dialog) return false
+      dialogRef.current = dialog
       const requested = initialFocusRef?.current
       if (requested && dialog.contains(requested)) {
         requested.focus()
-        return
+        return true
       }
       ;(focusableElements(dialog)[0] ?? dialog).focus()
+      return true
     }
 
     const onKeyDown = (event: KeyboardEvent) => {
       const dialog = dialogRef.current
       if (!dialog) return
 
-      if (event.key === 'Escape') {
-        event.preventDefault()
-        if (!closeDisabledRef.current) onCloseRef.current()
-        return
-      }
       if (event.key !== 'Tab') return
 
       const focusable = focusableElements(dialog)
@@ -124,12 +121,12 @@ export function Modal({
 
     document.addEventListener('keydown', onKeyDown)
     document.addEventListener('focusin', onFocusIn)
-    focusFirst()
+    const focusTimer = focusFirst() ? undefined : window.setTimeout(focusFirst, 0)
 
     return () => {
+      if (focusTimer !== undefined) window.clearTimeout(focusTimer)
       document.removeEventListener('keydown', onKeyDown)
       document.removeEventListener('focusin', onFocusIn)
-      document.body.style.overflow = previousOverflow
       const returnTarget = explicitReturnTarget ?? previouslyFocused
       if (returnTarget?.isConnected) {
         returnTarget.focus()
@@ -144,45 +141,52 @@ export function Modal({
         applicationMain.focus()
       }
     }
-  }, [initialFocusRef, returnFocusRef])
+  }, [initialFocusRef, returnFocusRef, titleId])
 
-  return createPortal(
-    <div
-      className="modal-backdrop"
-      role="presentation"
-      onMouseDown={(event) => {
-        if (event.target === event.currentTarget && !closeDisabled) onClose()
+  return (
+    <Dialog
+      open
+      maxWidth={false}
+      scroll="paper"
+      transitionDuration={0}
+      disableAutoFocus
+      disableEnforceFocus
+      disableRestoreFocus
+      aria-labelledby={titleId}
+      aria-describedby={description ? descriptionId : undefined}
+      onClose={(_event, reason) => {
+        if (closeDisabled && (reason === 'escapeKeyDown' || reason === 'backdropClick')) return
+        onClose()
+      }}
+      slotProps={{
+        backdrop: { className: 'modal-backdrop' },
+        container: { className: 'modal-container' },
+        paper: {
+          ref: dialogRef,
+          className: `modal ${className}`.trim(),
+          'aria-busy': closeDisabled || undefined,
+          sx: { m: { xs: 0, sm: 2 } },
+        },
       }}
     >
-      <section
-        ref={dialogRef}
-        className={`modal ${className}`.trim()}
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby={titleId}
-        aria-describedby={description ? descriptionId : undefined}
-        aria-busy={closeDisabled || undefined}
-        tabIndex={-1}
-      >
-        <header className="modal__header">
-          <div>
-            <h2 id={titleId}>{title}</h2>
-            {description ? <p id={descriptionId}>{description}</p> : null}
-          </div>
-          <button
-            className="icon-button"
-            type="button"
-            aria-label={closeLabel}
-            onClick={onClose}
-            disabled={closeDisabled}
-          >
-            <span aria-hidden="true">×</span>
-          </button>
-        </header>
-        <div className="modal__body">{children}</div>
-        {footer ? <footer className="modal__footer">{footer}</footer> : null}
-      </section>
-    </div>,
-    document.body,
+      <Box component="header" className="modal__header" sx={{ borderBottom: 1, borderColor: 'divider' }}>
+        <div>
+          <DialogTitle id={titleId} component="h2" sx={{ p: 0 }}>{title}</DialogTitle>
+          {description ? <Typography id={descriptionId} component="p" variant="body2" color="text.secondary">{description}</Typography> : null}
+        </div>
+        <IconButton
+          className="icon-button"
+          type="button"
+          aria-label={closeLabel}
+          onClick={onClose}
+          disabled={closeDisabled}
+          sx={{ color: 'text.primary', backgroundColor: 'action.hover' }}
+        >
+          <span aria-hidden="true">×</span>
+        </IconButton>
+      </Box>
+      <DialogContent className="modal__body">{children}</DialogContent>
+      {footer ? <DialogActions className="modal__footer" sx={{ borderTop: 1, borderColor: 'divider', backgroundColor: 'background.default', '& > :not(style) ~ :not(style)': { marginLeft: 0 } }}>{footer}</DialogActions> : null}
+    </Dialog>
   )
 }

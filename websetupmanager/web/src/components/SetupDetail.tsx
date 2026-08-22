@@ -1,4 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
+import Alert from '@mui/material/Alert'
+import Button from '@mui/material/Button'
+import CircularProgress from '@mui/material/CircularProgress'
 import {
 	ApiError,
   cancelJob,
@@ -72,13 +75,26 @@ function JobNotice({ job, setup, onCancel, onReload }: { job: Job; setup: Setup;
     : undefined
   const completed = bytePercent ?? itemPercent
   const issues = jobIssues(job)
+	const severity = job.state === 'failed' || job.state === 'conflict'
+		? 'error' as const
+		: job.state === 'cancelled' ? 'warning' as const : job.state === 'succeeded' ? 'success' as const : 'info' as const
 	const labels: Record<string, string> = {
 		validate: 'Проверка сетапа', duplicate: 'Дублирование сетапа',
 		addPrograms: 'Добавление программ', replaceProgram: 'Загрузка файла сетапа',
 		updateSetupSheet: 'Загрузка Setup Sheet', restore: 'Восстановление сетапа',
 	}
   return (
-    <section className={`job-notice job-notice--${job.state}`} aria-live="polite" aria-busy={active || undefined}>
+    <Alert
+      component="section"
+      className={`job-notice job-notice--${job.state}`}
+      severity={severity}
+      variant="standard"
+      icon={active ? <CircularProgress color="inherit" size="1rem" aria-hidden="true" /> : false}
+      role="status"
+      aria-live="polite"
+      aria-busy={active || undefined}
+      sx={{ '& .MuiAlert-message': { display: 'contents' }, '& .MuiAlert-icon': { margin: 0, padding: 0 } }}
+    >
       <div>
         <strong>{labels[job.kind] ?? 'Фоновая операция сетапа'}</strong>
         <p>
@@ -89,8 +105,8 @@ function JobNotice({ job, setup, onCancel, onReload }: { job: Job; setup: Setup;
           {job.state === 'cancelled' ? 'Операция отменена.' : null}
         </p>
       </div>
-      {active ? <button className="button button--quiet" type="button" onClick={onCancel}>Отменить job</button> : null}
-      {job.state === 'conflict' ? <button className="button button--quiet" type="button" onClick={() => void onReload()}>Загрузить актуальную revision</button> : null}
+      {active ? <Button component="button" className="button button--quiet" type="button" onClick={onCancel}>Отменить job</Button> : null}
+      {job.state === 'conflict' ? <Button component="button" className="button button--quiet" type="button" onClick={() => void onReload()}>Загрузить актуальную revision</Button> : null}
       {!active && issues.length > 0 ? <ul className="validation-issues">
         {issues.map((issue, index) => {
           const artifact = setup.artifacts.find((item) => item.artifactId === issue.artifactId)
@@ -101,7 +117,7 @@ function JobNotice({ job, setup, onCancel, onReload }: { job: Job; setup: Setup;
           </li>
         })}
       </ul> : null}
-    </section>
+    </Alert>
   )
 }
 
@@ -281,7 +297,7 @@ export function SetupDetail({
 
   return (
     <article className="setup-detail" aria-labelledby="setup-title">
-      <button className="back-button" type="button" onClick={onBack}>← К библиотеке</button>
+      <Button component="button" className="back-button" type="button" onClick={onBack}>← К библиотеке</Button>
       <header className="detail-hero">
         <div>
           <p className="eyebrow">{sourceLabels[setup.source]} · Revision {setup.revision}</p>
@@ -289,18 +305,18 @@ export function SetupDetail({
           <p>Изменён {formatDate(setup.updatedAt)} · ID используется внутри системы и не раскрывает физическое хранилище.</p>
         </div>
         <div className="detail-actions" aria-label="Действия сетапа">
-          {setup.status !== 'archived' ? <button className="button button--primary" type="button" onClick={() => setConfirm({ kind: 'validate' })}>Проверить</button> : null}
-          {setup.status === 'ready' && current?.setupId !== setup.setupId ? <button className="button button--quiet" type="button" onClick={() => setConfirm({ kind: 'current' })}>Выбрать текущим</button> : null}
-          <button className="button button--quiet" type="button" onClick={() => setDuplicateOpen(true)}>Дублировать</button>
+          {setup.status !== 'archived' ? <Button component="button" className="button button--primary" type="button" onClick={() => setConfirm({ kind: 'validate' })}>Проверить</Button> : null}
+          {setup.status === 'ready' && current?.setupId !== setup.setupId ? <Button component="button" className="button button--quiet" type="button" onClick={() => setConfirm({ kind: 'current' })}>Выбрать текущим</Button> : null}
+          <Button component="button" className="button button--quiet" type="button" onClick={() => setDuplicateOpen(true)}>Дублировать</Button>
           {setup.status === 'archived' ? (
-            <><button className="button button--quiet" type="button" onClick={() => setConfirm({ kind: 'restore' })}>Восстановить</button><button className="button button--danger" type="button" onClick={() => setDeleteOpen(true)}>Удалить навсегда</button></>
-          ) : <button className="button button--quiet" type="button" disabled={current?.setupId === setup.setupId} title={current?.setupId === setup.setupId ? 'Сначала снимите выбор текущего сетапа' : undefined} onClick={() => setConfirm({ kind: 'archive' })}>В архив</button>}
+            <><Button component="button" className="button button--quiet" type="button" onClick={() => setConfirm({ kind: 'restore' })}>Восстановить</Button><Button component="button" className="button button--danger" type="button" onClick={() => setDeleteOpen(true)}>Удалить навсегда</Button></>
+          ) : <Button component="button" className="button button--quiet" type="button" disabled={current?.setupId === setup.setupId} title={current?.setupId === setup.setupId ? 'Сначала снимите выбор текущего сетапа' : undefined} onClick={() => setConfirm({ kind: 'archive' })}>В архив</Button>}
         </div>
       </header>
 
-      {current?.setupId === setup.setupId ? <p className="current-detail-notice">Текущий сетап · выбрана revision {current.revisionSelected}. Выбор не означает запуск программы.</p> : null}
+      {current?.setupId === setup.setupId ? <Alert className="current-detail-notice" severity="success" variant="standard" icon={false} role="status" sx={{ '& .MuiAlert-message': { padding: 0 } }}>Текущий сетап · выбрана revision {current.revisionSelected}. Выбор не означает запуск программы.</Alert> : null}
       {job ? <JobNotice job={job} setup={setup} onCancel={() => void cancelActiveJob()} onReload={onReload} /> : null}
-      {jobError ? <p className="form-error" role="alert">{jobError}</p> : null}
+      {jobError ? <Alert className="form-error" severity="error" variant="standard" icon={false} role="alert" sx={{ '& .MuiAlert-message': { padding: 0 } }}>{jobError}</Alert> : null}
 
       <section className={`readiness readiness--${setup.status}`} aria-labelledby="readiness-title">
         <div><p className="eyebrow">Готовность</p><h2 id="readiness-title">{setup.status === 'ready' ? 'Revision прошла структурную проверку' : 'Что нужно проверить'}</h2></div>
@@ -313,7 +329,7 @@ export function SetupDetail({
       <section className="detail-section" aria-labelledby="programs-title">
         <div className="section-heading">
           <div><p className="eyebrow">G-code</p><h2 id="programs-title">Программы <span>{programs.length}</span></h2></div>
-          {setup.status !== 'archived' ? <button className="button button--primary" type="button" onClick={() => programPicker.current?.click()}>Добавить программу</button> : null}
+          {setup.status !== 'archived' ? <Button component="button" className="button button--primary" type="button" onClick={() => programPicker.current?.click()}>Добавить программу</Button> : null}
         </div>
         <input ref={programPicker} className="visually-hidden" type="file" tabIndex={-1} aria-hidden="true" multiple onChange={(event) => { const files = event.target.files ? Array.from(event.target.files) : []; if (files.length > 0) setProgramFiles(files); event.target.value = '' }} />
         <input ref={replacementPicker} className="visually-hidden" type="file" tabIndex={-1} aria-hidden="true" onChange={(event) => { const file = event.target.files?.[0]; if (file && replaceProgramId.current) setFileIntent({ kind: 'replace-program', file, artifactId: replaceProgramId.current }); event.target.value = '' }} />
@@ -321,14 +337,14 @@ export function SetupDetail({
           <ul className="artifact-list">
             {programs.map((artifact) => (
               <li key={artifact.artifactId} className={selectedProgram?.artifactId === artifact.artifactId ? 'artifact-list__selected' : ''}>
-                <button className="artifact-list__open" type="button" onClick={() => onSelectedArtifact(artifact.artifactId)}>
+                <Button component="button" className="artifact-list__open" type="button" onClick={() => onSelectedArtifact(artifact.artifactId)}>
                   <strong>{artifact.displayName}</strong><span>{artifact.primary ? 'Основная · ' : ''}{formatBytes(artifact.byteSize)} · {artifact.state}</span>
-                </button>
+                </Button>
                 {setup.status !== 'archived' ? <div className="artifact-list__actions">
-                  {!artifact.primary ? <button type="button" onClick={() => setConfirm({ kind: 'primary', artifactId: artifact.artifactId })}>Основная</button> : null}
-                  <button type="button" onClick={() => setRenameId(artifact.artifactId)}>Переименовать</button>
-                  <button type="button" onClick={() => { replaceProgramId.current = artifact.artifactId; replacementPicker.current?.click() }}>Заменить</button>
-                  <button type="button" onClick={() => setDeleteProgramId(artifact.artifactId)}>Удалить</button>
+                  {!artifact.primary ? <Button component="button" type="button" onClick={() => setConfirm({ kind: 'primary', artifactId: artifact.artifactId })} sx={{ minWidth: 0 }}>Основная</Button> : null}
+                  <Button component="button" type="button" onClick={() => setRenameId(artifact.artifactId)} sx={{ minWidth: 0 }}>Переименовать</Button>
+                  <Button component="button" type="button" onClick={() => { replaceProgramId.current = artifact.artifactId; replacementPicker.current?.click() }} sx={{ minWidth: 0 }}>Заменить</Button>
+                  <Button component="button" type="button" onClick={() => setDeleteProgramId(artifact.artifactId)} sx={{ minWidth: 0 }}>Удалить</Button>
                 </div> : null}
               </li>
             ))}
@@ -340,7 +356,7 @@ export function SetupDetail({
       <section className="detail-section" aria-labelledby="sheet-title">
         <div className="section-heading"><div><p className="eyebrow">Общий документ</p><h2 id="sheet-title">Setup Sheet</h2></div></div>
         <input ref={sheetPicker} className="visually-hidden" type="file" tabIndex={-1} aria-hidden="true" accept=".pdf,.html,.htm" onChange={(event) => { const file = event.target.files?.[0]; if (file) setFileIntent({ kind: 'put-sheet', file, artifactId: sheet?.artifactId }); event.target.value = '' }} />
-        {sheet ? <div className="sheet-card"><div><strong>{sheet.displayName}</strong><p>{sheet.mediaType} · {formatBytes(sheet.byteSize)} · {sheet.state}</p></div><div className="sheet-card__actions"><button className="button button--primary" type="button" onClick={() => setViewerOpen(true)}>Открыть</button>{setup.status !== 'archived' ? <><button className="button button--quiet" type="button" onClick={() => sheetPicker.current?.click()}>Заменить</button><button className="button button--quiet" type="button" onClick={() => setConfirm({ kind: 'delete-artifact', artifactId: sheet.artifactId })}>Удалить</button></> : null}</div></div> : <div className="section-empty"><p>Setup Sheet не добавлена.</p>{setup.status !== 'archived' ? <button className="button button--primary" type="button" onClick={() => sheetPicker.current?.click()}>Добавить PDF или HTML</button> : null}</div>}
+        {sheet ? <div className="sheet-card"><div><strong>{sheet.displayName}</strong><p>{sheet.mediaType} · {formatBytes(sheet.byteSize)} · {sheet.state}</p></div><div className="sheet-card__actions"><Button component="button" className="button button--primary" type="button" onClick={() => setViewerOpen(true)}>Открыть</Button>{setup.status !== 'archived' ? <><Button component="button" className="button button--quiet" type="button" onClick={() => sheetPicker.current?.click()}>Заменить</Button><Button component="button" className="button button--quiet" type="button" onClick={() => setConfirm({ kind: 'delete-artifact', artifactId: sheet.artifactId })}>Удалить</Button></> : null}</div></div> : <div className="section-empty"><p>Setup Sheet не добавлена.</p>{setup.status !== 'archived' ? <Button component="button" className="button button--primary" type="button" onClick={() => sheetPicker.current?.click()}>Добавить PDF или HTML</Button> : null}</div>}
       </section>
 
       {viewerOpen && sheet ? <SetupSheetViewer setup={setup} artifact={sheet} onClose={() => setViewerOpen(false)} onReplace={() => { setViewerOpen(false); sheetPicker.current?.click() }} /> : null}

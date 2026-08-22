@@ -1,4 +1,8 @@
 import { useMemo, useRef, useState } from 'react'
+import Button from '@mui/material/Button'
+import Checkbox from '@mui/material/Checkbox'
+import FormControlLabel from '@mui/material/FormControlLabel'
+import TextField from '@mui/material/TextField'
 import { ApiError, cancelJob, deleteArtifact, getSetup, newIdempotencyKey, uploadPrograms, waitForJob } from '../api'
 import type { Artifact, Job, Setup } from '../domain'
 import { formatBytes, isNetworkError } from '../ui'
@@ -89,10 +93,10 @@ export function MultiProgramUploadDialog({
     title={`Добавить программы: ${programs.length}`}
     description={`Все файлы публикуются одной атомарной операцией в revision ${setup.revision}. Browser filename не используется без подтверждения.`}
     onClose={onClose} closeDisabled={pending}
-    footer={<><button className="button button--quiet" type="button" onClick={pending ? () => void cancelUpload() : onClose}>{pending ? 'Отменить job' : 'Отмена'}</button><button className="button button--primary" type="button" disabled={pending || invalid || duplicates.size > 0} onClick={() => void upload()}>{pending ? 'Передаём…' : 'Добавить атомарно'}</button></>}
+    footer={<><Button className="button button--quiet" variant="outlined" type="button" onClick={pending ? () => void cancelUpload() : onClose}>{pending ? 'Отменить job' : 'Отмена'}</Button><Button className="button button--primary" variant="contained" type="button" disabled={pending || invalid || duplicates.size > 0} onClick={() => void upload()}>{pending ? 'Передаём…' : 'Добавить атомарно'}</Button></>}
   >
     <div className="stack-form">
-      {programs.map((program, index) => <label key={`${program.file.name}-${program.file.lastModified}-${index}`}><span>Basename · {formatBytes(program.file.size)}</span><input aria-label={`Basename ${program.file.name}`} value={program.displayName} disabled={pending} onChange={(event) => setPrograms((current) => current.map((item, itemIndex) => itemIndex === index ? { ...item, displayName: event.target.value } : item))} />{duplicates.has(nameKey(program.displayName)) ? <small className="field-error">Совпадает с другой программой без учёта регистра/Unicode.</small> : null}</label>)}
+      {programs.map((program, index) => <label key={`${program.file.name}-${program.file.lastModified}-${index}`}><span>Basename · {formatBytes(program.file.size)}</span><TextField value={program.displayName} fullWidth size="small" disabled={pending} slotProps={{ htmlInput: { 'aria-label': `Basename ${program.file.name}` } }} onChange={(event) => setPrograms((current) => current.map((item, itemIndex) => itemIndex === index ? { ...item, displayName: event.target.value } : item))} />{duplicates.has(nameKey(program.displayName)) ? <small className="field-error">Совпадает с другой программой без учёта регистра/Unicode.</small> : null}</label>)}
     </div>
     {pending ? <div className="import-progress" role="status"><span>Передаём комплект программ… {job ? `Job ${job.jobId.slice(0, 8)} · ${job.state}` : 'создаём job…'}</span><progress max={Math.max(job?.progress.totalBytes ?? 0, progress.total, 1)} value={Math.max(job?.progress.completedBytes ?? 0, progress.loaded)} /><small>{formatBytes(Math.max(job?.progress.completedBytes ?? 0, progress.loaded))} из {formatBytes(Math.max(job?.progress.totalBytes ?? 0, progress.total))} · {job?.progress.completedItems ?? 0} из {job?.progress.totalItems ?? programs.length} файлов</small></div> : null}
     {error ? <OperationError error={error} onReload={onReload} onReloaded={() => { setError(undefined); setKey(newIdempotencyKey()) }} /> : null}
@@ -144,10 +148,10 @@ export function DeleteProgramDialog({
     title="Удалить программу из сетапа"
     description={`${artifact.displayName} будет удалена из revision ${setup.revision}. Управляемый объект удалится сборщиком мусора только когда ссылок не останется.`}
     onClose={onClose} closeDisabled={pending}
-    footer={<><button className="button button--quiet" type="button" disabled={pending} onClick={onClose}>Отмена</button><button className="button button--danger" type="button" disabled={pending || !allowed} onClick={() => void remove()}>{pending ? 'Удаляем…' : 'Удалить программу'}</button></>}
+    footer={<><Button className="button button--quiet" variant="outlined" type="button" disabled={pending} onClick={onClose}>Отмена</Button><Button className="button button--danger" variant="contained" color="error" type="button" disabled={pending || !allowed} onClick={() => void remove()}>{pending ? 'Удаляем…' : 'Удалить программу'}</Button></>}
   >
     {artifact.primary && !last ? <label className="stack-field"><span>После удаления основной программы</span><select value={primaryChoice} onChange={(event) => setPrimaryChoice(event.target.value)}><option value="">Выберите явно…</option>{alternatives.map((item) => <option key={item.artifactId} value={item.artifactId}>Назначить {item.displayName}</option>)}<option value="__none">Оставить без основной программы</option></select></label> : null}
-    {last ? <label className="danger-check"><input type="checkbox" checked={confirmLast} onChange={(event) => setConfirmLast(event.target.checked)} /> Подтверждаю удаление последней G-code-программы. Сетап станет неготовым.</label> : null}
+    {last ? <FormControlLabel className="danger-check" sx={{ margin: 0 }} control={<Checkbox size="small" sx={{ padding: '2px' }} checked={confirmLast} onChange={(event) => setConfirmLast(event.target.checked)} />} label="Подтверждаю удаление последней G-code-программы. Сетап станет неготовым." /> : null}
     {error ? <OperationError error={error} onReload={onReload} onReloaded={() => { setError(undefined); setKey(newIdempotencyKey()) }} /> : null}
   </Modal>
 }

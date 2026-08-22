@@ -373,6 +373,18 @@ describe('catalog workbench', () => {
     await waitFor(() => expect(document.getElementById('catalog-editor')).toHaveFocus())
   })
 
+  it('labels the catalog search and returns focus after clearing it', async () => {
+    const user = userEvent.setup()
+    render(<App />)
+
+    const search = await screen.findByRole('searchbox', { name: 'Поиск файлов' })
+    await user.type(search, 'bracket')
+    await user.click(screen.getByRole('button', { name: 'Очистить поиск' }))
+
+    expect(search).toHaveValue('')
+    expect(search).toHaveFocus()
+  })
+
 	it('revokes and refuses an explicit session that cannot seal its provisional browser journal', async () => {
 		mocks.getAuthSession.mockResolvedValueOnce({ authenticated: false, loginRequired: true, user: null })
 		mocks.quarantineExplicitAuthSession.mockResolvedValueOnce(undefined)

@@ -1,4 +1,7 @@
 import { useMemo, useRef, useState, type FormEvent } from 'react'
+import Alert from '@mui/material/Alert'
+import Button from '@mui/material/Button'
+import TextField from '@mui/material/TextField'
 import {
   ApiError,
   createCatalogFolder,
@@ -166,10 +169,10 @@ export function UploadSetupDialog({
       className="catalog-modal catalog-modal--upload"
       footer={(
         <>
-          <button className="button button--quiet" type="button" disabled={pending} onClick={onClose}>Отмена</button>
-          <button className="button button--primary" type="submit" form="catalog-upload-form" disabled={pending || !name.trim()}>
+          <Button className="button button--quiet" variant="outlined" type="button" disabled={pending} onClick={onClose}>Отмена</Button>
+          <Button className="button button--primary" variant="contained" type="submit" form="catalog-upload-form" disabled={pending || !name.trim()}>
             {pending ? 'Сохраняем…' : program || sheet ? 'Создать и загрузить' : 'Создать неполный сетап'}
-          </button>
+          </Button>
         </>
       )}
     >
@@ -177,8 +180,8 @@ export function UploadSetupDialog({
         <label htmlFor="catalog-upload-folder"><span>Каталог LinuxCNC</span>
           <FolderSelect id="catalog-upload-folder" folders={folders} value={folderId} rootLabel={destination.rootLabel} disabled={pending || Boolean(created)} onChange={(value) => { createKey.requestChanged(); setFolderId(value) }} />
         </label>
-        <label htmlFor="catalog-upload-name"><span>Название сетапа</span><input id="catalog-upload-name" value={name} maxLength={200} disabled={pending || Boolean(created)} autoFocus required onChange={(event) => { createKey.requestChanged(); nameTouched.current = true; setName(event.target.value) }} /></label>
-        <label htmlFor="catalog-upload-description"><span>Описание <small>необязательно</small></span><textarea id="catalog-upload-description" rows={2} value={description} disabled={pending || Boolean(created)} onChange={(event) => { createKey.requestChanged(); setDescription(event.target.value) }} /></label>
+        <label htmlFor="catalog-upload-name"><span>Название сетапа</span><TextField id="catalog-upload-name" value={name} fullWidth size="small" slotProps={{ htmlInput: { maxLength: 200 } }} disabled={pending || Boolean(created)} autoFocus required onChange={(event) => { createKey.requestChanged(); nameTouched.current = true; setName(event.target.value) }} /></label>
+        <label htmlFor="catalog-upload-description"><span>Описание <small>необязательно</small></span><TextField id="catalog-upload-description" multiline rows={2} value={description} fullWidth size="small" disabled={pending || Boolean(created)} onChange={(event) => { createKey.requestChanged(); setDescription(event.target.value) }} /></label>
         <div className="catalog-file-grid">
           <label className="catalog-file-field" htmlFor="catalog-upload-program">
             <span>G-code программа</span>
@@ -199,7 +202,7 @@ export function UploadSetupDialog({
         </section>
         {created && error ? <p className="catalog-partial-note" role="status">Сетап уже создан и остаётся доступным как неполный. Повтор продолжит с незагруженного файла.</p> : null}
         {progress ? <div className="catalog-upload-progress" role="status"><span>{progress.label}</span>{progress.total > 0 ? <progress max={progress.total} value={Math.min(progress.loaded, progress.total)} /> : null}</div> : null}
-        {error ? <p className="form-error" role="alert">{error}</p> : null}
+        {error ? <Alert className="form-error" severity="error" role="alert">{error}</Alert> : null}
       </form>
     </Modal>
   )
@@ -261,13 +264,13 @@ export function FolderDialog({ folders, destination, initialParentFolderId, fold
     onClose={onClose}
     closeDisabled={pending}
     className="catalog-modal"
-    footer={<><button className="button button--quiet" type="button" disabled={pending} onClick={onClose}>Отмена</button><button className="button button--primary" type="submit" form="catalog-folder-form" disabled={pending || !name.trim()}>{folder ? 'Сохранить' : 'Создать каталог'}</button></>}
+    footer={<><Button className="button button--quiet" variant="outlined" type="button" disabled={pending} onClick={onClose}>Отмена</Button><Button className="button button--primary" variant="contained" type="submit" form="catalog-folder-form" disabled={pending || !name.trim()}>{folder ? 'Сохранить' : 'Создать каталог'}</Button></>}
   >
     <form id="catalog-folder-form" className="catalog-form" onSubmit={(event) => void submit(event)}>
-      <label htmlFor="catalog-folder-name"><span>Название</span><input id="catalog-folder-name" value={name} maxLength={200} autoFocus required onChange={(event) => { key.requestChanged(); setName(event.target.value) }} /></label>
+      <label htmlFor="catalog-folder-name"><span>Название</span><TextField id="catalog-folder-name" value={name} fullWidth size="small" slotProps={{ htmlInput: { maxLength: 200 } }} autoFocus required onChange={(event) => { key.requestChanged(); setName(event.target.value) }} /></label>
       <label htmlFor="catalog-folder-parent"><span>Родительский каталог</span><FolderSelect id="catalog-folder-parent" folders={folders} value={parentFolderId} rootLabel={destination.rootLabel} excludedIds={excluded} onChange={(value) => { key.requestChanged(); setParentFolderId(value) }} /></label>
       <section className="destination-preview"><strong>Итоговый каталог</strong><code>{preview}</code></section>
-      {error ? <p className="form-error" role="alert">{error}</p> : null}
+      {error ? <Alert className="form-error" severity="error" role="alert">{error}</Alert> : null}
     </form>
   </Modal>
 }
@@ -312,14 +315,14 @@ export function SetupPropertiesDialog({ setup, folders, destination, onClose, on
     onClose={onClose}
     closeDisabled={pending}
     className="catalog-modal"
-    footer={<><button className="button button--quiet" type="button" disabled={pending} onClick={onClose}>Отмена</button><button className="button button--primary" type="submit" form="catalog-setup-form" disabled={pending || !name.trim()}>Сохранить</button></>}
+    footer={<><Button className="button button--quiet" variant="outlined" type="button" disabled={pending} onClick={onClose}>Отмена</Button><Button className="button button--primary" variant="contained" type="submit" form="catalog-setup-form" disabled={pending || !name.trim()}>Сохранить</Button></>}
   >
     <form id="catalog-setup-form" className="catalog-form" onSubmit={(event) => void submit(event)}>
-      <label htmlFor="catalog-setup-name"><span>Название</span><input id="catalog-setup-name" value={name} maxLength={200} autoFocus required onChange={(event) => { key.requestChanged(); setName(event.target.value) }} /></label>
-      <label htmlFor="catalog-setup-description"><span>Описание</span><textarea id="catalog-setup-description" rows={3} value={description} onChange={(event) => { key.requestChanged(); setDescription(event.target.value) }} /></label>
+      <label htmlFor="catalog-setup-name"><span>Название</span><TextField id="catalog-setup-name" value={name} fullWidth size="small" slotProps={{ htmlInput: { maxLength: 200 } }} autoFocus required onChange={(event) => { key.requestChanged(); setName(event.target.value) }} /></label>
+      <label htmlFor="catalog-setup-description"><span>Описание</span><TextField id="catalog-setup-description" multiline rows={3} value={description} fullWidth size="small" onChange={(event) => { key.requestChanged(); setDescription(event.target.value) }} /></label>
       <label htmlFor="catalog-setup-folder"><span>Каталог LinuxCNC</span><FolderSelect id="catalog-setup-folder" folders={folders} value={folderId} rootLabel={destination.rootLabel} onChange={(value) => { key.requestChanged(); setFolderId(value) }} /></label>
       <section className="destination-preview"><strong>Расположение</strong><code>{joinDisplayPath(destination.rootDisplay, folder?.relativePath, filename)}</code></section>
-      {error ? <p className="form-error" role="alert">{error}</p> : null}
+      {error ? <Alert className="form-error" severity="error" role="alert">{error}</Alert> : null}
     </form>
   </Modal>
 }
@@ -365,13 +368,13 @@ export function ComponentUploadDialog({ setup, component, destination, folderRel
     onClose={onClose}
     closeDisabled={pending}
     className="catalog-modal"
-    footer={<><button className="button button--quiet" type="button" disabled={pending} onClick={onClose}>Отмена</button><button className="button button--primary" type="submit" form="catalog-component-form" disabled={pending || !file}>{pending ? 'Загружаем…' : existing ? 'Заменить' : 'Загрузить'}</button></>}
+    footer={<><Button className="button button--quiet" variant="outlined" type="button" disabled={pending} onClick={onClose}>Отмена</Button><Button className="button button--primary" variant="contained" type="submit" form="catalog-component-form" disabled={pending || !file}>{pending ? 'Загружаем…' : existing ? 'Заменить' : 'Загрузить'}</Button></>}
   >
     <form id="catalog-component-form" className="catalog-form" onSubmit={(event) => void submit(event)}>
       <label className="catalog-file-field" htmlFor="catalog-component-file"><span>{label}</span><input id="catalog-component-file" aria-label={label} type="file" autoFocus required accept={component === 'program' ? gcodeExtensions.join(',') : '.pdf,.html,.htm'} onChange={(event) => { key.requestChanged(); setFile(event.target.files?.[0]) }} /><small>{file ? `${file.name} · ${formatBytes(file.size)}` : 'Выберите один файл'}</small></label>
       <section className="destination-preview"><strong>Назначение LinuxCNC</strong><code>{joinDisplayPath(destination.rootDisplay, file ? folderRelativePath : undefined, file?.name ?? existing?.relativePath ?? folderRelativePath)}</code></section>
       {pending ? <progress max={1} value={progress} aria-label="Прогресс загрузки" /> : null}
-      {error ? <p className="form-error" role="alert">{error}</p> : null}
+      {error ? <Alert className="form-error" severity="error" role="alert">{error}</Alert> : null}
     </form>
   </Modal>
 }
@@ -398,8 +401,8 @@ export function ConfirmCatalogDialog({ title, description, confirmLabel, onClose
     }
     finally { setPending(false) }
   }
-  return <Modal title={title} description={description} onClose={onClose} closeDisabled={pending} className="catalog-modal" footer={<><button className="button button--quiet" type="button" disabled={pending} onClick={onClose}>Отмена</button><button className="button button--danger" type="button" disabled={pending} onClick={() => void confirm()}>{pending ? 'Выполняется…' : confirmLabel}</button></>}>
+  return <Modal title={title} description={description} onClose={onClose} closeDisabled={pending} className="catalog-modal" footer={<><Button className="button button--quiet" variant="outlined" type="button" disabled={pending} onClick={onClose}>Отмена</Button><Button className="button button--danger" variant="contained" color="error" type="button" disabled={pending} onClick={() => void confirm()}>{pending ? 'Выполняется…' : confirmLabel}</Button></>}>
     <p className="catalog-danger-note">Операция относится только к выбранному элементу внутри каталога программ LinuxCNC.</p>
-    {error ? <p className="form-error" role="alert">{error}</p> : null}
+    {error ? <Alert className="form-error" severity="error" role="alert">{error}</Alert> : null}
   </Modal>
 }

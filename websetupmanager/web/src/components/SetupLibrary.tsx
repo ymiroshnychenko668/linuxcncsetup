@@ -1,4 +1,11 @@
 import { useEffect, useState, type FormEvent } from 'react'
+import Alert from '@mui/material/Alert'
+import Button from '@mui/material/Button'
+import Card from '@mui/material/Card'
+import Chip from '@mui/material/Chip'
+import CircularProgress from '@mui/material/CircularProgress'
+import NativeSelect from '@mui/material/NativeSelect'
+import TextField from '@mui/material/TextField'
 import type { SetupStatus, SetupSummary } from '../domain'
 import { formatDate, statusLabels } from '../ui'
 
@@ -32,10 +39,10 @@ interface Props {
 
 function SetupCard({ item, onOpen }: { item: SetupSummary; onOpen: (setupId: string) => void }) {
   return (
-    <article className={`setup-card setup-card--${item.status}`} aria-labelledby={`setup-${item.setupId}`}>
+    <Card component="article" elevation={0} className={`setup-card setup-card--${item.status}`} aria-labelledby={`setup-${item.setupId}`}>
       <div className="setup-card__topline">
-        <span className={`status-badge status-badge--${item.status}`}>{statusLabels[item.status]}</span>
-        {item.isCurrent ? <span className="current-chip">Текущий</span> : null}
+        <Chip component="span" className={`status-badge status-badge--${item.status}`} label={statusLabels[item.status]} size="small" />
+        {item.isCurrent ? <Chip component="span" className="current-chip" label="Текущий" size="small" /> : null}
       </div>
       <h2 id={`setup-${item.setupId}`}>{item.name}</h2>
       <p className="setup-card__description">{item.description || 'Описание не добавлено.'}</p>
@@ -49,11 +56,11 @@ function SetupCard({ item, onOpen }: { item: SetupSummary; onOpen: (setupId: str
       ) : null}
       <footer className="setup-card__footer">
         <span>Изменён {formatDate(item.updatedAt)}</span>
-        <button className="button button--quiet" type="button" onClick={() => onOpen(item.setupId)}>
+        <Button className="button button--quiet" variant="text" type="button" onClick={() => onOpen(item.setupId)}>
           Открыть сетап <span className="visually-hidden">{item.name}</span>
-        </button>
+        </Button>
       </footer>
-    </article>
+    </Card>
   )
 }
 
@@ -91,8 +98,8 @@ export function SetupLibrary({
           <h1 id="library-title">{alias}</h1>
         </div>
         <div className="library__actions" aria-label="Действия библиотеки">
-          <button className="button button--quiet" type="button" onClick={onCreate}>Создать сетап</button>
-          <button className="button button--primary" type="button" onClick={onImport}>Импортировать комплект</button>
+          <Button className="button button--quiet" variant="text" type="button" onClick={onCreate}>Создать сетап</Button>
+          <Button className="button button--primary" variant="contained" type="button" onClick={onImport}>Импортировать комплект</Button>
         </div>
       </div>
 
@@ -100,19 +107,27 @@ export function SetupLibrary({
         <label className="search-field">
           <span>Поиск сетапов</span>
           <span className="search-field__control">
-            <input
+            <TextField
               type="search"
               value={queryDraft}
               placeholder="Название, описание или программа"
+              variant="standard"
+              fullWidth
+              slotProps={{
+                htmlInput: { 'aria-label': 'Поиск сетапов' },
+                input: { disableUnderline: true },
+              }}
               onChange={(event) => setQueryDraft(event.target.value)}
             />
-            <button className="button button--primary" type="submit">Найти</button>
+            <Button className="button button--primary" variant="contained" type="submit">Найти</Button>
           </span>
         </label>
         <label>
           <span>Статус</span>
-          <select
+          <NativeSelect
             value={filters.status}
+            disableUnderline
+            inputProps={{ 'aria-label': 'Статус' }}
             onChange={(event) => onFiltersChange({ ...filters, status: event.target.value as StatusFilter })}
           >
             <option value="active">Рабочие</option>
@@ -121,34 +136,40 @@ export function SetupLibrary({
             <option value="attention">Требуют внимания</option>
             <option value="archived">Архив</option>
             <option value="all">Все статусы</option>
-          </select>
+          </NativeSelect>
         </label>
         <label>
           <span>Setup Sheet</span>
-          <select
+          <NativeSelect
             value={filters.sheet}
+            disableUnderline
+            inputProps={{ 'aria-label': 'Setup Sheet' }}
             onChange={(event) => onFiltersChange({ ...filters, sheet: event.target.value as BooleanFilter })}
           >
             <option value="any">Любое состояние</option>
             <option value="yes">Есть</option>
             <option value="no">Нет</option>
-          </select>
+          </NativeSelect>
         </label>
         <label>
           <span>Текущий</span>
-          <select
+          <NativeSelect
             value={filters.current}
+            disableUnderline
+            inputProps={{ 'aria-label': 'Текущий' }}
             onChange={(event) => onFiltersChange({ ...filters, current: event.target.value as BooleanFilter })}
           >
             <option value="any">Все</option>
             <option value="yes">Только текущий</option>
             <option value="no">Кроме текущего</option>
-          </select>
+          </NativeSelect>
         </label>
         <label>
           <span>Сортировка</span>
-          <select
+          <NativeSelect
             value={filters.sort}
+            disableUnderline
+            inputProps={{ 'aria-label': 'Сортировка' }}
             onChange={(event) => onFiltersChange({
               ...filters,
               sort: event.target.value as LibraryFilters['sort'],
@@ -159,23 +180,27 @@ export function SetupLibrary({
             <option value="name_asc">Название А–Я</option>
             <option value="name_desc">Название Я–А</option>
             <option value="recent_desc">Недавно открытые</option>
-          </select>
+          </NativeSelect>
         </label>
       </form>
 
       {error ? (
-        <div className="inline-state inline-state--error" role="alert">
+        <Alert
+          className="inline-state inline-state--error"
+          severity="error"
+          role="alert"
+          action={<Button className="button button--quiet" variant="text" type="button" onClick={onRetry}>Повторить</Button>}
+        >
           <div>
             <strong>Библиотеку не удалось загрузить</strong>
             <p>{error} Фильтры и введённый запрос сохранены.</p>
           </div>
-          <button className="button button--quiet" type="button" onClick={onRetry}>Повторить</button>
-        </div>
+        </Alert>
       ) : null}
 
       {loading && items.length === 0 ? (
         <div className="library-loading" role="status">
-          <span className="spinner" aria-hidden="true" /> Загружаем сетапы…
+          <CircularProgress aria-hidden="true" size={34} /> Загружаем сетапы…
         </div>
       ) : null}
 
@@ -199,9 +224,9 @@ export function SetupLibrary({
                   filters.current !== 'any' ? (filters.current === 'yes' ? 'только текущий' : 'кроме текущего') : undefined,
                 ].filter(Boolean).join('; ')}.
               </p>
-              <button className="button button--quiet" type="button" onClick={onResetFilters}>Сбросить запрос и фильтры</button>
+              <Button className="button button--quiet" variant="text" type="button" onClick={onResetFilters}>Сбросить запрос и фильтры</Button>
             </>
-          ) : <button className="button button--primary" type="button" onClick={onCreate}>Создать первый сетап</button>}
+          ) : <Button className="button button--primary" variant="contained" type="button" onClick={onCreate}>Создать первый сетап</Button>}
         </div>
       ) : null}
 
@@ -212,9 +237,9 @@ export function SetupLibrary({
           </div>
           {nextCursor ? (
             <div className="load-more">
-              <button className="button button--quiet" type="button" onClick={onLoadMore} disabled={loadingMore}>
+              <Button className="button button--quiet" variant="text" type="button" onClick={onLoadMore} disabled={loadingMore}>
                 {loadingMore ? 'Загружаем…' : 'Показать ещё'}
-              </button>
+              </Button>
             </div>
           ) : null}
         </>

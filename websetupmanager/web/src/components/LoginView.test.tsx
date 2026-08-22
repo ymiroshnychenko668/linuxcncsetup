@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { LoginView } from './LoginView'
@@ -82,7 +82,7 @@ describe('LoginView', () => {
     expect(screen.getByRole('button', { name: 'Выполняется вход…' })).toBeDisabled()
     expect(screen.getByLabelText('Имя пользователя')).toBeDisabled()
     expect(screen.getByLabelText('Пароль')).toBeDisabled()
-    await user.click(screen.getByRole('button', { name: 'Выполняется вход…' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Выполняется вход…' }))
     expect(mocks.login).toHaveBeenCalledTimes(1)
 
     resolveLogin({

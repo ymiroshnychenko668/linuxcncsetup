@@ -1,4 +1,18 @@
-import { useCallback, useEffect, useRef, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPointerEvent } from 'react'
+import { useCallback, useEffect, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent } from 'react'
+import Alert from '@mui/material/Alert'
+import Button from '@mui/material/Button'
+import CircularProgress from '@mui/material/CircularProgress'
+import IconButton from '@mui/material/IconButton'
+import InputBase from '@mui/material/InputBase'
+import Snackbar from '@mui/material/Snackbar'
+import Tab from '@mui/material/Tab'
+import Table from '@mui/material/Table'
+import TableBody from '@mui/material/TableBody'
+import TableCell from '@mui/material/TableCell'
+import TableContainer from '@mui/material/TableContainer'
+import TableHead from '@mui/material/TableHead'
+import TableRow from '@mui/material/TableRow'
+import Tabs from '@mui/material/Tabs'
 import {
   catalogContentURL,
   createCatalogSetup,
@@ -215,6 +229,7 @@ export function Workbench({
   const [retryUpload, setRetryUpload] = useState<{ kind: 'setup' | 'component'; label: string }>()
   const workbenchRef = useRef<HTMLDivElement>(null)
   const explorerRef = useRef<HTMLElement>(null)
+  const catalogSearchRef = useRef<HTMLInputElement>(null)
   const explorerToggleRef = useRef<HTMLButtonElement>(null)
   const explorerCloseRef = useRef<HTMLButtonElement>(null)
   const addSetupInputRef = useRef<HTMLInputElement>(null)
@@ -343,12 +358,6 @@ export function Workbench({
     if (dialog) setExplorerOpen(false)
   }, [dialog])
 
-  useEffect(() => {
-    if (!destinationNotice) return
-    const timeout = window.setTimeout(() => setDestinationNotice(undefined), 8000)
-    return () => window.clearTimeout(timeout)
-  }, [destinationNotice])
-
   useEffect(() => () => {
     resizeCleanupRef.current?.()
     uploadControllerRef.current?.abort()
@@ -414,18 +423,6 @@ export function Workbench({
   const selectEditorTab = (component: EditorTab, moveFocus = false) => {
     setSelectedComponent(component)
     if (moveFocus) queueMicrotask(() => editorTabRef(component).current?.focus())
-  }
-
-  const editorTabKeyDown = (event: ReactKeyboardEvent<HTMLButtonElement>) => {
-    let target: EditorTab | undefined
-    const currentIndex = Math.max(0, visibleEditorTabs.indexOf(selectedComponent))
-    if (event.key === 'Home') target = visibleEditorTabs[0]
-    else if (event.key === 'End') target = visibleEditorTabs[visibleEditorTabs.length - 1]
-    else if (event.key === 'ArrowLeft') target = visibleEditorTabs[Math.max(0, currentIndex - 1)]
-    else if (event.key === 'ArrowRight') target = visibleEditorTabs[Math.min(visibleEditorTabs.length - 1, currentIndex + 1)]
-    if (!target) return
-    event.preventDefault()
-    selectEditorTab(target, true)
   }
 
   const restorePickerFocus = (fallback?: CatalogComponent) => {
@@ -657,10 +654,10 @@ export function Workbench({
           <FolderIcon /><span>{catalog?.destination.rootDisplay ?? 'Подключаем каталог LinuxCNC…'}</span>
         </div>
         <div className="workbench-titlebar__actions">
-          <button className="workbench-button workbench-button--primary" type="button" disabled={!catalog || uploading} onClick={(event) => { pickerReturnRef.current = event.currentTarget; addSetupInputRef.current?.click() }}><PlusIcon />{uploading ? 'Загружаем…' : 'Добавить'}</button>
-          <button ref={explorerToggleRef} className="workbench-icon-button workbench-explorer-toggle" type="button" aria-label="Открыть дерево файлов" aria-expanded={explorerOpen} onClick={() => setExplorerOpen(true)}><MenuIcon /></button>
+          <Button component="button" className="workbench-button workbench-button--primary" type="button" disabled={!catalog || uploading} onClick={(event) => { pickerReturnRef.current = event.currentTarget; addSetupInputRef.current?.click() }}><PlusIcon />{uploading ? 'Загружаем…' : 'Добавить'}</Button>
+          <IconButton component="button" ref={explorerToggleRef} className="workbench-icon-button workbench-explorer-toggle" type="button" aria-label="Открыть дерево файлов" aria-expanded={explorerOpen} onClick={() => setExplorerOpen(true)}><MenuIcon /></IconButton>
           {loginRequired ? <div className="workbench-user"><span aria-hidden="true">{(username?.[0] ?? 'U').toUpperCase()}</span><strong>{username}</strong></div> : <span className="workbench-local-mode">Локальный режим</span>}
-          {loginRequired ? <button className="workbench-icon-button" type="button" title="Выйти" aria-label="Выйти" disabled={loggingOut} onClick={logoutAndClearCache}>{loggingOut ? <span className="spinner spinner--small" aria-hidden="true" /> : <LogOutIcon />}</button> : null}
+          {loginRequired ? <IconButton component="button" className="workbench-icon-button" type="button" title="Выйти" aria-label="Выйти" disabled={loggingOut} onClick={logoutAndClearCache}>{loggingOut ? <CircularProgress color="inherit" size="1rem" aria-hidden="true" /> : <LogOutIcon />}</IconButton> : null}
         </div>
       </header>
 
@@ -708,10 +705,26 @@ export function Workbench({
         }}
       />
 
-      {networkOffline ? <div className="workbench-notice" role="status">Нет соединения с Web Setup Manager. Открытый просмотр сохранён.</div> : null}
-      {!readiness.ok ? <div className="workbench-notice workbench-notice--error" role="alert"><span>{readiness.message ?? 'Backend или каталог LinuxCNC временно недоступен.'}</span><button type="button" onClick={onRetryReadiness}>Повторить</button></div> : null}
-      {logoutError ? <div className="workbench-notice workbench-notice--error" role="alert">Не удалось выйти: {logoutError}</div> : null}
-      {uploadStatus ? <div className="workbench-upload-status" role="status"><span>{uploadStatus.label}</span>{uploadStatus.total > 0 ? <progress max={uploadStatus.total} value={Math.min(uploadStatus.loaded, uploadStatus.total)} /> : null}<button type="button" onClick={() => uploadControllerRef.current?.abort()}>Отменить</button></div> : null}
+      {networkOffline ? <Alert className="workbench-notice" severity="warning" variant="standard" icon={false} role="status" sx={{ '& .MuiAlert-message': { minWidth: 0, padding: 0 } }}>Нет соединения с Web Setup Manager. Открытый просмотр сохранён.</Alert> : null}
+      {!readiness.ok ? <Alert
+        className="workbench-notice workbench-notice--error"
+        severity="error"
+        variant="standard"
+        icon={false}
+        role="alert"
+        action={<Button component="button" type="button" onClick={onRetryReadiness} sx={{ minWidth: 0 }}>Повторить</Button>}
+        sx={{ '& .MuiAlert-message': { minWidth: 0, padding: 0 }, '& .MuiAlert-action': { margin: 0, padding: 0 } }}
+      ><span>{readiness.message ?? 'Backend или каталог LinuxCNC временно недоступен.'}</span></Alert> : null}
+      {logoutError ? <Alert className="workbench-notice workbench-notice--error" severity="error" variant="standard" icon={false} role="alert" sx={{ '& .MuiAlert-message': { minWidth: 0, padding: 0 } }}>Не удалось выйти: {logoutError}</Alert> : null}
+      {uploadStatus ? <Alert
+        className="workbench-upload-status"
+        severity="info"
+        variant="standard"
+        icon={false}
+        role="status"
+        action={<Button component="button" type="button" onClick={() => uploadControllerRef.current?.abort()} sx={{ minWidth: 0 }}>Отменить</Button>}
+        sx={{ '& .MuiAlert-message': { display: 'flex', minWidth: 0, alignItems: 'center', gap: '10px', padding: 0 }, '& .MuiAlert-action': { margin: 0, padding: 0 } }}
+      ><span>{uploadStatus.label}</span>{uploadStatus.total > 0 ? <progress max={uploadStatus.total} value={Math.min(uploadStatus.loaded, uploadStatus.total)} /> : null}</Alert> : null}
 
       <main className="catalog-workspace">
         <button className={`catalog-explorer-scrim${explorerOpen ? ' catalog-explorer-scrim--visible' : ''}`} type="button" aria-label="Закрыть дерево файлов по нажатию вне панели" tabIndex={explorerOpen ? 0 : -1} onClick={() => { setExplorerOpen(false); window.setTimeout(() => explorerToggleRef.current?.focus(), 0) }} />
@@ -719,23 +732,23 @@ export function Workbench({
           <header className="catalog-explorer__header">
             <strong>ФАЙЛЫ</strong>
             <div>
-              <button className="workbench-icon-button" type="button" title="Новый каталог" aria-label="Новый каталог" disabled={!catalog} onClick={() => setDialog({ kind: 'folder' })}><FolderIcon /></button>
-              <button className="workbench-icon-button" type="button" title="Добавить G-code и необязательную Setup Sheet" aria-label="Добавить сетап" disabled={!catalog || uploading} onClick={(event) => { pickerReturnRef.current = event.currentTarget; addSetupInputRef.current?.click() }}><PlusIcon /></button>
-              <button className="workbench-icon-button" type="button" title="Обновить каталог" aria-label="Обновить каталог" disabled={refreshing} onClick={() => void load(undefined, true)}>{refreshing ? <span className="spinner spinner--small" aria-hidden="true" /> : <RefreshIcon />}</button>
-              <button ref={explorerCloseRef} className="workbench-icon-button catalog-explorer__close" type="button" aria-label="Закрыть дерево файлов" onClick={() => { setExplorerOpen(false); window.setTimeout(() => explorerToggleRef.current?.focus(), 0) }}><CloseIcon /></button>
+              <IconButton component="button" className="workbench-icon-button" type="button" title="Новый каталог" aria-label="Новый каталог" disabled={!catalog} onClick={() => setDialog({ kind: 'folder' })}><FolderIcon /></IconButton>
+              <IconButton component="button" className="workbench-icon-button" type="button" title="Добавить G-code и необязательную Setup Sheet" aria-label="Добавить сетап" disabled={!catalog || uploading} onClick={(event) => { pickerReturnRef.current = event.currentTarget; addSetupInputRef.current?.click() }}><PlusIcon /></IconButton>
+              <IconButton component="button" className="workbench-icon-button" type="button" title="Обновить каталог" aria-label="Обновить каталог" disabled={refreshing} onClick={() => void load(undefined, true)}>{refreshing ? <CircularProgress color="inherit" size="1rem" aria-hidden="true" /> : <RefreshIcon />}</IconButton>
+              <IconButton component="button" ref={explorerCloseRef} className="workbench-icon-button catalog-explorer__close" type="button" aria-label="Закрыть дерево файлов" onClick={() => { setExplorerOpen(false); window.setTimeout(() => explorerToggleRef.current?.focus(), 0) }}><CloseIcon /></IconButton>
             </div>
           </header>
-          <label className="catalog-search" htmlFor="catalog-search-input"><SearchIcon /><span className="visually-hidden">Поиск файлов</span><input id="catalog-search-input" type="search" value={query} placeholder="Поиск G-code и Setup Sheet" onChange={(event) => setQuery(event.target.value)} />{query ? <button type="button" aria-label="Очистить поиск" onClick={() => setQuery('')}><CloseIcon /></button> : null}</label>
+          <div className="catalog-search" role="search"><SearchIcon /><label className="visually-hidden" htmlFor="catalog-search-input">Поиск файлов</label><InputBase inputRef={catalogSearchRef} id="catalog-search-input" type="search" value={query} placeholder="Поиск G-code и Setup Sheet" onChange={(event) => setQuery(event.target.value)} />{query ? <IconButton component="button" type="button" aria-label="Очистить поиск" onClick={() => { setQuery(''); catalogSearchRef.current?.focus() }}><CloseIcon /></IconButton> : null}</div>
 
           <div className="catalog-context-actions" aria-label="Действия выбранного элемента">
             <span>{selectedSetup ? selectedSetup.name : selectedFolder?.relativePath ?? catalog?.destination.rootLabel ?? 'LinuxCNC'}</span>
             <div>
               {selectedSetup ? <>
-                <button type="button" title="Свойства" aria-label="Свойства сетапа" onClick={() => setDialog({ kind: 'setup', setup: selectedSetup })}><EditIcon /></button>
-                <button type="button" title="Удалить" aria-label="Удалить сетап" onClick={() => openDeleteSetup(selectedSetup)}><TrashIcon /></button>
+                <IconButton component="button" type="button" title="Свойства" aria-label="Свойства сетапа" onClick={() => setDialog({ kind: 'setup', setup: selectedSetup })}><EditIcon /></IconButton>
+                <IconButton component="button" type="button" title="Удалить" aria-label="Удалить сетап" onClick={() => openDeleteSetup(selectedSetup)}><TrashIcon /></IconButton>
               </> : selectedFolder ? <>
-                <button type="button" title="Переименовать или переместить" aria-label="Переименовать или переместить каталог" onClick={() => setDialog({ kind: 'folder', folder: selectedFolder })}><EditIcon /></button>
-                <button type="button" title="Удалить пустой каталог" aria-label="Удалить каталог" onClick={() => openDeleteFolder(selectedFolder)}><TrashIcon /></button>
+                <IconButton component="button" type="button" title="Переименовать или переместить" aria-label="Переименовать или переместить каталог" onClick={() => setDialog({ kind: 'folder', folder: selectedFolder })}><EditIcon /></IconButton>
+                <IconButton component="button" type="button" title="Удалить пустой каталог" aria-label="Удалить каталог" onClick={() => openDeleteFolder(selectedFolder)}><TrashIcon /></IconButton>
               </> : null}
             </div>
           </div>
@@ -788,60 +801,62 @@ export function Workbench({
 
         <section id="catalog-editor" className="catalog-editor" aria-label="Просмотр файла" tabIndex={-1}>
           <div className="editor-tabs">
-            <div className="editor-tablist" role="tablist" aria-label="Файлы выбранного сетапа">
-              <button
+            <Tabs
+              className="editor-tablist"
+              value={visibleEditorTabs.includes(selectedComponent) ? selectedComponent : false}
+              onChange={(_event, value: EditorTab) => selectEditorTab(value)}
+              aria-label="Файлы выбранного сетапа"
+              variant="scrollable"
+              scrollButtons={false}
+              selectionFollowsFocus
+              slotProps={{ indicator: { style: { display: 'none' } } }}
+              sx={{ minHeight: 34, flex: '1 1 auto' }}
+            >
+              <Tab
+                component="button"
                 ref={programTabRef}
                 id="editor-tab-program"
                 className={`editor-tab${selectedComponent === 'program' ? ' editor-tab--active' : ''}`}
-                type="button"
-                role="tab"
-                aria-selected={selectedComponent === 'program'}
                 aria-controls="editor-file-panel"
-                tabIndex={selectedComponent === 'program' ? 0 : -1}
+                value="program"
                 disabled={!selectedSetup}
-                onClick={() => selectEditorTab('program')}
-                onKeyDown={editorTabKeyDown}
-              >
+                sx={{ minHeight: 34 }}
+                label={<>
                 <span className="editor-tab__dot" aria-hidden="true" />
                 {selectedSetup?.program?.displayName ?? selectedSetup?.name ?? 'G-code'}
-              </button>
-              {selectedSetup?.program ? <button
+                </>}
+              />
+              {selectedSetup?.program ? <Tab
+                component="button"
                 ref={toolpathTabRef}
                 id="editor-tab-toolpath"
                 className={`editor-tab${selectedComponent === 'toolpath' ? ' editor-tab--active' : ''}`}
-                type="button"
-                role="tab"
-                aria-selected={selectedComponent === 'toolpath'}
                 aria-controls="editor-file-panel"
-                tabIndex={selectedComponent === 'toolpath' ? 0 : -1}
-                onClick={() => selectEditorTab('toolpath')}
-                onKeyDown={editorTabKeyDown}
-              >Toolpath</button> : null}
-              {selectedSetup?.program ? <button
+                value="toolpath"
+                label="Toolpath"
+                sx={{ minHeight: 34 }}
+              /> : null}
+              {selectedSetup?.program ? <Tab
+                component="button"
                 ref={toolTableTabRef}
                 id="editor-tab-tool-table"
                 className={`editor-tab${selectedComponent === 'tool-table' ? ' editor-tab--active' : ''}`}
-                type="button"
-                role="tab"
-                aria-selected={selectedComponent === 'tool-table'}
                 aria-controls="editor-file-panel"
-                tabIndex={selectedComponent === 'tool-table' ? 0 : -1}
-                onClick={() => selectEditorTab('tool-table')}
-                onKeyDown={editorTabKeyDown}
-              >Tool Table</button> : null}
-              {selectedSetup?.setupSheet ? <button
+                value="tool-table"
+                label="Tool Table"
+                sx={{ minHeight: 34 }}
+              /> : null}
+              {selectedSetup?.setupSheet ? <Tab
+                component="button"
                 ref={sheetTabRef}
                 id="editor-tab-setup-sheet"
                 className={`editor-tab${selectedComponent === 'setup-sheet' ? ' editor-tab--active' : ''}`}
-                type="button"
-                role="tab"
-                aria-selected={selectedComponent === 'setup-sheet'}
                 aria-controls="editor-file-panel"
-                tabIndex={selectedComponent === 'setup-sheet' ? 0 : -1}
-                onClick={() => selectEditorTab('setup-sheet')}
-                onKeyDown={editorTabKeyDown}
-              ><SheetIcon />{selectedSetup.setupSheet.displayName}</button> : null}
-            </div>
+                value="setup-sheet"
+                label={<><SheetIcon />{selectedSetup.setupSheet.displayName}</>}
+                sx={{ minHeight: 34 }}
+              /> : null}
+            </Tabs>
             <div className="editor-tabs__actions">
               {selectedSetup?.program ? selectedAnalysis?.error
                 ? <div className="editor-index-progress editor-index-progress--error" role="alert">Индекс: ошибка</div>
@@ -850,18 +865,34 @@ export function Workbench({
                   <progress max={1} value={selectedAnalysis?.progress ?? 0} aria-label="Прогресс индексации G-code" />
                 </div> : null}
               {selectedSetup ? <>
-                {selectedComponent !== 'setup-sheet' ? <button className="editor-file-action" type="button" disabled={uploading} onClick={(event) => { pickerReturnRef.current = event.currentTarget; programInputRef.current?.click() }}>{selectedSetup.program ? 'Заменить G-code' : 'Добавить G-code'}</button> : null}
-                {selectedComponent === 'setup-sheet' ? <button className="editor-file-action" type="button" disabled={uploading} onClick={(event) => { pickerReturnRef.current = event.currentTarget; sheetInputRef.current?.click() }}>Заменить Sheet</button> : null}
-                {!selectedSetup.setupSheet ? <button className="editor-file-action editor-file-action--attach" type="button" disabled={uploading || !selectedSetup.program} onClick={(event) => { pickerReturnRef.current = event.currentTarget; sheetInputRef.current?.click() }}><PlusIcon />Setup Sheet</button> : null}
-                {selectedComponent === 'setup-sheet' && selectedSetup.setupSheet ? <button className="workbench-icon-button" type="button" title="Отсоединить Setup Sheet" aria-label="Удалить Setup Sheet" onClick={() => setDialog({ kind: 'delete-component', setup: selectedSetup, component: 'setup-sheet' })}><TrashIcon /></button> : null}
-                <button className="workbench-icon-button" type="button" title="Свойства и каталог" aria-label="Свойства и каталог сетапа" onClick={() => setDialog({ kind: 'setup', setup: selectedSetup })}><EditIcon /></button>
-                <button className="workbench-icon-button" type="button" title="Удалить G-code и Setup Sheet" aria-label="Удалить сетап" onClick={() => openDeleteSetup(selectedSetup)}><TrashIcon /></button>
+                {selectedComponent !== 'setup-sheet' ? <Button component="button" className="editor-file-action" type="button" disabled={uploading} onClick={(event) => { pickerReturnRef.current = event.currentTarget; programInputRef.current?.click() }}>{selectedSetup.program ? 'Заменить G-code' : 'Добавить G-code'}</Button> : null}
+                {selectedComponent === 'setup-sheet' ? <Button component="button" className="editor-file-action" type="button" disabled={uploading} onClick={(event) => { pickerReturnRef.current = event.currentTarget; sheetInputRef.current?.click() }}>Заменить Sheet</Button> : null}
+                {!selectedSetup.setupSheet ? <Button component="button" className="editor-file-action editor-file-action--attach" type="button" disabled={uploading || !selectedSetup.program} onClick={(event) => { pickerReturnRef.current = event.currentTarget; sheetInputRef.current?.click() }}><PlusIcon />Setup Sheet</Button> : null}
+                {selectedComponent === 'setup-sheet' && selectedSetup.setupSheet ? <IconButton component="button" className="workbench-icon-button" type="button" title="Отсоединить Setup Sheet" aria-label="Удалить Setup Sheet" onClick={() => setDialog({ kind: 'delete-component', setup: selectedSetup, component: 'setup-sheet' })}><TrashIcon /></IconButton> : null}
+                <IconButton component="button" className="workbench-icon-button" type="button" title="Свойства и каталог" aria-label="Свойства и каталог сетапа" onClick={() => setDialog({ kind: 'setup', setup: selectedSetup })}><EditIcon /></IconButton>
+                <IconButton component="button" className="workbench-icon-button" type="button" title="Удалить G-code и Setup Sheet" aria-label="Удалить сетап" onClick={() => openDeleteSetup(selectedSetup)}><TrashIcon /></IconButton>
               </> : null}
             </div>
           </div>
 
-          {actionError ? <div className="editor-inline-error" role="alert"><span>{actionError}</span><div>{retryUpload ? <button type="button" disabled={uploading} onClick={retryPendingUpload}>Повторить: {retryUpload.label}</button> : null}<button type="button" onClick={() => { setActionError(undefined); setRetryUpload(undefined) }}>Закрыть</button></div></div> : null}
-          {loadError ? <div className="editor-inline-error" role="alert"><span>Каталог не удалось загрузить: {loadError}</span><button type="button" onClick={() => void load()}>Повторить</button></div> : null}
+          {actionError ? <Alert
+            className="editor-inline-error"
+            severity="error"
+            variant="standard"
+            icon={false}
+            role="alert"
+            action={<>{retryUpload ? <Button component="button" type="button" disabled={uploading} onClick={retryPendingUpload} sx={{ minWidth: 0 }}>Повторить: {retryUpload.label}</Button> : null}<Button component="button" type="button" onClick={() => { setActionError(undefined); setRetryUpload(undefined) }} sx={{ minWidth: 0 }}>Закрыть</Button></>}
+            sx={{ '& .MuiAlert-message': { minWidth: 0, padding: 0 }, '& .MuiAlert-action': { margin: 0, padding: 0 } }}
+          ><span>{actionError}</span></Alert> : null}
+          {loadError ? <Alert
+            className="editor-inline-error"
+            severity="error"
+            variant="standard"
+            icon={false}
+            role="alert"
+            action={<Button component="button" type="button" onClick={() => void load()} sx={{ minWidth: 0 }}>Повторить</Button>}
+            sx={{ '& .MuiAlert-message': { minWidth: 0, padding: 0 }, '& .MuiAlert-action': { margin: 0, padding: 0 } }}
+          ><span>Каталог не удалось загрузить: {loadError}</span></Alert> : null}
 
           <div
             id="editor-file-panel"
@@ -869,10 +900,10 @@ export function Workbench({
             role="tabpanel"
             aria-labelledby={`editor-tab-${selectedComponent}`}
           >
-            {loading && !catalog ? <div className="workbench-state" aria-busy="true"><span className="spinner" aria-hidden="true" /><p role="status">Открываем каталог программ LinuxCNC…</p></div> : null}
-            {!loading && catalog && catalog.setups.length === 0 ? <div className="workbench-state"><UploadIcon width={42} height={42} /><h1>Добавьте первый G-code</h1><p>Можно выбрать G-code отдельно или сразу вместе с одной PDF/HTML Setup Sheet.</p><div><button className="workbench-button" type="button" onClick={(event) => { pickerReturnRef.current = event.currentTarget; addSetupInputRef.current?.click() }}><PlusIcon />Добавить сетап</button><button className="workbench-button" type="button" onClick={() => setDialog({ kind: 'folder' })}><FolderIcon />Создать каталог</button></div></div> : null}
+            {loading && !catalog ? <div className="workbench-state" aria-busy="true"><CircularProgress color="inherit" size="2.1rem" aria-hidden="true" /><p role="status">Открываем каталог программ LinuxCNC…</p></div> : null}
+            {!loading && catalog && catalog.setups.length === 0 ? <div className="workbench-state"><UploadIcon width={42} height={42} /><h1>Добавьте первый G-code</h1><p>Можно выбрать G-code отдельно или сразу вместе с одной PDF/HTML Setup Sheet.</p><div><Button component="button" className="workbench-button" type="button" onClick={(event) => { pickerReturnRef.current = event.currentTarget; addSetupInputRef.current?.click() }}><PlusIcon />Добавить сетап</Button><Button component="button" className="workbench-button" type="button" onClick={() => setDialog({ kind: 'folder' })}><FolderIcon />Создать каталог</Button></div></div> : null}
             {!loading && catalog && catalog.setups.length > 0 && !selectedSetup ? <div className="workbench-state"><h1>Выберите G-code слева</h1><p>Setup Sheet, если она прикреплена, находится дочерней строкой под G-code.</p></div> : null}
-            {selectedSetup && selectedComponent === 'program' && !programArtifact ? <div className="workbench-state workbench-state--incomplete"><span className="incomplete-icon" aria-hidden="true">{'{}'}</span><h1>Нужен G-code</h1><p>Эта запись не завершена. Добавьте программу; существующая Setup Sheet останется прикреплённой.</p><div><button className="workbench-button" type="button" disabled={uploading} onClick={(event) => { pickerReturnRef.current = event.currentTarget; programInputRef.current?.click() }}><UploadIcon />Добавить G-code</button></div></div> : null}
+            {selectedSetup && selectedComponent === 'program' && !programArtifact ? <div className="workbench-state workbench-state--incomplete"><span className="incomplete-icon" aria-hidden="true">{'{}'}</span><h1>Нужен G-code</h1><p>Эта запись не завершена. Добавьте программу; существующая Setup Sheet останется прикреплённой.</p><div><Button component="button" className="workbench-button" type="button" disabled={uploading} onClick={(event) => { pickerReturnRef.current = event.currentTarget; programInputRef.current?.click() }}><UploadIcon />Добавить G-code</Button></div></div> : null}
             {selectedSetup && programArtifact && previewSetup ? <div className="editor-program-panel" hidden={selectedComponent !== 'program'}><GCodePreview
               key={`${programArtifact.artifactId}:${programArtifact.version}:${cacheSessionGeneration}`}
               compact
@@ -893,13 +924,21 @@ export function Workbench({
             </div> : null}
             {selectedSetup && selectedComponent === 'tool-table' && programArtifact ? <div className="tool-table-panel">
               <header><div><h1>Tool Table</h1><p>Инструменты, извлечённые из программы по словам T и M6. Это не системный LinuxCNC TOOL_TABLE.</p></div><span>{selectedAnalysis?.complete ? `${selectedAnalysis.tools.length} инструментов` : `Индекс ${Math.round((selectedAnalysis?.progress ?? 0) * 100)}%`}</span></header>
-              {selectedAnalysis?.validation === 'offline' ? <p className="tool-table-offline" role="status">Открыта сохранённая офлайн-версия; backend пока не подтвердил, что файл не изменился.</p> : null}
-              {selectedAnalysis?.error ? <div className="derived-tab-error" role="alert"><h2>Tool Table не построена</h2><p>{selectedAnalysis.error === 'UNSUPPORTED_ENCODING' ? 'Программа не является корректным UTF-8 текстом.' : selectedAnalysis.error === 'ARTIFACT_CHANGED' ? 'Версия программы изменилась; обновите каталог.' : 'Не удалось прочитать и проиндексировать программу.'}</p><div><button type="button" onClick={() => { setCacheSessionGeneration((generation) => generation + 1); queueMicrotask(() => toolTableTabRef.current?.focus()) }}>Повторить</button><button type="button" onClick={() => selectEditorTab('program', true)}>Открыть G-code</button></div></div> : !selectedAnalysis || selectedAnalysis.validation === 'pending' ? <div className="derived-tab-loading" role="status"><span className="spinner" aria-hidden="true" />Проверяем версию программы…</div> : !selectedAnalysis.complete ? <div className="derived-tab-loading" role="status"><span className="spinner" aria-hidden="true" />{selectedAnalysis.progress >= 1 ? 'Финализируем Tool Table…' : `Строим Tool Table: ${Math.round(selectedAnalysis.progress * 100)}%`}</div> : selectedAnalysis.tools.length === 0 ? <div className="derived-tab-empty" role="status"><h2>Инструменты не найдены</h2><p>{selectedAnalysis.toolsTruncated ? 'В обработанной части программы статические целочисленные слова T не найдены.' : 'В программе нет статических целочисленных слов T. Динамические выражения не подменяются догадками.'}</p></div> : <div className="tool-table-scroll"><table>
+              {selectedAnalysis?.validation === 'offline' ? <Alert className="tool-table-offline" severity="warning" variant="standard" icon={false} role="status" sx={{ '& .MuiAlert-message': { minWidth: 0, padding: 0 } }}>Открыта сохранённая офлайн-версия; backend пока не подтвердил, что файл не изменился.</Alert> : null}
+              {selectedAnalysis?.error ? <div className="derived-tab-error"><Alert
+                severity="error"
+                variant="standard"
+                icon={false}
+                role="alert"
+                sx={{ width: '100%', padding: 0, color: 'inherit', backgroundColor: 'transparent', '& .MuiAlert-message': { width: '100%', padding: 0 } }}
+              ><h2>Tool Table не построена</h2><p>{selectedAnalysis.error === 'UNSUPPORTED_ENCODING' ? 'Программа не является корректным UTF-8 текстом.' : selectedAnalysis.error === 'ARTIFACT_CHANGED' ? 'Версия программы изменилась; обновите каталог.' : 'Не удалось прочитать и проиндексировать программу.'}</p><div><Button component="button" type="button" onClick={() => { setCacheSessionGeneration((generation) => generation + 1); queueMicrotask(() => toolTableTabRef.current?.focus()) }}>Повторить</Button><Button component="button" type="button" onClick={() => selectEditorTab('program', true)}>Открыть G-code</Button></div></Alert></div> : !selectedAnalysis || selectedAnalysis.validation === 'pending' ? <div className="derived-tab-loading" role="status"><CircularProgress color="inherit" size="2.1rem" aria-hidden="true" />Проверяем версию программы…</div> : !selectedAnalysis.complete ? <div className="derived-tab-loading" role="status"><CircularProgress color="inherit" size="2.1rem" aria-hidden="true" />{selectedAnalysis.progress >= 1 ? 'Финализируем Tool Table…' : `Строим Tool Table: ${Math.round(selectedAnalysis.progress * 100)}%`}</div> : selectedAnalysis.tools.length === 0 ? <div className="derived-tab-empty" role="status"><h2>Инструменты не найдены</h2><p>{selectedAnalysis.toolsTruncated ? 'В обработанной части программы статические целочисленные слова T не найдены.' : 'В программе нет статических целочисленных слов T. Динамические выражения не подменяются догадками.'}</p></div> : <TableContainer className="tool-table-scroll">
+                <Table size="small">
                 <caption className="visually-hidden">Инструменты из G-code</caption>
-                <thead><tr><th scope="col">Инструмент</th><th scope="col">Первая строка</th><th scope="col">Упоминания T</th><th scope="col">Смены M6</th></tr></thead>
-                <tbody>{selectedAnalysis.tools.map((tool) => <tr key={tool.toolNumber}><th scope="row">T{tool.toolNumber}</th><td><button type="button" onClick={() => { setLineBySetup((current) => ({ ...current, [selectedSetup.setupId]: tool.firstLine })); selectEditorTab('program', true) }}>Строка {tool.firstLine}</button></td><td>{tool.references}</td><td>{tool.changes}</td></tr>)}</tbody>
-              </table></div>}
-              {selectedAnalysis?.complete && selectedAnalysis.toolsTruncated ? <p className="tool-table-warning" role="status">Результат ограничен первыми 1024 уникальными инструментами или строкой необычно большого размера.</p> : null}
+                  <TableHead><TableRow><TableCell scope="col">Инструмент</TableCell><TableCell scope="col">Первая строка</TableCell><TableCell scope="col">Упоминания T</TableCell><TableCell scope="col">Смены M6</TableCell></TableRow></TableHead>
+                  <TableBody>{selectedAnalysis.tools.map((tool) => <TableRow key={tool.toolNumber}><TableCell component="th" scope="row">T{tool.toolNumber}</TableCell><TableCell><Button component="button" type="button" onClick={() => { setLineBySetup((current) => ({ ...current, [selectedSetup.setupId]: tool.firstLine })); selectEditorTab('program', true) }} sx={{ minWidth: 0 }}>Строка {tool.firstLine}</Button></TableCell><TableCell>{tool.references}</TableCell><TableCell>{tool.changes}</TableCell></TableRow>)}</TableBody>
+                </Table>
+              </TableContainer>}
+              {selectedAnalysis?.complete && selectedAnalysis.toolsTruncated ? <Alert className="tool-table-warning" severity="warning" variant="standard" icon={false} role="status" sx={{ '& .MuiAlert-message': { minWidth: 0, padding: 0 } }}>Результат ограничен первыми 1024 уникальными инструментами или строкой необычно большого размера.</Alert> : null}
             </div> : null}
             {selectedSetup && selectedComponent === 'setup-sheet' && sheetArtifact && previewSetup ? <SetupSheetViewer
               inline
@@ -920,7 +959,33 @@ export function Workbench({
         <code title={destinationText}>{destinationText}</code>
         {selectedSetup ? <span>rev {selectedSetup.revision}{selectedSetup.program ? ` · ${formatBytes(selectedSetup.program.byteSize)}` : ' · без G-code'}</span> : null}
       </footer>
-      {destinationNotice ? <div className="destination-toast" role="status"><span>{destinationNotice}</span><button type="button" aria-label="Закрыть уведомление" onClick={() => setDestinationNotice(undefined)}><CloseIcon /></button></div> : null}
+      {destinationNotice ? <Snackbar
+        key={destinationNotice}
+        className="destination-toast"
+        open
+        autoHideDuration={8000}
+        anchorOrigin={{ vertical: 'bottom', horizontal: 'left' }}
+        onClose={(_event, reason) => {
+          if (reason !== 'clickaway') setDestinationNotice(undefined)
+        }}
+      >
+        <Alert
+          severity="success"
+          variant="standard"
+          icon={false}
+          role="status"
+          action={<IconButton color="inherit" size="small" aria-label="Закрыть уведомление" onClick={() => setDestinationNotice(undefined)}><CloseIcon /></IconButton>}
+          sx={{
+            width: '100%',
+            padding: 0,
+            color: 'inherit',
+            backgroundColor: 'transparent',
+            font: 'inherit',
+            '& .MuiAlert-message': { minWidth: 0, flex: 1, padding: 0 },
+            '& .MuiAlert-action': { marginLeft: 'auto', marginRight: 0, padding: 0 },
+          }}
+        ><span>{destinationNotice}</span></Alert>
+      </Snackbar> : null}
 
       {catalog && dialog?.kind === 'folder' ? <FolderDialog folders={catalog.folders} destination={catalog.destination} initialParentFolderId={activeFolderId} folder={dialog.folder} onClose={() => setDialog(undefined)} onSaved={savedFolder} /> : null}
       {catalog && dialog?.kind === 'setup' ? <SetupPropertiesDialog setup={dialog.setup} folders={catalog.folders} destination={catalog.destination} onClose={() => setDialog(undefined)} onSaved={savedSetup} /> : null}

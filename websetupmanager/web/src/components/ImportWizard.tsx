@@ -1,4 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
+import Alert from '@mui/material/Alert'
+import Button from '@mui/material/Button'
+import Checkbox from '@mui/material/Checkbox'
+import FormControlLabel from '@mui/material/FormControlLabel'
+import TextField from '@mui/material/TextField'
 import {
 	cancelJob,
   cancelImport,
@@ -330,47 +335,47 @@ export function ImportWizard({ capabilities, onClose, onImported }: Props) {
       className="import-modal"
       footer={(
         <>
-          {step === 2 ? <button className="button button--quiet" type="button" disabled={pending || Boolean(session)} onClick={() => setStep(1)}>Назад</button> : null}
-          <button className="button button--quiet" type="button" disabled={cancelling} onClick={() => void cancelAndClose()}>{cancelling ? 'Отменяем…' : pending ? 'Отменить загрузку' : 'Отмена'}</button>
+          {step === 2 ? <Button className="button button--quiet" variant="outlined" type="button" disabled={pending || Boolean(session)} onClick={() => setStep(1)}>Назад</Button> : null}
+          <Button className="button button--quiet" variant="outlined" type="button" disabled={cancelling} onClick={() => void cancelAndClose()}>{cancelling ? 'Отменяем…' : pending ? 'Отменить загрузку' : 'Отмена'}</Button>
           {step === 1 ? (
-			<button className="button button--primary" type="button" disabled={preflightPending || name.trim() === '' || files.length === 0} onClick={() => void checkNames(true)}>{preflightPending ? 'Проверяем Unicode…' : 'Проверить роли'}</button>
+				<Button className="button button--primary" variant="contained" type="button" disabled={preflightPending || name.trim() === '' || files.length === 0} onClick={() => void checkNames(true)}>{preflightPending ? 'Проверяем Unicode…' : 'Проверить роли'}</Button>
           ) : (
-			preflightFresh ? <button className="button button--primary" type="button" disabled={pending || !canPublish} onClick={() => void publish()}>{pending ? 'Импортируем…' : failed ? 'Повторить загрузку' : 'Опубликовать комплект'}</button>
-				: <button className="button button--primary" type="button" disabled={pending || preflightPending} onClick={() => void checkNames()}>{preflightPending ? 'Проверяем Unicode…' : 'Проверить имена повторно'}</button>
+				preflightFresh ? <Button className="button button--primary" variant="contained" type="button" disabled={pending || !canPublish} onClick={() => void publish()}>{pending ? 'Импортируем…' : failed ? 'Повторить загрузку' : 'Опубликовать комплект'}</Button>
+					: <Button className="button button--primary" variant="contained" type="button" disabled={pending || preflightPending} onClick={() => void checkNames()}>{preflightPending ? 'Проверяем Unicode…' : 'Проверить имена повторно'}</Button>
           )}
         </>
       )}
     >
       {step === 1 ? (
         <div className="stack-form">
-          <label><span>Название сетапа</span><input value={name} maxLength={200} onChange={(event) => setName(event.target.value)} required /></label>
-          <label><span>Описание</span><textarea rows={3} value={description} onChange={(event) => setDescription(event.target.value)} /></label>
+          <label><span>Название сетапа</span><TextField value={name} fullWidth size="small" slotProps={{ htmlInput: { maxLength: 200 } }} onChange={(event) => setName(event.target.value)} required /></label>
+          <label><span>Описание</span><TextField multiline rows={3} value={description} fullWidth size="small" onChange={(event) => setDescription(event.target.value)} /></label>
           <input ref={pickerRef} className="visually-hidden" type="file" tabIndex={-1} aria-hidden="true" multiple accept={[...capabilities.gcodeExtensions, '.pdf', '.html', '.htm'].join(',')} onChange={(event) => { choose(event.target.files); event.target.value = '' }} />
-          <button className="file-drop" type="button" onClick={() => pickerRef.current?.click()}><strong>{files.length > 0 ? `Выбрано файлов: ${files.length}` : 'Выбрать несколько файлов'}</strong><span>G-code, PDF или автономная HTML Setup Sheet</span></button>
+          <Button className="file-drop" variant="outlined" type="button" onClick={() => pickerRef.current?.click()}><strong>{files.length > 0 ? `Выбрано файлов: ${files.length}` : 'Выбрать несколько файлов'}</strong><span>G-code, PDF или автономная HTML Setup Sheet</span></Button>
         </div>
       ) : (
         <div>
           <div className="wizard-summary"><strong>{name}</strong><span>{description || 'Без описания'}</span></div>
           <ul className="import-file-list">
             {files.map((item) => {
-			  const duplicate = item.included && conflictIDs.has(item.id)
+				  const duplicate = item.included && conflictIDs.has(item.id)
               return <li key={item.id} className={duplicate ? 'import-file-list__conflict' : ''}>
-			<label className="toggle"><input type="checkbox" checked={item.included} disabled={pending || Boolean(item.uploaded)} onChange={(event) => updateFiles((current) => current.map((entry) => entry.id === item.id ? { ...entry, included: event.target.checked } : entry))} /> Включить</label>
-			<span><label><small>Подтверждённое basename</small><input aria-label={`Basename ${item.file.name}`} value={item.basename} disabled={pending || Boolean(item.uploaded)} onChange={(event) => updateFiles((current) => current.map((entry) => entry.id === item.id ? { ...entry, basename: event.target.value } : entry))} /></label><small>{formatBytes(item.file.size)}{item.uploaded ? ' · загружен в staging' : ''}</small></span>
-			<select aria-label={`Роль ${item.file.name}`} value={item.role} disabled={pending || Boolean(item.uploaded)} onChange={(event) => updateFiles((current) => current.map((entry) => entry.id === item.id ? { ...entry, role: event.target.value as SelectedFile['role'] } : entry))}><option value="program">G-code программа</option><option value="setup_sheet">Общая Setup Sheet</option></select>
+				<FormControlLabel className="toggle" sx={{ margin: 0 }} control={<Checkbox size="small" sx={{ padding: '2px' }} checked={item.included} disabled={pending || Boolean(item.uploaded)} onChange={(event) => updateFiles((current) => current.map((entry) => entry.id === item.id ? { ...entry, included: event.target.checked } : entry))} />} label="Включить" />
+				<span><label><small>Подтверждённое basename</small><TextField value={item.basename} fullWidth size="small" disabled={pending || Boolean(item.uploaded)} slotProps={{ htmlInput: { 'aria-label': `Basename ${item.file.name}` } }} onChange={(event) => updateFiles((current) => current.map((entry) => entry.id === item.id ? { ...entry, basename: event.target.value } : entry))} /></label><small>{formatBytes(item.file.size)}{item.uploaded ? ' · загружен в staging' : ''}</small></span>
+				<select aria-label={`Роль ${item.file.name}`} value={item.role} disabled={pending || Boolean(item.uploaded)} onChange={(event) => updateFiles((current) => current.map((entry) => entry.id === item.id ? { ...entry, role: event.target.value as SelectedFile['role'] } : entry))}><option value="program">G-code программа</option><option value="setup_sheet">Общая Setup Sheet</option></select>
                 {item.included && item.role === 'program' ? <label className="toggle"><input type="radio" name="primary-program" checked={primaryID === item.id} disabled={pending || Boolean(session)} onChange={() => setPrimaryID(item.id)} /> Основная</label> : null}
-			{duplicate ? <div className="import-conflict-actions"><span>Backend обнаружил совпадение Unicode basename.</span><button type="button" disabled={pending} onClick={() => void keepOnlyCollision(item.id)}>Оставить только этот файл</button><button type="button" disabled={pending} onClick={() => void excludeFile(item.id)}>Исключить</button></div> : null}
-			{item.included && item.role === 'setup_sheet' && sheetCount > 1 && !session ? <div className="import-conflict-actions"><span>В комплекте допустима одна Setup Sheet.</span><button type="button" onClick={() => updateFiles((current) => current.map((entry) => entry.role === 'setup_sheet' && entry.id !== item.id ? { ...entry, included: false } : entry))}>Оставить эту Setup Sheet</button></div> : null}
+				{duplicate ? <div className="import-conflict-actions"><span>Backend обнаружил совпадение Unicode basename.</span><Button variant="outlined" type="button" disabled={pending} onClick={() => void keepOnlyCollision(item.id)}>Оставить только этот файл</Button><Button variant="outlined" type="button" disabled={pending} onClick={() => void excludeFile(item.id)}>Исключить</Button></div> : null}
+				{item.included && item.role === 'setup_sheet' && sheetCount > 1 && !session ? <div className="import-conflict-actions"><span>В комплекте допустима одна Setup Sheet.</span><Button variant="outlined" type="button" onClick={() => updateFiles((current) => current.map((entry) => entry.role === 'setup_sheet' && entry.id !== item.id ? { ...entry, included: false } : entry))}>Оставить эту Setup Sheet</Button></div> : null}
               </li>
             })}
           </ul>
-		  {conflicts.length > 0 ? <p className="form-error" role="alert">Backend обнаружил совпадающие Unicode basename: переименуйте, оставьте один или исключите файл.</p> : null}
-		  {preflightErrors.size > 0 ? <p className="form-error" role="alert">Backend отклонил одно или несколько имён: {Array.from(preflightErrors.values()).join(', ')}.</p> : null}
-          {sheetCount > 1 ? <p className="form-error" role="alert">В сетапе может быть только одна Setup Sheet.</p> : null}
-          {programs.length === 0 ? <p className="form-error" role="alert">В комплекте должна быть хотя бы одна G-code-программа.</p> : null}
-          {invalidNames.length > 0 ? <p className="form-error" role="alert">Basename не может быть пустым, путём, «.» или «..».</p> : null}
-          {error ? <p className="form-error" role="alert">{error}</p> : null}
-          {failed && stagedPrograms.length > 0 ? <div className="partial-import"><p>Успешно staged: {staged.length}. Можно повторить остальные файлы или сохранить staged-часть как draft.</p><button className="button button--quiet" type="button" disabled={pending} onClick={() => void savePartialDraft()}>Сохранить staged как draft</button></div> : null}
+			  {conflicts.length > 0 ? <Alert className="form-error" severity="error" role="alert">Backend обнаружил совпадающие Unicode basename: переименуйте, оставьте один или исключите файл.</Alert> : null}
+			  {preflightErrors.size > 0 ? <Alert className="form-error" severity="error" role="alert">Backend отклонил одно или несколько имён: {Array.from(preflightErrors.values()).join(', ')}.</Alert> : null}
+          {sheetCount > 1 ? <Alert className="form-error" severity="error" role="alert">В сетапе может быть только одна Setup Sheet.</Alert> : null}
+          {programs.length === 0 ? <Alert className="form-error" severity="error" role="alert">В комплекте должна быть хотя бы одна G-code-программа.</Alert> : null}
+          {invalidNames.length > 0 ? <Alert className="form-error" severity="error" role="alert">Basename не может быть пустым, путём, «.» или «..».</Alert> : null}
+          {error ? <Alert className="form-error" severity="error" role="alert">{error}</Alert> : null}
+          {failed && stagedPrograms.length > 0 ? <div className="partial-import"><p>Успешно staged: {staged.length}. Можно повторить остальные файлы или сохранить staged-часть как draft.</p><Button className="button button--quiet" variant="outlined" type="button" disabled={pending} onClick={() => void savePartialDraft()}>Сохранить staged как draft</Button></div> : null}
           {progress ? <div className="import-progress" role="status"><span>{progress.label}{session?.jobId ? ` · Job ${session.jobId.slice(0, 8)} · ${job?.state ?? 'running'}` : ''}</span>{progress.total > 0 ? <><progress max={progress.total} value={Math.min(Math.max(job?.progress.completedBytes ?? 0, progress.loaded), progress.total)} /><small>{formatBytes(Math.max(job?.progress.completedBytes ?? 0, progress.loaded))} из {formatBytes(progress.total)}</small></> : null}</div> : <p className="form-hint">До commit файлы находятся в staging и не видны в библиотеке.</p>}
         </div>
       )}

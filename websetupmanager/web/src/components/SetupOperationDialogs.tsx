@@ -1,4 +1,8 @@
 import { useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react'
+import Alert from '@mui/material/Alert'
+import Button from '@mui/material/Button'
+import CircularProgress from '@mui/material/CircularProgress'
+import TextField from '@mui/material/TextField'
 import {
 	ApiError,
 	cancelJob,
@@ -26,11 +30,19 @@ export function OperationError({ error, onReload, onReloaded }: ErrorNoticeProps
   const [reloading, setReloading] = useState(false)
   const conflict = isRevisionConflict(error)
   return (
-    <div className={`form-error${conflict ? ' conflict-notice' : ''}`} role="alert">
+    <Alert
+      className={`form-error${conflict ? ' conflict-notice' : ''}`}
+      severity={conflict ? 'warning' : 'error'}
+      variant="standard"
+      icon={false}
+      role="alert"
+      sx={{ '& .MuiAlert-message': { width: '100%', padding: 0 } }}
+    >
       <strong>{conflict ? 'Карточка уже изменилась' : 'Операция не завершена'}</strong>
       <p>{errorMessage(error)}{conflict ? ' Введённые данные сохранены.' : ''}</p>
       {conflict && onReload ? (
-        <button
+        <Button
+          component="button"
           className="button button--quiet"
           type="button"
           disabled={reloading}
@@ -38,11 +50,12 @@ export function OperationError({ error, onReload, onReloaded }: ErrorNoticeProps
             setReloading(true)
             void onReload().then(onReloaded).finally(() => setReloading(false))
           }}
+          startIcon={reloading ? <CircularProgress color="inherit" size="1rem" aria-hidden="true" /> : undefined}
         >
           {reloading ? 'Обновляем…' : 'Загрузить актуальную revision'}
-        </button>
+        </Button>
       ) : null}
-    </div>
+    </Alert>
   )
 }
 
@@ -97,7 +110,7 @@ export function MetadataEditor({ setup, onChanged, onReload }: MetadataProps) {
       <section className="detail-section metadata-section" aria-labelledby="metadata-title">
         <div className="section-heading">
           <div><p className="eyebrow">Карточка</p><h2 id="metadata-title">Описание</h2></div>
-          {setup.status !== 'archived' ? <button className="button button--quiet" type="button" onClick={() => setEditing(true)}>Изменить метаданные</button> : null}
+          {setup.status !== 'archived' ? <Button component="button" className="button button--quiet" type="button" onClick={() => setEditing(true)}>Изменить метаданные</Button> : null}
         </div>
         <p className={setup.description ? '' : 'muted-copy'}>{setup.description || 'Описание не добавлено.'}</p>
       </section>
@@ -108,12 +121,12 @@ export function MetadataEditor({ setup, onChanged, onReload }: MetadataProps) {
     <section className="detail-section metadata-section" aria-labelledby="metadata-edit-title">
       <div className="section-heading"><div><p className="eyebrow">Карточка</p><h2 id="metadata-edit-title">Изменение метаданных</h2></div></div>
       <form className="stack-form" onSubmit={(event) => void submit(event)}>
-        <label><span>Название</span><input value={name} required maxLength={200} onChange={(event) => setName(event.target.value)} /></label>
-        <label><span>Описание</span><textarea rows={4} value={description} onChange={(event) => setDescription(event.target.value)} /></label>
+        <TextField label="Название" value={name} required fullWidth slotProps={{ htmlInput: { maxLength: 200 } }} onChange={(event) => setName(event.target.value)} />
+        <TextField label="Описание" value={description} fullWidth multiline rows={4} onChange={(event) => setDescription(event.target.value)} />
         {error ? <OperationError error={error} onReload={onReload} onReloaded={() => { setError(undefined); setKey(newIdempotencyKey()) }} /> : null}
         <div className="form-actions">
-          <button className="button button--quiet" type="button" onClick={reset} disabled={pending}>Отмена</button>
-          <button className="button button--primary" type="submit" disabled={pending || name.trim() === ''}>{pending ? 'Сохраняем…' : 'Сохранить revision'}</button>
+          <Button component="button" className="button button--quiet" type="button" onClick={reset} disabled={pending}>Отмена</Button>
+          <Button component="button" className="button button--primary" type="submit" disabled={pending || name.trim() === ''} startIcon={pending ? <CircularProgress color="inherit" size="1rem" aria-hidden="true" /> : undefined}>{pending ? 'Сохраняем…' : 'Сохранить revision'}</Button>
         </div>
       </form>
     </section>
@@ -165,10 +178,10 @@ export function ConfirmOperationDialog({
       closeDisabled={pending}
       footer={(
         <>
-          <button className="button button--quiet" type="button" onClick={onClose} disabled={pending}>Отмена</button>
-          <button className={`button ${danger ? 'button--danger' : 'button--primary'}`} type="button" onClick={() => void confirm()} disabled={pending}>
+          <Button component="button" className="button button--quiet" type="button" onClick={onClose} disabled={pending}>Отмена</Button>
+          <Button component="button" className={`button ${danger ? 'button--danger' : 'button--primary'}`} type="button" onClick={() => void confirm()} disabled={pending} startIcon={pending ? <CircularProgress color="inherit" size="1rem" aria-hidden="true" /> : undefined}>
             {pending ? 'Выполняем…' : confirmLabel}
-          </button>
+          </Button>
         </>
       )}
     >
@@ -216,13 +229,13 @@ export function RenameProgramDialog({ setup, artifact, onClose, onChanged, onRel
       initialFocusRef={inputRef}
       footer={(
         <>
-          <button className="button button--quiet" type="button" onClick={onClose} disabled={pending}>Отмена</button>
-          <button className="button button--primary" type="submit" form="rename-program-form" disabled={pending || name.trim() === ''}>Переименовать</button>
+          <Button component="button" className="button button--quiet" type="button" onClick={onClose} disabled={pending}>Отмена</Button>
+          <Button component="button" className="button button--primary" type="submit" form="rename-program-form" disabled={pending || name.trim() === ''} startIcon={pending ? <CircularProgress color="inherit" size="1rem" aria-hidden="true" /> : undefined}>Переименовать</Button>
         </>
       )}
     >
       <form id="rename-program-form" className="stack-form" onSubmit={(event) => void submit(event)}>
-        <label><span>Новое basename</span><input ref={inputRef} value={name} onChange={(event) => setName(event.target.value)} required /></label>
+        <TextField label="Новое basename" inputRef={inputRef} value={name} onChange={(event) => setName(event.target.value)} required fullWidth />
         {error ? <OperationError error={error} onReload={onReload} onReloaded={() => { setError(undefined); setKey(newIdempotencyKey()) }} /> : null}
       </form>
     </Modal>
@@ -305,8 +318,8 @@ export function FileOperationDialog({
       closeDisabled={pending}
       footer={(
         <>
-          <button className="button button--quiet" type="button" onClick={pending ? () => void cancelUpload() : onClose}>{pending ? 'Отменить job' : 'Отмена'}</button>
-          <button className="button button--primary" type="button" onClick={() => void confirm()} disabled={pending}>{pending ? 'Передаём…' : 'Подтвердить'}</button>
+          <Button component="button" className="button button--quiet" type="button" onClick={pending ? () => void cancelUpload() : onClose}>{pending ? 'Отменить job' : 'Отмена'}</Button>
+          <Button component="button" className="button button--primary" type="button" onClick={() => void confirm()} disabled={pending} startIcon={pending ? <CircularProgress color="inherit" size="1rem" aria-hidden="true" /> : undefined}>{pending ? 'Передаём…' : 'Подтвердить'}</Button>
         </>
       )}
     >
@@ -359,13 +372,13 @@ export function DuplicateSetupDialog({ setup, onClose, onStart, onReload }: Dupl
       initialFocusRef={inputRef}
       footer={(
         <>
-          <button className="button button--quiet" type="button" onClick={onClose} disabled={pending}>Отмена</button>
-          <button className="button button--primary" type="submit" form="duplicate-setup-form" disabled={pending || name.trim() === ''}>Запустить дублирование</button>
+          <Button component="button" className="button button--quiet" type="button" onClick={onClose} disabled={pending}>Отмена</Button>
+          <Button component="button" className="button button--primary" type="submit" form="duplicate-setup-form" disabled={pending || name.trim() === ''} startIcon={pending ? <CircularProgress color="inherit" size="1rem" aria-hidden="true" /> : undefined}>Запустить дублирование</Button>
         </>
       )}
     >
       <form id="duplicate-setup-form" className="stack-form" onSubmit={(event) => void submit(event)}>
-        <label><span>Название копии</span><input ref={inputRef} value={name} required onChange={(event) => setName(event.target.value)} /></label>
+        <TextField label="Название копии" inputRef={inputRef} value={name} required fullWidth onChange={(event) => setName(event.target.value)} />
         {error ? <OperationError error={error} onReload={onReload} onReloaded={() => { setError(undefined); setKey(newIdempotencyKey()) }} /> : null}
       </form>
     </Modal>
@@ -459,19 +472,21 @@ export function PermanentDeleteDialog({ setup, onClose, onDeleted, onReload }: P
       closeDisabled={pending}
       footer={(
         <>
-          <button className="button button--quiet" type="button" onClick={onClose} disabled={pending}>Отмена</button>
-          <button
+          <Button component="button" className="button button--quiet" type="button" onClick={onClose} disabled={pending}>Отмена</Button>
+          <Button
+            component="button"
             className="button button--danger"
             type="button"
             disabled={pending || !plan || exactName !== plan.exactName}
             onClick={() => void remove()}
+            startIcon={pending ? <CircularProgress color="inherit" size="1rem" aria-hidden="true" /> : undefined}
           >
             {pending ? 'Выполняем…' : 'Удалить окончательно'}
-          </button>
+          </Button>
         </>
       )}
     >
-      {pending && !plan ? <p role="status">Готовим точный план удаления…</p> : null}
+      {pending && !plan ? <div role="status"><CircularProgress color="inherit" size="1rem" aria-hidden="true" /> <span>Готовим точный план удаления…</span></div> : null}
       {plan ? (
         <>
           <dl className="operation-summary">
@@ -479,10 +494,14 @@ export function PermanentDeleteDialog({ setup, onClose, onDeleted, onReload }: P
             <div><dt>Setup Sheet</dt><dd>{plan.hasSetupSheet ? 'Есть' : 'Нет'}</dd></div>
             <div><dt>Уникальный объём</dt><dd>{formatBytes(plan.uniqueBytes)}</dd></div>
           </dl>
-          <label className="danger-confirmation">
-            <span>Введите точное название: <strong>{plan.exactName}</strong></span>
-            <input value={exactName} onChange={(event) => setExactName(event.target.value)} autoComplete="off" />
-          </label>
+          <TextField
+            className="danger-confirmation"
+            label={<>Введите точное название: <strong>{plan.exactName}</strong></>}
+            value={exactName}
+            onChange={(event) => setExactName(event.target.value)}
+            autoComplete="off"
+            fullWidth
+          />
         </>
       ) : null}
       {error ? (

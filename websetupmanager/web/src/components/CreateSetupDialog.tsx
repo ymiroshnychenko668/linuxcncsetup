@@ -1,4 +1,9 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react'
+import Alert from '@mui/material/Alert'
+import Button from '@mui/material/Button'
+import Checkbox from '@mui/material/Checkbox'
+import FormControlLabel from '@mui/material/FormControlLabel'
+import TextField from '@mui/material/TextField'
 import { checkSetupName, createSetup, newIdempotencyKey } from '../api'
 import type { Setup } from '../domain'
 import { errorMessage, isNetworkError } from '../ui'
@@ -80,35 +85,38 @@ export function CreateSetupDialog({ onClose, onCreated }: Props) {
       initialFocusRef={nameRef}
       footer={(
         <>
-          <button className="button button--quiet" type="button" onClick={onClose} disabled={pending}>Отмена</button>
-          <button className="button button--primary" type="submit" form="create-setup-form" disabled={pending}>
+          <Button className="button button--quiet" variant="outlined" type="button" onClick={onClose} disabled={pending}>Отмена</Button>
+          <Button className="button button--primary" variant="contained" type="submit" form="create-setup-form" disabled={pending}>
             {pending ? 'Создаём…' : 'Создать черновик'}
-          </button>
+          </Button>
         </>
       )}
     >
       <form id="create-setup-form" className="stack-form" onSubmit={(event) => void submit(event)}>
         <label>
           <span>Название <strong aria-hidden="true">*</strong></span>
-          <input ref={nameRef} value={name} maxLength={200} onChange={(event) => setName(event.target.value)} required />
+          <TextField inputRef={nameRef} value={name} fullWidth size="small" slotProps={{ htmlInput: { maxLength: 200 } }} onChange={(event) => setName(event.target.value)} required />
         </label>
         <label>
           <span>Описание</span>
-          <textarea value={description} rows={5} onChange={(event) => setDescription(event.target.value)} />
+          <TextField multiline rows={5} value={description} fullWidth size="small" onChange={(event) => setDescription(event.target.value)} />
         </label>
-        {error ? <p className="form-error" role="alert">{error}</p> : null}
+        {error ? <Alert className="form-error" severity="error" role="alert">{error}</Alert> : null}
         {matchingName ? (
-          <div className="inline-warning" role="alert">
+          <Alert className="inline-warning" severity="warning" role="alert">
             <p>Уже существует сетап «{matchingName}» с таким отображаемым названием. Сетапы останутся разными благодаря устойчивым ID.</p>
-            <label className="toggle">
-              <input
-                type="checkbox"
+            <FormControlLabel
+              className="toggle"
+              sx={{ margin: 0 }}
+              control={<Checkbox
+                size="small"
+                sx={{ padding: '2px' }}
                 checked={duplicateAcknowledged}
                 onChange={(event) => { setDuplicateAcknowledged(event.target.checked); setError(undefined) }}
-              />
-              Создать отдельный сетап с совпадающим названием
-            </label>
-          </div>
+              />}
+              label="Создать отдельный сетап с совпадающим названием"
+            />
+          </Alert>
         ) : <p className="form-hint">Совпадающие отображаемые названия разрешены, но перед созданием будет показано предупреждение.</p>}
       </form>
     </Modal>

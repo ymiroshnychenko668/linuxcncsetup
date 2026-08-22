@@ -1,10 +1,10 @@
 import { createRef } from 'react'
-import { fireEvent, render, screen } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { describe, expect, it, vi } from 'vitest'
 import { Modal } from './Modal'
 
 describe('Modal', () => {
-  it('labels the dialog, traps Tab navigation, and restores focus', () => {
+  it('labels the dialog, traps Tab navigation, and restores focus', async () => {
     const trigger = document.createElement('button')
     trigger.textContent = 'Открыть'
     document.body.appendChild(trigger)
@@ -25,7 +25,7 @@ describe('Modal', () => {
     const closeButton = screen.getByRole('button', { name: 'Закрыть диалог' })
     const finalButton = screen.getByRole('button', { name: 'Создать' })
     expect(dialog).toHaveAccessibleDescription('Введите метаданные.')
-    expect(closeButton).toHaveFocus()
+    await waitFor(() => expect(closeButton).toHaveFocus())
 
     fireEvent.keyDown(document, { key: 'Tab', shiftKey: true })
     expect(finalButton).toHaveFocus()
@@ -37,7 +37,7 @@ describe('Modal', () => {
     trigger.remove()
   })
 
-  it('honors explicit initial and return focus targets', () => {
+  it('honors explicit initial and return focus targets', async () => {
     const returnTarget = document.createElement('button')
     returnTarget.textContent = 'Вернуться сюда'
     document.body.appendChild(returnTarget)
@@ -54,13 +54,13 @@ describe('Modal', () => {
       </Modal>,
     )
 
-    expect(screen.getByRole('textbox', { name: 'Новое имя' })).toHaveFocus()
+    await waitFor(() => expect(screen.getByRole('textbox', { name: 'Новое имя' })).toHaveFocus())
     unmount()
     expect(returnTarget).toHaveFocus()
     returnTarget.remove()
   })
 
-  it('captures the initiator before a portal child applies autoFocus', () => {
+  it('captures the initiator before a portal child applies autoFocus', async () => {
     const trigger = document.createElement('button')
     trigger.textContent = 'Загрузить'
     document.body.appendChild(trigger)
@@ -72,7 +72,7 @@ describe('Modal', () => {
       </Modal>,
     )
 
-    expect(screen.getByRole('button', { name: 'Закрыть диалог' })).toHaveFocus()
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Закрыть диалог' })).toHaveFocus())
     unmount()
     expect(trigger).toHaveFocus()
     trigger.remove()
@@ -116,16 +116,17 @@ describe('Modal', () => {
 
   it('supports Escape and backdrop closing, but blocks both while busy', () => {
     const onClose = vi.fn()
-    const { container, rerender } = render(
+    const { rerender } = render(
       <Modal title="Импорт" onClose={onClose} closeDisabled>
         <button type="button">Отмена</button>
       </Modal>,
     )
 
     const backdrop = document.querySelector('.modal-backdrop') as HTMLElement
-    expect(screen.getByRole('dialog')).toHaveAttribute('aria-busy', 'true')
-    fireEvent.keyDown(document, { key: 'Escape' })
-    fireEvent.mouseDown(backdrop)
+    const busyDialog = screen.getByRole('dialog')
+    expect(busyDialog).toHaveAttribute('aria-busy', 'true')
+    fireEvent.keyDown(busyDialog, { key: 'Escape' })
+    fireEvent.click(backdrop)
     expect(onClose).not.toHaveBeenCalled()
 
     rerender(
@@ -133,9 +134,9 @@ describe('Modal', () => {
         <button type="button">Отмена</button>
       </Modal>,
     )
-    fireEvent.keyDown(document, { key: 'Escape' })
+    fireEvent.keyDown(screen.getByRole('dialog'), { key: 'Escape' })
     expect(onClose).toHaveBeenCalledTimes(1)
-    fireEvent.mouseDown(container.ownerDocument.querySelector('.modal-backdrop') as HTMLElement)
+    fireEvent.click(document.querySelector('.modal-backdrop') as HTMLElement)
     expect(onClose).toHaveBeenCalledTimes(2)
   })
 

@@ -1,4 +1,10 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react'
+import Alert from '@mui/material/Alert'
+import Button from '@mui/material/Button'
+import Checkbox from '@mui/material/Checkbox'
+import CircularProgress from '@mui/material/CircularProgress'
+import FormControlLabel from '@mui/material/FormControlLabel'
+import TextField from '@mui/material/TextField'
 import { ApiError, login, type AuthSession } from '../api'
 
 interface LoginViewProps {
@@ -90,64 +96,77 @@ export function LoginView({ message, onAuthenticated, captureAuthGeneration }: L
           <p>Используйте имя пользователя и пароль Linux этого станка.</p>
         </div>
 
-        {message ? <div className="auth-notice auth-notice--info" role="status">{message}</div> : null}
+        {message ? <Alert className="auth-notice auth-notice--info" severity="info" role="status">{message}</Alert> : null}
         {isRemotePlainHTTP() ? (
-          <div className="auth-notice auth-notice--warning" role="alert">
+          <Alert className="auth-notice auth-notice--warning" severity="warning" role="alert">
             Пароль и данные сессии могут быть перехвачены или изменены в сети.
-          </div>
+          </Alert>
         ) : null}
-        {error ? <div id="login-error" className="auth-notice auth-notice--error" role="alert">{error}</div> : null}
+        {error ? <Alert id="login-error" className="auth-notice auth-notice--error" severity="error" role="alert">{error}</Alert> : null}
 
         <form className="login-form" aria-busy={submitting} onSubmit={submit}>
-          <label htmlFor="login-username">Имя пользователя</label>
-          <input
+          <TextField
             id="login-username"
             name="username"
+            label="Имя пользователя"
             type="text"
             autoComplete="username"
-            autoCapitalize="none"
-            spellCheck={false}
             value={username}
             disabled={submitting}
             autoFocus
-            required
+            fullWidth
+            margin="normal"
+            slotProps={{ htmlInput: { autoCapitalize: 'none', required: true, spellCheck: false } }}
             onChange={(event) => setUsername(event.target.value)}
           />
 
-          <label htmlFor="login-password">Пароль</label>
-          <input
-            ref={passwordRef}
+          <TextField
+            inputRef={passwordRef}
             id="login-password"
             name="password"
+            label="Пароль"
             type="password"
             autoComplete="current-password"
             value={password}
             disabled={submitting}
-            required
-            aria-invalid={error ? true : undefined}
-            aria-describedby={error ? 'login-error' : undefined}
+            error={Boolean(error)}
+            fullWidth
+            margin="normal"
+            slotProps={{ htmlInput: { 'aria-describedby': error ? 'login-error' : undefined, required: true } }}
             onChange={(event) => setPassword(event.target.value)}
           />
 
-          <label className="remember-option" htmlFor="login-remember">
-            <input
-              id="login-remember"
-              name="rememberMe"
-              type="checkbox"
-              checked={rememberMe}
-              disabled={submitting}
-              onChange={(event) => setRememberMe(event.target.checked)}
-            />
-            <span>
+          <FormControlLabel
+            className="remember-option"
+            disabled={submitting}
+            control={(
+              <Checkbox
+                id="login-remember"
+                name="rememberMe"
+                checked={rememberMe}
+                disableRipple
+                size="small"
+                sx={{ alignSelf: 'flex-start', marginTop: '0.2rem', padding: 0 }}
+                onChange={(event) => setRememberMe(event.target.checked)}
+              />
+            )}
+            label={(
+              <>
               <strong>Запомнить меня</strong>
               <small>Сохранить вход после закрытия браузера на этом доверенном устройстве.</small>
-            </span>
-          </label>
+              </>
+            )}
+          />
 
-          <button className="button button--primary login-form__submit" type="submit" disabled={submitting}>
-            {submitting ? <span className="spinner spinner--small" aria-hidden="true" /> : null}
+          <Button
+            className="button button--primary login-form__submit"
+            variant="contained"
+            type="submit"
+            disabled={submitting}
+          >
+            {submitting ? <CircularProgress aria-hidden="true" color="inherit" size={16} /> : null}
             {submitting ? 'Выполняется вход…' : 'Открыть каталог сетапов'}
-          </button>
+          </Button>
         </form>
 
         <p className="login-card__footnote">

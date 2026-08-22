@@ -1,4 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import Alert from '@mui/material/Alert'
+import Button from '@mui/material/Button'
+import Checkbox from '@mui/material/Checkbox'
+import FormControlLabel from '@mui/material/FormControlLabel'
+import IconButton from '@mui/material/IconButton'
 import type { Artifact, Setup } from '../domain'
 import {
   createCachedRangeSource,
@@ -595,47 +600,47 @@ export function GCodePreview({ setup, artifact, contentUrl, compact = false, onO
           <p>{setup.name} · {artifact.byteSize.toLocaleString()} байт · версия {artifact.version.slice(0, 12)}… {artifact.primary ? '· Основная программа' : ''}</p>
         </div>
         <div className="preview-header__actions">
-          <button type="button" className="button button--quiet" disabled={!hasSheet} onClick={onOpenSetupSheet}>Setup Sheet</button>
-          <label className="toggle"><input type="checkbox" checked={wrap} onChange={(event) => setWrap(event.target.checked)} /> Перенос строк</label>
+          <Button type="button" className="button button--quiet" variant="outlined" disabled={!hasSheet} onClick={onOpenSetupSheet}>Setup Sheet</Button>
+          <FormControlLabel className="toggle" sx={{ margin: 0 }} control={<Checkbox size="small" sx={{ padding: '2px' }} checked={wrap} onChange={(event) => setWrap(event.target.checked)} />} label="Перенос строк" />
         </div>
       </header> : null}
       {!compact ? <div className="index-progress" role="status">
         Индекс строк: {Math.round(indexProgress * 100)}%
         <progress max={1} value={indexProgress} aria-label="Прогресс индекса строк" />
       </div> : null}
-      {displayedError ? <div className="preview-error" role="alert">
+      {displayedError ? <Alert className="preview-error" severity="warning" role="alert">
         {displayedError === 'ARTIFACT_CHANGED' ? 'Артефакт изменён. Обновите карточку перед продолжением.' : searchError && !indexError && !previewError ? 'Поиск не выполнен.' : 'Текстовый preview недоступен.'}
-        {displayedError === 'ARTIFACT_CHANGED' && onArtifactChanged ? <button type="button" className="button button--quiet" onClick={() => artifactChangedRef.current?.()}>Обновить карточку</button> : null}
-      </div> : null}
+        {displayedError === 'ARTIFACT_CHANGED' && onArtifactChanged ? <Button type="button" className="button button--quiet" variant="outlined" onClick={() => artifactChangedRef.current?.()}>Обновить карточку</Button> : null}
+      </Alert> : null}
       {artifact.byteSize === 0 ? <div className="preview-empty" role="status">Программа пуста.</div> : null}
       <div className="preview-tools">
-        {compact ? <label className="toggle"><input type="checkbox" checked={wrap} onChange={(event) => setWrap(event.target.checked)} /> Перенос</label> : null}
+        {compact ? <FormControlLabel className="toggle" sx={{ margin: 0 }} control={<Checkbox size="small" sx={{ padding: '2px' }} checked={wrap} onChange={(event) => setWrap(event.target.checked)} />} label="Перенос" /> : null}
         <form onSubmit={(event) => { event.preventDefault(); goToLine(Number(lineInput)) }}>
           <label>Строка <input name="line" type="number" min={1} max={lineCount} value={lineInput} onChange={(event) => setLineInput(event.target.value)} /></label>
-          <button type="submit" className="button button--quiet">Перейти</button>
+          <Button type="submit" className="button button--quiet" variant="outlined">Перейти</Button>
         </form>
         <form role="search" onSubmit={submitSearch}>
-          <label>Поиск <input type="search" value={query} onChange={(event) => setQuery(event.target.value)} /></label>
-          <label className="toggle"><input type="checkbox" checked={caseSensitive} onChange={(event) => setCaseSensitive(event.target.checked)} /> Учитывать регистр</label>
-          <button type="submit" className="button button--quiet" disabled={!workerReady || searching}>Найти</button>
-					{searching ? <button type="button" className="button button--quiet" onClick={cancelSearch}>Отменить поиск</button> : null}
-          <button type="button" aria-label="Предыдущее совпадение" onClick={() => moveMatch(-1)} disabled={totalMatches === 0 || searching}>↑</button>
-          <button type="button" aria-label="Следующее совпадение" onClick={() => moveMatch(1)} disabled={totalMatches === 0 || searching}>↓</button>
-					<output aria-live="polite">
-						{searching ? `Поиск ${Math.round(searchProgress * 100)}% · найдено ${totalMatches}` : totalMatches > 0 ? `${matchOffset + matchIndex + 1} из ${totalMatches}${matchesTruncated ? ' · компактные страницы результатов' : ''}` : 'Нет совпадений'}
-					</output>
+			<label>Поиск <input type="search" value={query} onChange={(event) => setQuery(event.target.value)} /></label>
+          <FormControlLabel className="toggle" sx={{ margin: 0 }} control={<Checkbox size="small" sx={{ padding: '2px' }} checked={caseSensitive} onChange={(event) => setCaseSensitive(event.target.checked)} />} label="Учитывать регистр" />
+          <Button type="submit" className="button button--quiet" variant="outlined" disabled={!workerReady || searching}>Найти</Button>
+					{searching ? <Button type="button" className="button button--quiet" variant="outlined" onClick={cancelSearch}>Отменить поиск</Button> : null}
+          <IconButton type="button" size="small" aria-label="Предыдущее совпадение" onClick={() => moveMatch(-1)} disabled={totalMatches === 0 || searching}>↑</IconButton>
+          <IconButton type="button" size="small" aria-label="Следующее совпадение" onClick={() => moveMatch(1)} disabled={totalMatches === 0 || searching}>↓</IconButton>
+						<output aria-live="polite">
+							{searching ? `Поиск ${Math.round(searchProgress * 100)}% · найдено ${totalMatches}` : totalMatches > 0 ? `${matchOffset + matchIndex + 1} из ${totalMatches}${matchesTruncated ? ' · компактные страницы результатов' : ''}` : 'Нет совпадений'}
+						</output>
         </form>
-				<form onSubmit={jumpToMatch}>
-					<label>Совпадение № <input key={`${matchOffset}-${matchIndex}-${totalMatches}`} name="match" type="number" min={1} max={Math.max(1, totalMatches)} defaultValue={totalMatches > 0 ? matchOffset + matchIndex + 1 : 1} disabled={totalMatches === 0 || searching} /></label>
-					<button type="submit" className="button button--quiet" disabled={totalMatches === 0 || searching}>Перейти к совпадению</button>
-				</form>
+					<form onSubmit={jumpToMatch}>
+						<label>Совпадение № <input key={`${matchOffset}-${matchIndex}-${totalMatches}`} name="match" type="number" min={1} max={Math.max(1, totalMatches)} defaultValue={totalMatches > 0 ? matchOffset + matchIndex + 1 : 1} disabled={totalMatches === 0 || searching} /></label>
+						<Button type="submit" className="button button--quiet" variant="outlined" disabled={totalMatches === 0 || searching}>Перейти к совпадению</Button>
+					</form>
       </div>
 			{totalMatches > 0 && matches.length > 0 ? (
 				<ol className="search-result-window" aria-label="Виртуализированные результаты поиска">
 					{Array.from(visibleMatches, (line, index) => {
 						const localIndex = matchWindowStart + index
 						const ordinal = matchOffset + localIndex
-						return <li key={ordinal}><button type="button" aria-current={localIndex === matchIndex ? 'true' : undefined} onClick={() => selectMatch(localIndex)}>Совпадение {ordinal + 1}, строка {line}</button></li>
+							return <li key={ordinal}><button type="button" aria-current={localIndex === matchIndex ? 'true' : undefined} onClick={() => selectMatch(localIndex)}>Совпадение {ordinal + 1}, строка {line}</button></li>
 					})}
 				</ol>
 			) : null}
@@ -674,25 +679,27 @@ export function GCodePreview({ setup, artifact, contentUrl, compact = false, onO
       </div>
 			{wrap ? (
 				<nav className="wrapped-window-nav" aria-label="Навигация по перенесённым строкам">
-					<button
-						type="button"
-						className="button button--quiet"
-						disabled={firstLine <= 1}
-						onClick={() => goToLine(firstLine - VIEWPORT_LINES)}
-					>
-						Предыдущие строки
-					</button>
+						<Button
+							type="button"
+							className="button button--quiet"
+							variant="outlined"
+							disabled={firstLine <= 1}
+							onClick={() => goToLine(firstLine - VIEWPORT_LINES)}
+						>
+							Предыдущие строки
+						</Button>
 					<output aria-live="polite">
 						Строки {Math.max(1, firstLine - OVERSCAN)}–{Math.min(lineCount, firstLine + VIEWPORT_LINES + OVERSCAN)} из {lineCount}
 					</output>
-					<button
-						type="button"
-						className="button button--quiet"
-						disabled={firstLine + VIEWPORT_LINES > lineCount}
-						onClick={() => goToLine(firstLine + VIEWPORT_LINES)}
-					>
-						Следующие строки
-					</button>
+						<Button
+							type="button"
+							className="button button--quiet"
+							variant="outlined"
+							disabled={firstLine + VIEWPORT_LINES > lineCount}
+							onClick={() => goToLine(firstLine + VIEWPORT_LINES)}
+						>
+							Следующие строки
+						</Button>
 				</nav>
 			) : null}
     </section>

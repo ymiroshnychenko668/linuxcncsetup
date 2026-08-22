@@ -1,4 +1,7 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
+import Button from '@mui/material/Button'
+import CircularProgress from '@mui/material/CircularProgress'
+import { ThemeProvider } from '@mui/material/styles'
 import {
 	activateExplicitAuthSession,
 	acceptExplicitAuthSession,
@@ -26,6 +29,7 @@ import {
 	clearGCodeCacheScope,
 } from './gcodeCache'
 import { errorMessage } from './ui'
+import { workbenchTheme } from './theme'
 
 type LoadState =
   | { kind: 'loading' }
@@ -34,11 +38,11 @@ type LoadState =
   | { kind: 'unavailable'; message: string }
 
 function LoadingWorkspace() {
-  return <section className="state-panel auth-loading" aria-busy="true" aria-labelledby="loading-title"><span className="spinner" aria-hidden="true" /><div><h2 id="loading-title">Проверяем защищённую сессию</h2><p role="status">Подключаем каталог программ LinuxCNC…</p></div></section>
+  return <section className="state-panel auth-loading" aria-busy="true" aria-labelledby="loading-title"><CircularProgress aria-hidden="true" size={34} /><div><h2 id="loading-title">Проверяем защищённую сессию</h2><p role="status">Подключаем каталог программ LinuxCNC…</p></div></section>
 }
 
 function BackendUnavailable({ message, onRetry }: { message: string; onRetry: () => void }) {
-  return <section className="state-panel state-panel--error" role="alert" aria-labelledby="offline-title"><span className="state-icon" aria-hidden="true">!</span><div><p className="eyebrow">Связь прервана</p><h2 id="offline-title">Web Setup Manager недоступен</h2><p>{message} Локальное состояние интерфейса не будет сброшено.</p><button className="button button--primary" type="button" onClick={onRetry}>Повторить подключение</button></div></section>
+  return <section className="state-panel state-panel--error" role="alert" aria-labelledby="offline-title"><span className="state-icon" aria-hidden="true">!</span><div><p className="eyebrow">Связь прервана</p><h2 id="offline-title">Web Setup Manager недоступен</h2><p>{message} Локальное состояние интерфейса не будет сброшено.</p><Button className="button button--primary" variant="contained" type="button" onClick={onRetry}>Повторить подключение</Button></div></section>
 }
 
 function AuthShell({ children, stateLabel }: { children: ReactNode; stateLabel: string }) {
@@ -283,17 +287,19 @@ export function App() {
   }
 
   if (state.kind === 'ready') {
-    return <Workbench
-      capabilities={state.capabilities}
-      username={state.session.user?.username}
-      loginRequired={state.session.loginRequired}
-      networkOffline={networkOffline}
-      readiness={readiness}
-      loggingOut={loggingOut}
-      logoutError={logoutError}
-      onLogout={signOut}
-      onRetryReadiness={() => setReadinessAttempt((value) => value + 1)}
-    />
+    return <ThemeProvider theme={workbenchTheme}>
+      <Workbench
+        capabilities={state.capabilities}
+        username={state.session.user?.username}
+        loginRequired={state.session.loginRequired}
+        networkOffline={networkOffline}
+        readiness={readiness}
+        loggingOut={loggingOut}
+        logoutError={logoutError}
+        onLogout={signOut}
+        onRetryReadiness={() => setReadinessAttempt((value) => value + 1)}
+      />
+    </ThemeProvider>
   }
 
   const label = state.kind === 'guest' ? 'Требуется вход'

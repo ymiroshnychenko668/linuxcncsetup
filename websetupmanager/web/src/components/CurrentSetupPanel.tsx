@@ -1,3 +1,5 @@
+import Alert from '@mui/material/Alert'
+import Button from '@mui/material/Button'
 import type { CurrentSetup, Setup } from '../domain'
 import { formatDate, statusLabels } from '../ui'
 
@@ -21,7 +23,7 @@ export function CurrentSetupPanel({ current, setup, loading, error, onOpen, onCl
       <div className="current-setup__copy">
         <p className="eyebrow">Текущий сетап</p>
         <h2 id="current-setup-title">{loading ? 'Загружаем…' : setup?.name ?? (current ? 'Текущий сетап недоступен' : 'Не выбран')}</h2>
-        {error ? <p className="form-error" role="alert">{error} Выбор не изменён.</p> : null}
+        {error ? <Alert className="form-error" severity="error" role="alert" icon={false}>{error} Выбор не изменён.</Alert> : null}
         {current && setup ? (
           <p>
             Revision при выборе: {current.revisionSelected} · выбран {formatDate(current.selectedAt)} · сейчас {statusLabels[setup.status]}.
@@ -32,11 +34,11 @@ export function CurrentSetupPanel({ current, setup, loading, error, onOpen, onCl
         )}
       </div>
       <div className="current-setup__actions">
-        {error ? <button className="button button--quiet" type="button" onClick={onRetry}>Повторить загрузку текущего</button> : null}
-        <button className="button button--quiet" type="button" disabled={!current} onClick={() => current && onOpen(current.setupId)}>
+        {error ? <Button className="button button--quiet" variant="text" type="button" onClick={onRetry}>Повторить загрузку текущего</Button> : null}
+        <Button className="button button--quiet" variant="text" type="button" disabled={!current} onClick={() => current && onOpen(current.setupId)}>
           Открыть текущий
-        </button>
-        {current ? <button className="button button--quiet" type="button" onClick={onClear}>Снять выбор</button> : null}
+        </Button>
+        {current ? <Button className="button button--quiet" variant="text" type="button" onClick={onClear}>Снять выбор</Button> : null}
       </div>
     </section>
   )

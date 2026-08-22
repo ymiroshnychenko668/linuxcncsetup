@@ -1,4 +1,8 @@
 import { useEffect, useRef, useState } from 'react'
+import Alert from '@mui/material/Alert'
+import CircularProgress from '@mui/material/CircularProgress'
+import IconButton from '@mui/material/IconButton'
+import TextField from '@mui/material/TextField'
 import type { PDFDocumentLoadingTask, PDFDocumentProxy } from 'pdfjs-dist/types/src/display/api'
 import type { Artifact } from '../domain'
 import { pdfAccessibleTextFromStream, pdfCanvasGeometry } from '../pdfGeometry'
@@ -103,20 +107,21 @@ export function PDFViewer({ artifact, url, onError }: Props) {
   }, [documentProxy, onError, pageNumber, scale])
 
   if (error) {
-    return <div className="viewer-error" role="alert">PDF повреждён, защищён паролем, изменён или имеет небезопасный размер страницы. Закройте viewer и замените Setup Sheet.</div>
+    return <Alert className="viewer-error" severity="error" role="alert" icon={false}>PDF повреждён, защищён паролем, изменён или имеет небезопасный размер страницы. Закройте viewer и замените Setup Sheet.</Alert>
   }
 
   return (
     <div className="pdf-viewer">
       <div className="viewer-toolbar" role="toolbar" aria-label="Управление PDF">
-        <button type="button" aria-label="Предыдущая страница" onClick={() => setPageNumber((value) => Math.max(1, value - 1))} disabled={!documentProxy || pageNumber <= 1}>←</button>
-        <label>Страница <input type="number" min={1} max={documentProxy?.numPages ?? 1} value={pageNumber} onChange={(event) => setPageNumber(Math.max(1, Math.min(documentProxy?.numPages ?? 1, Number(event.target.value))))} /></label>
+        <IconButton type="button" size="small" aria-label="Предыдущая страница" onClick={() => setPageNumber((value) => Math.max(1, value - 1))} disabled={!documentProxy || pageNumber <= 1}>←</IconButton>
+        <label htmlFor="pdf-page-number">Страница</label>
+        <TextField id="pdf-page-number" type="number" size="small" slotProps={{ htmlInput: { min: 1, max: documentProxy?.numPages ?? 1 } }} value={pageNumber} onChange={(event) => setPageNumber(Math.max(1, Math.min(documentProxy?.numPages ?? 1, Number(event.target.value))))} />
         <span>из {documentProxy?.numPages ?? '…'}</span>
-        <button type="button" aria-label="Следующая страница" onClick={() => setPageNumber((value) => Math.min(documentProxy?.numPages ?? 1, value + 1))} disabled={!documentProxy || pageNumber >= documentProxy.numPages}>→</button>
-        <button type="button" onClick={() => setScale((value) => Math.max(0.5, value - 0.25))} aria-label="Уменьшить масштаб">−</button>
+        <IconButton type="button" size="small" aria-label="Следующая страница" onClick={() => setPageNumber((value) => Math.min(documentProxy?.numPages ?? 1, value + 1))} disabled={!documentProxy || pageNumber >= documentProxy.numPages}>→</IconButton>
+        <IconButton type="button" size="small" onClick={() => setScale((value) => Math.max(0.5, value - 0.25))} aria-label="Уменьшить масштаб">−</IconButton>
         <output aria-label="Масштаб PDF">{Math.round(scale * 100)}%</output>
-        <button type="button" onClick={() => setScale((value) => Math.min(4, value + 0.25))} aria-label="Увеличить масштаб">+</button>
-        {!documentProxy ? <span role="status">Загрузка {Math.round(progress * 100)}%</span> : null}
+        <IconButton type="button" size="small" onClick={() => setScale((value) => Math.min(4, value + 0.25))} aria-label="Увеличить масштаб">+</IconButton>
+        {!documentProxy ? <span role="status"><CircularProgress size="1em" aria-hidden="true" /> Загрузка {Math.round(progress * 100)}%</span> : null}
       </div>
       <div className="pdf-canvas-scroll" role="region" tabIndex={0} aria-label={`PDF ${artifact.displayName}, страница ${pageNumber}`}>
         <canvas ref={canvasRef} aria-hidden="true" />
