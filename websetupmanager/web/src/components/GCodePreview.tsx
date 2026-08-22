@@ -1,7 +1,15 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { Artifact, Setup } from '../domain'
+import {
+  createCachedRangeSource,
+  createUploadedFileRangeSource,
+	isGCodeCachePersistenceQuarantined,
+  readLocalGCodeCacheState,
+  updateLocalGCodeCacheState,
+  type GCodeCacheIdentity,
+} from '../gcodeCache'
 import { tokenizeGCode } from '../gcodeHighlight'
-import { resolveSparseLineAnchor, type SparseLineEntry } from '../workers/gcodeCore'
+import { resolveSparseLineAnchor, type SparseLineEntry, type ToolTableEntry } from '../workers/gcodeCore'
 
 const BLOCK_BYTES = 1 << 20
 const PREVIEW_PREFIX_BYTES = 64 << 10
@@ -12,6 +20,7 @@ const OVERSCAN = 8
 const MAX_RENDERED_LINE = 4096
 const MATCH_PAGE_SIZE = 512
 const MATCH_RESULT_WINDOW = 17
+const MAX_PROGRESS_PERSIST_STEP = 64 << 20
 // Browser engines clamp layout coordinates far below the number of pixels
 // represented by hundreds of millions of G-code lines. Keep the scroll track
 // bounded and map it proportionally across the complete logical line range.
@@ -25,8 +34,8 @@ interface CachedBlock {
 }
 
 type WorkerResponse =
-	| { type: 'progress'; requestId: string; completedBytes: number; totalBytes: number; totalMatches?: number }
-  | { type: 'indexResult'; requestId: string; lineCount: number; entries: SparseLineEntry[] }
+	| { type: 'progress'; requestId: string; completedBytes: number; totalBytes: number; cachedBytes?: number; totalMatches?: number }
+  | { type: 'indexResult'; requestId: string; lineCount: number; entries: SparseLineEntry[]; tools?: ToolTableEntry[]; toolsTruncated?: boolean }
 	| { type: 'searchResult'; requestId: string; totalMatches: number; lineNumbers: Float64Array; matchOffset: number; truncated: boolean }
   | { type: 'error'; requestId: string; code: string }
 
@@ -39,6 +48,21 @@ interface Props {
   onArtifactChanged?: () => void
   initialLine?: number
   onLineChanged?: (line: number) => void
+  onAnalysisChanged?: (analysis: GCodeAnalysisState) => void
+  cacheScope?: string
+  sourceFile?: File
+}
+
+export interface GCodeAnalysisState {
+  artifactId: string
+  version: string
+  progress: number
+  complete: boolean
+  lineCount: number
+  tools: ToolTableEntry[]
+  toolsTruncated: boolean
+  validation: 'pending' | 'online' | 'offline'
+  error?: string
 }
 
 function contentURL(setupId: string, artifactId: string): string {
@@ -52,47 +76,49 @@ function displayLine(value: string): { text: string; truncated: boolean } {
 
 async function fetchRangeBytes(
   url: string,
-  version: string,
-  total: number,
+  identity: GCodeCacheIdentity,
   start: number,
   endInclusive: number,
   signal: AbortSignal,
+  networkFirst = false,
+  onOfflineFallback?: () => void,
 ): Promise<Uint8Array> {
+  const { version, byteSize: total } = identity
   if (!Number.isSafeInteger(total) || total < 1 ||
       !Number.isSafeInteger(start) || !Number.isSafeInteger(endInclusive) ||
       start < 0 || endInclusive < start || endInclusive >= total) {
     throw new Error('RANGE_FAILED')
   }
   signal.throwIfAborted()
-  const response = await fetch(url, {
-    headers: { Range: `bytes=${start}-${endInclusive}`, 'If-Match': `"${version}"` },
-    credentials: 'same-origin', cache: 'no-store', signal,
-  })
-  if (response.status === 412 || response.headers.get('etag') !== `"${version}"`) {
-    throw new Error('ARTIFACT_CHANGED')
-  }
-  if (response.status !== 206 && !(response.status === 200 && start === 0)) {
-    throw new Error('RANGE_FAILED')
-  }
-	const bytes = new Uint8Array(await response.arrayBuffer())
-	signal.throwIfAborted()
-	if (bytes.byteLength !== endInclusive - start + 1) throw new Error('INCOMPLETE_RANGE')
-	return bytes
+	return createCachedRangeSource(identity, url, { networkFirst, onOfflineFallback }).read(start, endInclusive, version, signal)
 }
 
 async function fetchBlock(
   url: string,
-  version: string,
-  total: number,
+  identity: GCodeCacheIdentity,
   entry: SparseLineEntry,
   signal: AbortSignal,
   blockBytes = BLOCK_BYTES,
+  networkFirst = false,
+  onOfflineFallback?: () => void,
+  sourceFile?: File,
 ): Promise<CachedBlock> {
+	const total = identity.byteSize
 	if (entry.byteOffset === total) {
 		return { offset: entry.byteOffset, startLine: entry.line, lines: [''], truncatedLastLine: false }
 	}
   const end = Math.min(total - 1, entry.byteOffset + blockBytes - 1)
-	const bytes = await fetchRangeBytes(url, version, total, entry.byteOffset, end, signal)
+	let bytes: Uint8Array
+	if (sourceFile && sourceFile.size === total) {
+		bytes = await createUploadedFileRangeSource(identity, sourceFile).read(
+			entry.byteOffset,
+			end,
+			identity.version,
+			signal,
+		)
+	} else {
+		bytes = await fetchRangeBytes(url, identity, entry.byteOffset, end, signal, networkFirst, onOfflineFallback)
+	}
 	let decoded: string | undefined
 	const removableSuffix = end < total - 1 ? Math.min(3, bytes.byteLength) : 0
 	for (let trim = 0; trim <= removableSuffix && decoded === undefined; trim += 1) {
@@ -146,7 +172,7 @@ function lineForScrollTop(scrollTop: number, scrollHeight: number, clientHeight:
   return Math.floor((Math.max(0, scrollTop) / maximumScroll) * (lastWindowLine - 1)) + 1
 }
 
-export function GCodePreview({ setup, artifact, contentUrl, compact = false, onOpenSetupSheet, onArtifactChanged, initialLine = 1, onLineChanged }: Props) {
+export function GCodePreview({ setup, artifact, contentUrl, compact = false, onOpenSetupSheet, onArtifactChanged, initialLine = 1, onLineChanged, onAnalysisChanged, cacheScope, sourceFile }: Props) {
   const url = useMemo(
     () => contentUrl ?? contentURL(setup.setupId, artifact.artifactId),
     [artifact.artifactId, contentUrl, setup.setupId],
@@ -157,15 +183,29 @@ export function GCodePreview({ setup, artifact, contentUrl, compact = false, onO
   const viewportRef = useRef<HTMLDivElement>(null)
   const artifactChangedRef = useRef(onArtifactChanged)
   const lineChangedRef = useRef(onLineChanged)
+  const analysisChangedRef = useRef(onAnalysisChanged)
+  const identity = useMemo<GCodeCacheIdentity>(() => ({
+    scope: cacheScope ?? `library:${setup.libraryId}`,
+    artifactId: artifact.artifactId,
+    version: artifact.version,
+    byteSize: artifact.byteSize,
+  }), [artifact.artifactId, artifact.byteSize, artifact.version, cacheScope, setup.libraryId])
+  const restoredCache = useMemo(() => readLocalGCodeCacheState(identity), [identity])
   const [blocks, setBlocks] = useState<CachedBlock[]>([])
   const [entries, setEntries] = useState<SparseLineEntry[]>([{ line: 1, byteOffset: 0 }])
-  const [lineCount, setLineCount] = useState(1)
+  const [lineCount, setLineCount] = useState(restoredCache?.lineCount ?? 1)
   const [firstLine, setFirstLine] = useState(() => Math.max(1, Math.floor(initialLine)))
   const [lineInput, setLineInput] = useState(() => String(Math.max(1, Math.floor(initialLine))))
   const [wrap, setWrap] = useState(false)
   const [indexProgress, setIndexProgress] = useState(0)
+  const [indexComplete, setIndexComplete] = useState(false)
+  const [tools, setTools] = useState<ToolTableEntry[]>(restoredCache?.tools ?? [])
+  const [toolsTruncated, setToolsTruncated] = useState(restoredCache?.toolsTruncated ?? false)
+  const [validation, setValidation] = useState<'pending' | 'online' | 'offline'>(artifact.byteSize === 0 ? 'online' : 'pending')
   const [workerReady, setWorkerReady] = useState(false)
-  const [error, setError] = useState<string>()
+  const [indexError, setIndexError] = useState<string>()
+  const [previewError, setPreviewError] = useState<string>()
+  const [searchError, setSearchError] = useState<string>()
   const [query, setQuery] = useState('')
   const [caseSensitive, setCaseSensitive] = useState(false)
 	const [matches, setMatches] = useState<Float64Array>(() => new Float64Array())
@@ -176,6 +216,7 @@ export function GCodePreview({ setup, artifact, contentUrl, compact = false, onO
 	const [searching, setSearching] = useState(false)
 	const [matchesTruncated, setMatchesTruncated] = useState(false)
   const pendingMatchIndexRef = useRef(0)
+  const persistedIndexBytesRef = useRef(0)
   const requestBase = `${artifact.artifactId}-${artifact.version}`
 
   useEffect(() => {
@@ -185,6 +226,24 @@ export function GCodePreview({ setup, artifact, contentUrl, compact = false, onO
   useEffect(() => {
     lineChangedRef.current = onLineChanged
   }, [onLineChanged])
+
+  useEffect(() => {
+    analysisChangedRef.current = onAnalysisChanged
+  }, [onAnalysisChanged])
+
+  useEffect(() => {
+    analysisChangedRef.current?.({
+      artifactId: artifact.artifactId,
+      version: artifact.version,
+      progress: indexProgress,
+      complete: indexComplete,
+      lineCount,
+      tools,
+      toolsTruncated,
+      validation,
+      error: indexError,
+    })
+  }, [artifact.artifactId, artifact.version, indexComplete, indexError, indexProgress, lineCount, tools, toolsTruncated, validation])
 
   useEffect(() => {
     const restored = Math.max(1, Math.floor(initialLine))
@@ -216,36 +275,95 @@ export function GCodePreview({ setup, artifact, contentUrl, compact = false, onO
     artifactGenerationRef.current = generation
     const pendingOffsets = new Set<number>()
     pendingBlockOffsetsRef.current = pendingOffsets
-    let indexStartTimer: number | undefined
-    let worker: Worker | undefined
+		let indexStartTimer: number | undefined
+		let worker: Worker | undefined
+		let indexResolved = false
     setBlocks([])
     setEntries([{ line: 1, byteOffset: 0 }])
-    setLineCount(1)
+    const restored = readLocalGCodeCacheState(identity)
+    persistedIndexBytesRef.current = 0
+    setLineCount(restored?.lineCount ?? 1)
     setIndexProgress(0)
+    setIndexComplete(false)
+    setTools(restored?.tools ?? [])
+    setToolsTruncated(restored?.toolsTruncated ?? false)
+    setValidation(artifact.byteSize === 0 ? 'online' : 'pending')
     setWorkerReady(false)
-    setError(undefined)
+    setIndexError(undefined)
+    setPreviewError(undefined)
+    setSearchError(undefined)
     setMatches(new Float64Array())
     setTotalMatches(0)
     setSearching(false)
     pendingOffsets.clear()
 
-    const startWorker = () => {
-      if (controller.signal.aborted || generation !== artifactGenerationRef.current || typeof Worker === 'undefined') return
-      worker = new Worker(new URL('../workers/gcodeWorker.ts', import.meta.url), { type: 'module' })
-      workerRef.current = worker
-      setWorkerReady(true)
-      const onMessage = (event: MessageEvent<WorkerResponse>) => {
+		const startWorker = () => {
+			if (controller.signal.aborted || generation !== artifactGenerationRef.current) return
+			if (typeof Worker === 'undefined') {
+				setIndexError('WORKER_UNAVAILABLE')
+				return
+			}
+			try {
+				worker = new Worker(new URL('../workers/gcodeWorker.ts', import.meta.url), { type: 'module' })
+			} catch {
+				setIndexError('WORKER_UNAVAILABLE')
+				return
+			}
+			workerRef.current = worker
+			setWorkerReady(true)
+			let workerStopped = false
+			const stopWorker = () => {
+				if (workerStopped) return
+				workerStopped = true
+				try { worker?.postMessage({ type: 'cancel', requestId: `${requestBase}-index` }) } catch { /* Worker already failed. */ }
+				try { worker?.postMessage({ type: 'cancel', requestId: `${requestBase}-search` }) } catch { /* Worker already failed. */ }
+				worker?.removeEventListener('message', onMessage)
+				worker?.removeEventListener('error', onWorkerFailure)
+				worker?.removeEventListener('messageerror', onWorkerFailure)
+				worker?.terminate()
+			}
+			const onWorkerFailure = (event: Event) => {
+				if (event.cancelable) event.preventDefault()
+				if (controller.signal.aborted || generation !== artifactGenerationRef.current || workerStopped) return
+				setWorkerReady(false)
+				setSearching(false)
+				if (indexResolved) setSearchError('WORKER_ERROR')
+				else setIndexError('WORKER_ERROR')
+				if (workerRef.current === worker) workerRef.current = null
+				stopWorker()
+			}
+			const onMessage = (event: MessageEvent<WorkerResponse>) => {
         if (controller.signal.aborted || generation !== artifactGenerationRef.current) return
         const message = event.data
         if (message.requestId === `${requestBase}-index`) {
-          if (message.type === 'progress') setIndexProgress(message.totalBytes === 0 ? 1 : message.completedBytes / message.totalBytes)
-          if (message.type === 'indexResult') {
+          if (message.type === 'progress') {
+            const progress = message.totalBytes === 0 ? 1 : message.completedBytes / message.totalBytes
+            setIndexProgress(progress)
+            const persistStep = Math.min(MAX_PROGRESS_PERSIST_STEP, Math.max(BLOCK_BYTES, Math.floor(artifact.byteSize / 100)))
+            if (message.completedBytes < message.totalBytes && message.completedBytes - persistedIndexBytesRef.current >= persistStep) {
+              persistedIndexBytesRef.current = message.completedBytes
+              void updateLocalGCodeCacheState(identity, { indexedBytes: message.completedBytes, cachedBytes: message.cachedBytes, analysisComplete: false })
+            }
+          }
+					if (message.type === 'indexResult') {
+						indexResolved = true
+						setIndexError(undefined)
+            setIndexComplete(true)
             setEntries(message.entries)
             setLineCount(message.lineCount)
+            setTools(message.tools ?? [])
+            setToolsTruncated(message.toolsTruncated ?? false)
             setIndexProgress(1)
+            void updateLocalGCodeCacheState(identity, {
+              indexedBytes: artifact.byteSize,
+              analysisComplete: true,
+              lineCount: message.lineCount,
+              tools: message.tools ?? [],
+              toolsTruncated: message.toolsTruncated ?? false,
+            })
           }
           if (message.type === 'error') {
-            setError(message.code)
+            setIndexError(message.code)
             if (message.code === 'ARTIFACT_CHANGED') artifactChangedRef.current?.()
           }
         }
@@ -255,6 +373,7 @@ export function GCodePreview({ setup, artifact, contentUrl, compact = false, onO
 						if (message.totalMatches !== undefined) setTotalMatches(message.totalMatches)
 					}
           if (message.type === 'searchResult') {
+			setSearchError(undefined)
 			setMatches(message.lineNumbers)
             setTotalMatches(message.totalMatches)
 			setMatchOffset(message.matchOffset)
@@ -272,48 +391,56 @@ export function GCodePreview({ setup, artifact, contentUrl, compact = false, onO
 						if (message.type === 'error') {
 							setSearching(false)
 							if (message.code !== 'CANCELLED') {
-								setError(message.code)
+								setSearchError(message.code)
 								if (message.code === 'ARTIFACT_CHANGED') artifactChangedRef.current?.()
 							}
 						}
         }
-      }
-      worker.addEventListener('message', onMessage)
-      worker.postMessage({ type: 'index', requestId: `${requestBase}-index`, url, version: artifact.version, byteSize: artifact.byteSize })
-      workerCleanup = () => {
-        worker?.postMessage({ type: 'cancel', requestId: `${requestBase}-index` })
-        worker?.postMessage({ type: 'cancel', requestId: `${requestBase}-search` })
-        worker?.removeEventListener('message', onMessage)
-        worker?.terminate()
-      }
-    }
+			}
+			worker.addEventListener('error', onWorkerFailure)
+			worker.addEventListener('messageerror', onWorkerFailure)
+			// Keep the message handler last as well as semantically primary. Some
+			// embedded WebViews expose only a minimal EventTarget-compatible Worker.
+			worker.addEventListener('message', onMessage)
+			workerCleanup = stopWorker
+			try {
+					worker.postMessage({ type: 'index', requestId: `${requestBase}-index`, cacheScope: identity.scope, artifactId: artifact.artifactId, url, version: artifact.version, byteSize: artifact.byteSize, file: sourceFile, cacheDisabled: isGCodeCachePersistenceQuarantined(identity.scope) })
+			} catch {
+				onWorkerFailure(new Event('messageerror'))
+			}
+		}
 
-    let workerCleanup = () => undefined
+		let workerCleanup: () => void = () => undefined
     const scheduleIndex = () => {
       if (controller.signal.aborted) return
       indexStartTimer = window.setTimeout(startWorker, 0)
     }
 
     if (artifact.byteSize > 0) {
+      let usedOfflineCache = false
       pendingOffsets.add(0)
       void fetchBlock(
         url,
-        artifact.version,
-        artifact.byteSize,
+        identity,
         { line: 1, byteOffset: 0 },
         controller.signal,
         PREVIEW_PREFIX_BYTES,
+        true,
+        () => { usedOfflineCache = true },
+        sourceFile,
       ).then((block) => {
         pendingOffsets.delete(0)
         if (controller.signal.aborted || generation !== artifactGenerationRef.current) return
         addBlock(block)
+        setIndexError(undefined)
+        setValidation(usedOfflineCache ? 'offline' : 'online')
         setLineCount(Math.max(1, block.startLine + block.lines.length - 1))
         scheduleIndex()
       }, (reason: unknown) => {
         pendingOffsets.delete(0)
         if (controller.signal.aborted || generation !== artifactGenerationRef.current) return
         const code = reason instanceof Error ? reason.message : 'RANGE_FAILED'
-        setError(code)
+        setIndexError(code)
         if (code === 'ARTIFACT_CHANGED') artifactChangedRef.current?.()
       })
     } else {
@@ -327,7 +454,7 @@ export function GCodePreview({ setup, artifact, contentUrl, compact = false, onO
       if (workerRef.current === worker) workerRef.current = null
       pendingOffsets.clear()
     }
-	}, [addBlock, artifact.byteSize, artifact.version, requestBase, url])
+	}, [addBlock, artifact.artifactId, artifact.byteSize, artifact.version, identity, requestBase, sourceFile, url])
 
   useEffect(() => {
 		const available = blocks.some((block) => firstLine >= block.startLine && firstLine < block.startLine + block.lines.length)
@@ -343,24 +470,25 @@ export function GCodePreview({ setup, artifact, contentUrl, compact = false, onO
     if (pendingOffsets.has(entry.byteOffset)) return
     pendingOffsets.add(entry.byteOffset)
     const controller = new AbortController()
-		const source = {
-			read: (start: number, endInclusive: number, version: string, signal: AbortSignal) =>
-				fetchRangeBytes(url, version, artifact.byteSize, start, endInclusive, signal),
-		}
+		const source = sourceFile && sourceFile.size === artifact.byteSize
+			? createUploadedFileRangeSource(identity, sourceFile)
+			: { read: (start: number, endInclusive: number, _version: string, signal: AbortSignal) =>
+				fetchRangeBytes(url, identity, start, endInclusive, signal) }
 		void resolveSparseLineAnchor({
 			source, version: artifact.version, byteSize: artifact.byteSize,
 			signal: controller.signal, blockSize: BLOCK_BYTES, entry, targetLine: firstLine,
-		}).then((resolved) => fetchBlock(url, artifact.version, artifact.byteSize, resolved, controller.signal)).then((block) => {
+		}).then((resolved) => fetchBlock(url, identity, resolved, controller.signal, BLOCK_BYTES, false, undefined, sourceFile)).then((block) => {
       if (controller.signal.aborted || generation !== artifactGenerationRef.current) return
+      setPreviewError(undefined)
       addBlock(block)
     }, (reason: unknown) => {
       if (controller.signal.aborted || generation !== artifactGenerationRef.current) return
       const code = reason instanceof Error ? reason.message : 'RANGE_FAILED'
-      setError(code)
+      setPreviewError(code)
       if (code === 'ARTIFACT_CHANGED') artifactChangedRef.current?.()
     }).finally(() => pendingOffsets.delete(entry.byteOffset))
     return () => controller.abort()
-  }, [addBlock, artifact.byteSize, artifact.version, blocks, entries, firstLine, url])
+  }, [addBlock, artifact.byteSize, artifact.version, blocks, entries, firstLine, identity, sourceFile, url])
 
   const visible = useMemo(() => {
     const start = Math.max(1, firstLine - OVERSCAN)
@@ -388,6 +516,7 @@ export function GCodePreview({ setup, artifact, contentUrl, compact = false, onO
     if (!workerRef.current) return
     workerRef.current?.postMessage({ type: 'cancel', requestId: `${requestBase}-search` })
 		setMatches(new Float64Array())
+    setSearchError(undefined)
     setTotalMatches(0)
 		setMatchOffset(0)
 		setMatchesTruncated(false)
@@ -395,10 +524,11 @@ export function GCodePreview({ setup, artifact, contentUrl, compact = false, onO
     if (query === '') return
 		setSearching(true)
 		pendingMatchIndexRef.current = 0
-    workerRef.current?.postMessage({
-      type: 'search', requestId: `${requestBase}-search`, url,
-      version: artifact.version, byteSize: artifact.byteSize, query, caseSensitive, matchOffset: 0,
-    })
+	    workerRef.current?.postMessage({
+	      type: 'search', requestId: `${requestBase}-search`, cacheScope: identity.scope, artifactId: artifact.artifactId, url,
+	      version: artifact.version, byteSize: artifact.byteSize, file: sourceFile, query, caseSensitive, matchOffset: 0,
+			cacheDisabled: isGCodeCachePersistenceQuarantined(identity.scope),
+	    })
   }
 
 	const cancelSearch = () => {
@@ -410,11 +540,13 @@ export function GCodePreview({ setup, artifact, contentUrl, compact = false, onO
 		workerRef.current?.postMessage({ type: 'cancel', requestId: `${requestBase}-search` })
 		pendingMatchIndexRef.current = selectedIndex
 		setSearchProgress(0)
+		setSearchError(undefined)
 		setSearching(true)
-		workerRef.current?.postMessage({
-			type: 'search', requestId: `${requestBase}-search`, url,
-			version: artifact.version, byteSize: artifact.byteSize, query, caseSensitive, matchOffset: offset,
-		})
+			workerRef.current?.postMessage({
+				type: 'search', requestId: `${requestBase}-search`, cacheScope: identity.scope, artifactId: artifact.artifactId, url,
+				version: artifact.version, byteSize: artifact.byteSize, file: sourceFile, query, caseSensitive, matchOffset: offset,
+				cacheDisabled: isGCodeCachePersistenceQuarantined(identity.scope),
+			})
 	}
 
   const selectMatch = (index: number) => {
@@ -449,6 +581,7 @@ export function GCodePreview({ setup, artifact, contentUrl, compact = false, onO
 	const visibleMatches = matches.slice(matchWindowStart, matchWindowStart + MATCH_RESULT_WINDOW)
 
   const hasSheet = setup.artifacts.some((item) => item.role === 'setup_sheet')
+  const displayedError = indexError ?? previewError ?? searchError
   return (
     <section
       className={`gcode-preview${compact ? ' gcode-preview--compact' : ''}`}
@@ -470,13 +603,13 @@ export function GCodePreview({ setup, artifact, contentUrl, compact = false, onO
         Индекс строк: {Math.round(indexProgress * 100)}%
         <progress max={1} value={indexProgress} aria-label="Прогресс индекса строк" />
       </div> : null}
-      {error ? <div className="preview-error" role="alert">
-        {error === 'ARTIFACT_CHANGED' ? 'Артефакт изменён. Обновите карточку перед продолжением.' : 'Текстовый preview недоступен.'}
-        {error === 'ARTIFACT_CHANGED' && onArtifactChanged ? <button type="button" className="button button--quiet" onClick={() => artifactChangedRef.current?.()}>Обновить карточку</button> : null}
+      {displayedError ? <div className="preview-error" role="alert">
+        {displayedError === 'ARTIFACT_CHANGED' ? 'Артефакт изменён. Обновите карточку перед продолжением.' : searchError && !indexError && !previewError ? 'Поиск не выполнен.' : 'Текстовый preview недоступен.'}
+        {displayedError === 'ARTIFACT_CHANGED' && onArtifactChanged ? <button type="button" className="button button--quiet" onClick={() => artifactChangedRef.current?.()}>Обновить карточку</button> : null}
       </div> : null}
       {artifact.byteSize === 0 ? <div className="preview-empty" role="status">Программа пуста.</div> : null}
       <div className="preview-tools">
-        {compact ? <><span className="preview-index-status" role="status">Индекс {Math.round(indexProgress * 100)}%</span><label className="toggle"><input type="checkbox" checked={wrap} onChange={(event) => setWrap(event.target.checked)} /> Перенос</label></> : null}
+        {compact ? <label className="toggle"><input type="checkbox" checked={wrap} onChange={(event) => setWrap(event.target.checked)} /> Перенос</label> : null}
         <form onSubmit={(event) => { event.preventDefault(); goToLine(Number(lineInput)) }}>
           <label>Строка <input name="line" type="number" min={1} max={lineCount} value={lineInput} onChange={(event) => setLineInput(event.target.value)} /></label>
           <button type="submit" className="button button--quiet">Перейти</button>

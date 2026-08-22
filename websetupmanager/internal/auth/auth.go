@@ -43,6 +43,7 @@ type Authenticator interface {
 type Session struct {
 	Username      string
 	CSRFToken     string
+	Activated     bool
 	CreatedAt     time.Time
 	LastSeen      time.Time
 	ExpiresAt     time.Time
@@ -50,6 +51,41 @@ type Session struct {
 	Remembered    bool
 	idleTimeout   time.Duration
 	persistScope  string
+}
+
+// Activate promotes exactly the session represented by token and its CSRF
+// secret from provisional login state. For remembered sessions the promotion
+// is durable before it becomes visible in memory, so a crash cannot resurrect
+// a login that the browser never finished journaling.
+func (s *Store) Activate(token, suppliedCSRF string) (Session, bool, error) {
+	if token == "" || suppliedCSRF == "" {
+		return Session{}, false, nil
+	}
+	key := sha256.Sum256([]byte(token))
+	now := s.now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return Session{}, false, ErrUnavailable
+	}
+	record, ok := s.sessions[key]
+	if !ok || !now.Before(record.ExpiresAt) || !now.Before(record.IdleExpiresAt) {
+		return Session{}, false, nil
+	}
+	if !EqualCSRF(record.CSRFToken, suppliedCSRF) {
+		return Session{}, false, nil
+	}
+	if record.Activated {
+		return record, true, nil
+	}
+	if record.Remembered && s.db != nil {
+		if err := s.activatePersistentLocked(key); err != nil {
+			return Session{}, false, err
+		}
+	}
+	record.Activated = true
+	s.sessions[key] = record
+	return record, true, nil
 }
 
 // Store keeps ordinary sessions only in memory. When constructed with
@@ -304,7 +340,7 @@ func (s *Store) loadPersistent() (finalErr error) {
 	}()
 
 	rows, err := tx.QueryContext(ctx, `
-		SELECT token_hash, username, csrf_token, created_at, expires_at, scope
+		SELECT token_hash, username, csrf_token, created_at, expires_at, scope, activated
 		  FROM auth_sessions
 		 ORDER BY token_hash`)
 	if err != nil {
@@ -320,11 +356,12 @@ func (s *Store) loadPersistent() (finalErr error) {
 			return errors.New("remembered-session table contains too many records")
 		}
 		var tokenHash, username, csrf, createdRaw, expiresRaw, scope string
-		if err := rows.Scan(&tokenHash, &username, &csrf, &createdRaw, &expiresRaw, &scope); err != nil {
+		var activated int64
+		if err := rows.Scan(&tokenHash, &username, &csrf, &createdRaw, &expiresRaw, &scope, &activated); err != nil {
 			_ = rows.Close()
 			return fmt.Errorf("%w: decode remembered session", ErrUnavailable)
 		}
-		key, record, err := decodePersistentSession(tokenHash, username, csrf, createdRaw, expiresRaw, scope)
+		key, record, err := decodePersistentSession(tokenHash, username, csrf, createdRaw, expiresRaw, scope, activated)
 		if err != nil {
 			_ = rows.Close()
 			return err
@@ -360,7 +397,7 @@ func (s *Store) loadPersistent() (finalErr error) {
 	return nil
 }
 
-func decodePersistentSession(tokenHash, username, csrf, createdRaw, expiresRaw, scope string) ([sha256.Size]byte, Session, error) {
+func decodePersistentSession(tokenHash, username, csrf, createdRaw, expiresRaw, scope string, activated int64) ([sha256.Size]byte, Session, error) {
 	var key [sha256.Size]byte
 	hash, err := hex.DecodeString(tokenHash)
 	if err != nil || len(hash) != sha256.Size || hex.EncodeToString(hash) != tokenHash {
@@ -382,10 +419,14 @@ func decodePersistentSession(tokenHash, username, csrf, createdRaw, expiresRaw, 
 	if !validBoundedString(username, 256) || !validBoundedString(scope, 512) {
 		return key, Session{}, errors.New("remembered-session table contains an invalid session record")
 	}
+	if activated != 0 && activated != 1 {
+		return key, Session{}, errors.New("remembered-session table contains an invalid activation state")
+	}
 	lifetime := expires.Sub(created)
 	return key, Session{
 		Username:      username,
 		CSRFToken:     csrf,
+		Activated:     activated == 1,
 		CreatedAt:     created,
 		LastSeen:      created,
 		ExpiresAt:     expires,
@@ -400,12 +441,26 @@ func (s *Store) insertPersistentLocked(key [sha256.Size]byte, record Session) er
 	ctx, cancel := context.WithTimeout(context.Background(), persistentOperationTimeout)
 	defer cancel()
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO auth_sessions(token_hash, username, csrf_token, created_at, expires_at, scope)
-		VALUES (?, ?, ?, ?, ?, ?)`,
+		INSERT INTO auth_sessions(token_hash, username, csrf_token, created_at, expires_at, scope, activated)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`,
 		hex.EncodeToString(key[:]), record.Username, record.CSRFToken,
-		formatPersistentTime(record.CreatedAt), formatPersistentTime(record.ExpiresAt), record.persistScope)
+		formatPersistentTime(record.CreatedAt), formatPersistentTime(record.ExpiresAt), record.persistScope, record.Activated)
 	if err != nil {
 		return fmt.Errorf("%w: persist remembered session", ErrUnavailable)
+	}
+	return nil
+}
+
+func (s *Store) activatePersistentLocked(key [sha256.Size]byte) error {
+	ctx, cancel := context.WithTimeout(context.Background(), persistentOperationTimeout)
+	defer cancel()
+	result, err := s.db.ExecContext(ctx, `UPDATE auth_sessions SET activated = 1 WHERE token_hash = ?`, hex.EncodeToString(key[:]))
+	if err != nil {
+		return fmt.Errorf("%w: activate remembered session", ErrUnavailable)
+	}
+	updated, err := result.RowsAffected()
+	if err != nil || updated != 1 {
+		return fmt.Errorf("%w: activate remembered session", ErrUnavailable)
 	}
 	return nil
 }

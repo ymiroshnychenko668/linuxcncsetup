@@ -37,7 +37,7 @@ import {
   TrashIcon,
   UploadIcon,
 } from './CatalogIcons'
-import { GCodePreview } from './GCodePreview'
+import { GCodePreview, type GCodeAnalysisState } from './GCodePreview'
 import { SetupSheetViewer } from './SetupSheetViewer'
 
 interface Props {
@@ -48,7 +48,7 @@ interface Props {
   readiness: Readiness
   loggingOut: boolean
   logoutError?: string
-  onLogout: () => void
+  onLogout: () => Promise<boolean>
   onRetryReadiness: () => void
 }
 
@@ -75,6 +75,8 @@ interface ComponentUploadIntent {
   file: File
   key: string
 }
+
+type EditorTab = CatalogComponent | 'toolpath' | 'tool-table'
 
 function legacyArtifact(setup: CatalogSetup, artifact: NonNullable<CatalogSetup['program']>, role: Artifact['role']): Artifact {
   return {
@@ -174,6 +176,10 @@ function displayDestination(catalog: CatalogSnapshot, setup: CatalogSetup): stri
   return `${catalog.destination.rootDisplay}${relative ? `/${relative}` : ''}`
 }
 
+function analysisKey(artifactId: string, version: string): string {
+  return `${artifactId}\u0000${version}`
+}
+
 export function Workbench({
   capabilities,
   username,
@@ -185,6 +191,7 @@ export function Workbench({
   onLogout,
   onRetryReadiness,
 }: Props) {
+  const cacheScope = `${username ? `user:${username}` : 'local'}:${capabilities.libraryId ?? capabilities.libraryAlias}`
   const [catalog, setCatalog] = useState<CatalogSnapshot>()
   const [loading, setLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
@@ -192,12 +199,15 @@ export function Workbench({
   const [query, setQuery] = useState('')
   const [selectedSetupId, setSelectedSetupId] = useState<string>()
   const [activeFolderId, setActiveFolderId] = useState<string>()
-  const [selectedComponent, setSelectedComponent] = useState<CatalogComponent>('program')
+  const [selectedComponent, setSelectedComponent] = useState<EditorTab>('program')
   const [expandedFolderIds, setExpandedFolderIds] = useState<Set<string>>(() => new Set())
   const [dialog, setDialog] = useState<DialogState>()
   const [explorerOpen, setExplorerOpen] = useState(false)
   const [actionError, setActionError] = useState<string>()
   const [lineBySetup, setLineBySetup] = useState<Record<string, number>>({})
+	const [latestAnalysis, setLatestAnalysis] = useState<GCodeAnalysisState>()
+  const [cacheSessionGeneration, setCacheSessionGeneration] = useState(0)
+  const [uploadedProgramSource, setUploadedProgramSource] = useState<{ key: string; file: File }>()
   const [explorerWidth, setExplorerWidth] = useState(320)
   const [destinationNotice, setDestinationNotice] = useState<string>()
   const [uploadStatus, setUploadStatus] = useState<{ label: string; loaded: number; total: number }>()
@@ -213,6 +223,8 @@ export function Workbench({
   const pickerReturnRef = useRef<HTMLElement | null>(null)
   const selectedSetupRef = useRef<string>()
   const programTabRef = useRef<HTMLButtonElement>(null)
+  const toolpathTabRef = useRef<HTMLButtonElement>(null)
+  const toolTableTabRef = useRef<HTMLButtonElement>(null)
   const sheetTabRef = useRef<HTMLButtonElement>(null)
   const resizeCleanupRef = useRef<() => void>()
   const setupUploadIntentRef = useRef<SetupUploadIntent>()
@@ -251,13 +263,24 @@ export function Workbench({
   const selectedFolder = catalog?.folders.find((folder) => folder.folderId === activeFolderId)
   const setupFolder = catalog && folderForSetup(catalog, selectedSetup)
   const effectiveFolderId = selectedSetup?.folderId ?? activeFolderId
+  const visibleEditorTabs: EditorTab[] = selectedSetup?.program
+    ? ['program', 'toolpath', 'tool-table', ...(selectedSetup.setupSheet ? ['setup-sheet' as const] : [])]
+    : selectedSetup?.setupSheet ? ['program', 'setup-sheet'] : ['program']
+
+  const editorTabRef = (tab: EditorTab) => {
+    if (tab === 'program') return programTabRef
+    if (tab === 'toolpath') return toolpathTabRef
+    if (tab === 'tool-table') return toolTableTabRef
+    return sheetTabRef
+  }
 
   useEffect(() => {
     if (!selectedSetup) return
     if (selectedSetupRef.current !== selectedSetup.setupId) {
       selectedSetupRef.current = selectedSetup.setupId
       setSelectedComponent(selectedSetup.program ? 'program' : selectedSetup.setupSheet ? 'setup-sheet' : 'program')
-    } else if (selectedComponent === 'setup-sheet' && !selectedSetup.setupSheet) {
+    } else if ((selectedComponent === 'setup-sheet' && !selectedSetup.setupSheet) ||
+      ((selectedComponent === 'toolpath' || selectedComponent === 'tool-table') && !selectedSetup.program)) {
       setSelectedComponent('program')
     }
   }, [selectedComponent, selectedSetup])
@@ -329,7 +352,7 @@ export function Workbench({
   useEffect(() => () => {
     resizeCleanupRef.current?.()
     uploadControllerRef.current?.abort()
-  }, [])
+	}, [])
 
   const savedSetup = (setup: CatalogSetup) => {
     setCatalog((current) => current ? upsertSetup(current, setup) : current)
@@ -388,16 +411,18 @@ export function Workbench({
     if (returnToEditor) window.setTimeout(() => sheetTabRef.current?.focus(), 0)
   }
 
-  const selectEditorTab = (component: CatalogComponent, moveFocus = false) => {
+  const selectEditorTab = (component: EditorTab, moveFocus = false) => {
     setSelectedComponent(component)
-    if (moveFocus) queueMicrotask(() => (component === 'program' ? programTabRef : sheetTabRef).current?.focus())
+    if (moveFocus) queueMicrotask(() => editorTabRef(component).current?.focus())
   }
 
   const editorTabKeyDown = (event: ReactKeyboardEvent<HTMLButtonElement>) => {
-    if (!selectedSetup?.setupSheet) return
-    let target: CatalogComponent | undefined
-    if (event.key === 'ArrowLeft' || event.key === 'Home') target = 'program'
-    else if (event.key === 'ArrowRight' || event.key === 'End') target = 'setup-sheet'
+    let target: EditorTab | undefined
+    const currentIndex = Math.max(0, visibleEditorTabs.indexOf(selectedComponent))
+    if (event.key === 'Home') target = visibleEditorTabs[0]
+    else if (event.key === 'End') target = visibleEditorTabs[visibleEditorTabs.length - 1]
+    else if (event.key === 'ArrowLeft') target = visibleEditorTabs[Math.max(0, currentIndex - 1)]
+    else if (event.key === 'ArrowRight') target = visibleEditorTabs[Math.min(visibleEditorTabs.length - 1, currentIndex + 1)]
     if (!target) return
     event.preventDefault()
     selectEditorTab(target, true)
@@ -439,6 +464,9 @@ export function Workbench({
         }),
       })
       savedSetup(saved)
+      if (intent.component === 'program' && saved.program && saved.program.byteSize === intent.file.size) {
+        setUploadedProgramSource({ key: analysisKey(saved.program.artifactId, saved.program.version), file: intent.file })
+      }
       setSelectedComponent(intent.component)
       if (catalog) setDestinationNotice(`Сохранено в LinuxCNC: ${displayDestination(catalog, saved)}`)
       if (componentUploadIntentRef.current === intent) componentUploadIntentRef.current = undefined
@@ -494,6 +522,9 @@ export function Workbench({
         })
         intent.setup = current
         savedSetup(current)
+        if (current.program && current.program.byteSize === intent.program.size) {
+          setUploadedProgramSource({ key: analysisKey(current.program.artifactId, current.program.version), file: intent.program })
+        }
       }
       if (intent.sheet && !current.setupSheet) {
         if (!intent.sheetKey) throw new Error('UPLOAD_INTENT_INVALID')
@@ -586,6 +617,11 @@ export function Workbench({
   const programArtifact = selectedSetup?.program ? legacyArtifact(selectedSetup, selectedSetup.program, 'program') : undefined
   const sheetArtifact = selectedSetup?.setupSheet ? legacyArtifact(selectedSetup, selectedSetup.setupSheet, 'setup_sheet') : undefined
   const previewSetup = selectedSetup ? legacySetup(selectedSetup) : undefined
+	const selectedAnalysis = selectedSetup?.program && latestAnalysis &&
+		analysisKey(selectedSetup.program.artifactId, selectedSetup.program.version) ===
+		analysisKey(latestAnalysis.artifactId, latestAnalysis.version)
+		? latestAnalysis
+		: undefined
   const activeRelativePath = (selectedComponent === 'setup-sheet'
     ? selectedSetup?.setupSheetRelativePath
     : selectedSetup?.programRelativePath)
@@ -595,6 +631,19 @@ export function Workbench({
   const destinationText = catalog
     ? `${catalog.destination.rootDisplay}${activeRelativePath ? `/${activeRelativePath}` : ''}`
     : 'LinuxCNC PROGRAM_PREFIX'
+  const logoutAndClearCache = () => {
+    void (async () => {
+      let succeeded = false
+      try {
+        succeeded = await onLogout()
+      } catch {
+        succeeded = false
+      }
+      if (!succeeded) {
+        setCacheSessionGeneration((generation) => generation + 1)
+      }
+    })()
+  }
 
   return (
     <div ref={workbenchRef} className="catalog-workbench" style={{ '--catalog-explorer-width': `${explorerWidth}px` } as CSSProperties}>
@@ -611,7 +660,7 @@ export function Workbench({
           <button className="workbench-button workbench-button--primary" type="button" disabled={!catalog || uploading} onClick={(event) => { pickerReturnRef.current = event.currentTarget; addSetupInputRef.current?.click() }}><PlusIcon />{uploading ? 'Загружаем…' : 'Добавить'}</button>
           <button ref={explorerToggleRef} className="workbench-icon-button workbench-explorer-toggle" type="button" aria-label="Открыть дерево файлов" aria-expanded={explorerOpen} onClick={() => setExplorerOpen(true)}><MenuIcon /></button>
           {loginRequired ? <div className="workbench-user"><span aria-hidden="true">{(username?.[0] ?? 'U').toUpperCase()}</span><strong>{username}</strong></div> : <span className="workbench-local-mode">Локальный режим</span>}
-          {loginRequired ? <button className="workbench-icon-button" type="button" title="Выйти" aria-label="Выйти" disabled={loggingOut} onClick={onLogout}>{loggingOut ? <span className="spinner spinner--small" aria-hidden="true" /> : <LogOutIcon />}</button> : null}
+          {loginRequired ? <button className="workbench-icon-button" type="button" title="Выйти" aria-label="Выйти" disabled={loggingOut} onClick={logoutAndClearCache}>{loggingOut ? <span className="spinner spinner--small" aria-hidden="true" /> : <LogOutIcon />}</button> : null}
         </div>
       </header>
 
@@ -698,7 +747,7 @@ export function Workbench({
               expandedFolderIds={expandedFolderIds}
               activeFolderId={activeFolderId}
               selectedSetupId={selectedSetupId}
-              selectedComponent={selectedComponent}
+              selectedComponent={selectedComponent === 'setup-sheet' ? 'setup-sheet' : 'program'}
               onExpandedChange={(folderId, expanded) => setExpandedFolderIds((current) => {
                 const next = new Set(current)
                 if (expanded) next.add(folderId); else next.delete(folderId)
@@ -756,6 +805,30 @@ export function Workbench({
                 <span className="editor-tab__dot" aria-hidden="true" />
                 {selectedSetup?.program?.displayName ?? selectedSetup?.name ?? 'G-code'}
               </button>
+              {selectedSetup?.program ? <button
+                ref={toolpathTabRef}
+                id="editor-tab-toolpath"
+                className={`editor-tab${selectedComponent === 'toolpath' ? ' editor-tab--active' : ''}`}
+                type="button"
+                role="tab"
+                aria-selected={selectedComponent === 'toolpath'}
+                aria-controls="editor-file-panel"
+                tabIndex={selectedComponent === 'toolpath' ? 0 : -1}
+                onClick={() => selectEditorTab('toolpath')}
+                onKeyDown={editorTabKeyDown}
+              >Toolpath</button> : null}
+              {selectedSetup?.program ? <button
+                ref={toolTableTabRef}
+                id="editor-tab-tool-table"
+                className={`editor-tab${selectedComponent === 'tool-table' ? ' editor-tab--active' : ''}`}
+                type="button"
+                role="tab"
+                aria-selected={selectedComponent === 'tool-table'}
+                aria-controls="editor-file-panel"
+                tabIndex={selectedComponent === 'tool-table' ? 0 : -1}
+                onClick={() => selectEditorTab('tool-table')}
+                onKeyDown={editorTabKeyDown}
+              >Tool Table</button> : null}
               {selectedSetup?.setupSheet ? <button
                 ref={sheetTabRef}
                 id="editor-tab-setup-sheet"
@@ -770,8 +843,14 @@ export function Workbench({
               ><SheetIcon />{selectedSetup.setupSheet.displayName}</button> : null}
             </div>
             <div className="editor-tabs__actions">
+              {selectedSetup?.program ? selectedAnalysis?.error
+                ? <div className="editor-index-progress editor-index-progress--error" role="alert">Индекс: ошибка</div>
+				: <div className="editor-index-progress">
+                  <span>{selectedAnalysis?.progress === 1 && !selectedAnalysis.complete ? 'Финализация…' : `Индекс ${Math.round((selectedAnalysis?.progress ?? 0) * 100)}%`}</span>
+                  <progress max={1} value={selectedAnalysis?.progress ?? 0} aria-label="Прогресс индексации G-code" />
+                </div> : null}
               {selectedSetup ? <>
-                {selectedComponent === 'program' ? <button className="editor-file-action" type="button" disabled={uploading} onClick={(event) => { pickerReturnRef.current = event.currentTarget; programInputRef.current?.click() }}>{selectedSetup.program ? 'Заменить G-code' : 'Добавить G-code'}</button> : null}
+                {selectedComponent !== 'setup-sheet' ? <button className="editor-file-action" type="button" disabled={uploading} onClick={(event) => { pickerReturnRef.current = event.currentTarget; programInputRef.current?.click() }}>{selectedSetup.program ? 'Заменить G-code' : 'Добавить G-code'}</button> : null}
                 {selectedComponent === 'setup-sheet' ? <button className="editor-file-action" type="button" disabled={uploading} onClick={(event) => { pickerReturnRef.current = event.currentTarget; sheetInputRef.current?.click() }}>Заменить Sheet</button> : null}
                 {!selectedSetup.setupSheet ? <button className="editor-file-action editor-file-action--attach" type="button" disabled={uploading || !selectedSetup.program} onClick={(event) => { pickerReturnRef.current = event.currentTarget; sheetInputRef.current?.click() }}><PlusIcon />Setup Sheet</button> : null}
                 {selectedComponent === 'setup-sheet' && selectedSetup.setupSheet ? <button className="workbench-icon-button" type="button" title="Отсоединить Setup Sheet" aria-label="Удалить Setup Sheet" onClick={() => setDialog({ kind: 'delete-component', setup: selectedSetup, component: 'setup-sheet' })}><TrashIcon /></button> : null}
@@ -788,22 +867,40 @@ export function Workbench({
             id="editor-file-panel"
             className="editor-surface"
             role="tabpanel"
-            aria-labelledby={selectedComponent === 'setup-sheet' ? 'editor-tab-setup-sheet' : 'editor-tab-program'}
+            aria-labelledby={`editor-tab-${selectedComponent}`}
           >
             {loading && !catalog ? <div className="workbench-state" aria-busy="true"><span className="spinner" aria-hidden="true" /><p role="status">Открываем каталог программ LinuxCNC…</p></div> : null}
             {!loading && catalog && catalog.setups.length === 0 ? <div className="workbench-state"><UploadIcon width={42} height={42} /><h1>Добавьте первый G-code</h1><p>Можно выбрать G-code отдельно или сразу вместе с одной PDF/HTML Setup Sheet.</p><div><button className="workbench-button" type="button" onClick={(event) => { pickerReturnRef.current = event.currentTarget; addSetupInputRef.current?.click() }}><PlusIcon />Добавить сетап</button><button className="workbench-button" type="button" onClick={() => setDialog({ kind: 'folder' })}><FolderIcon />Создать каталог</button></div></div> : null}
             {!loading && catalog && catalog.setups.length > 0 && !selectedSetup ? <div className="workbench-state"><h1>Выберите G-code слева</h1><p>Setup Sheet, если она прикреплена, находится дочерней строкой под G-code.</p></div> : null}
             {selectedSetup && selectedComponent === 'program' && !programArtifact ? <div className="workbench-state workbench-state--incomplete"><span className="incomplete-icon" aria-hidden="true">{'{}'}</span><h1>Нужен G-code</h1><p>Эта запись не завершена. Добавьте программу; существующая Setup Sheet останется прикреплённой.</p><div><button className="workbench-button" type="button" disabled={uploading} onClick={(event) => { pickerReturnRef.current = event.currentTarget; programInputRef.current?.click() }}><UploadIcon />Добавить G-code</button></div></div> : null}
-            {selectedSetup && selectedComponent === 'program' && programArtifact && previewSetup ? <GCodePreview
-              key={`${programArtifact.artifactId}:${programArtifact.version}`}
+            {selectedSetup && programArtifact && previewSetup ? <div className="editor-program-panel" hidden={selectedComponent !== 'program'}><GCodePreview
+              key={`${programArtifact.artifactId}:${programArtifact.version}:${cacheSessionGeneration}`}
               compact
               setup={previewSetup}
               artifact={programArtifact}
+              cacheScope={cacheScope}
+              sourceFile={uploadedProgramSource?.key === analysisKey(programArtifact.artifactId, programArtifact.version) ? uploadedProgramSource.file : undefined}
               contentUrl={catalogContentURL(selectedSetup.setupId, 'program')}
               initialLine={lineBySetup[selectedSetup.setupId] ?? 1}
               onLineChanged={(line) => setLineBySetup((current) => ({ ...current, [selectedSetup.setupId]: line }))}
               onArtifactChanged={() => void load(undefined, true)}
-            /> : null}
+				onAnalysisChanged={setLatestAnalysis}
+            /></div> : null}
+            {selectedSetup && selectedComponent === 'toolpath' && programArtifact ? <div className="derived-tab-empty" role="status">
+              <div className="toolpath-placeholder" aria-hidden="true"><span /><span /><span /></div>
+              <h1>Toolpath</h1>
+              <p>Вкладка зарезервирована. Визуализация траектории пока не построена.</p>
+            </div> : null}
+            {selectedSetup && selectedComponent === 'tool-table' && programArtifact ? <div className="tool-table-panel">
+              <header><div><h1>Tool Table</h1><p>Инструменты, извлечённые из программы по словам T и M6. Это не системный LinuxCNC TOOL_TABLE.</p></div><span>{selectedAnalysis?.complete ? `${selectedAnalysis.tools.length} инструментов` : `Индекс ${Math.round((selectedAnalysis?.progress ?? 0) * 100)}%`}</span></header>
+              {selectedAnalysis?.validation === 'offline' ? <p className="tool-table-offline" role="status">Открыта сохранённая офлайн-версия; backend пока не подтвердил, что файл не изменился.</p> : null}
+              {selectedAnalysis?.error ? <div className="derived-tab-error" role="alert"><h2>Tool Table не построена</h2><p>{selectedAnalysis.error === 'UNSUPPORTED_ENCODING' ? 'Программа не является корректным UTF-8 текстом.' : selectedAnalysis.error === 'ARTIFACT_CHANGED' ? 'Версия программы изменилась; обновите каталог.' : 'Не удалось прочитать и проиндексировать программу.'}</p><div><button type="button" onClick={() => { setCacheSessionGeneration((generation) => generation + 1); queueMicrotask(() => toolTableTabRef.current?.focus()) }}>Повторить</button><button type="button" onClick={() => selectEditorTab('program', true)}>Открыть G-code</button></div></div> : !selectedAnalysis || selectedAnalysis.validation === 'pending' ? <div className="derived-tab-loading" role="status"><span className="spinner" aria-hidden="true" />Проверяем версию программы…</div> : !selectedAnalysis.complete ? <div className="derived-tab-loading" role="status"><span className="spinner" aria-hidden="true" />{selectedAnalysis.progress >= 1 ? 'Финализируем Tool Table…' : `Строим Tool Table: ${Math.round(selectedAnalysis.progress * 100)}%`}</div> : selectedAnalysis.tools.length === 0 ? <div className="derived-tab-empty" role="status"><h2>Инструменты не найдены</h2><p>{selectedAnalysis.toolsTruncated ? 'В обработанной части программы статические целочисленные слова T не найдены.' : 'В программе нет статических целочисленных слов T. Динамические выражения не подменяются догадками.'}</p></div> : <div className="tool-table-scroll"><table>
+                <caption className="visually-hidden">Инструменты из G-code</caption>
+                <thead><tr><th scope="col">Инструмент</th><th scope="col">Первая строка</th><th scope="col">Упоминания T</th><th scope="col">Смены M6</th></tr></thead>
+                <tbody>{selectedAnalysis.tools.map((tool) => <tr key={tool.toolNumber}><th scope="row">T{tool.toolNumber}</th><td><button type="button" onClick={() => { setLineBySetup((current) => ({ ...current, [selectedSetup.setupId]: tool.firstLine })); selectEditorTab('program', true) }}>Строка {tool.firstLine}</button></td><td>{tool.references}</td><td>{tool.changes}</td></tr>)}</tbody>
+              </table></div>}
+              {selectedAnalysis?.complete && selectedAnalysis.toolsTruncated ? <p className="tool-table-warning" role="status">Результат ограничен первыми 1024 уникальными инструментами или строкой необычно большого размера.</p> : null}
+            </div> : null}
             {selectedSetup && selectedComponent === 'setup-sheet' && sheetArtifact && previewSetup ? <SetupSheetViewer
               inline
               setup={previewSetup}

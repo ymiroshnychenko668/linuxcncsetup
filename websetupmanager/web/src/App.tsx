@@ -1,11 +1,16 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import {
+	activateExplicitAuthSession,
+	acceptExplicitAuthSession,
   ApiError,
   clearApiSession,
   getAuthSession,
   getCapabilities,
   getReadiness,
   logout,
+	logoutSessionIfCurrent,
+	quarantineExplicitAuthSession,
+	reconcileStaleAuthSession,
   setUnauthorizedHandler,
   type AuthSession,
   type Capabilities,
@@ -13,6 +18,13 @@ import {
 } from './api'
 import { LoginView } from './components/LoginView'
 import { Workbench } from './components/Workbench'
+import {
+	allowGCodeCacheScope,
+	blockGCodeCacheScope,
+	captureDurableGCodeCacheAuthGeneration,
+	captureGCodeCacheAuthGeneration,
+	clearGCodeCacheScope,
+} from './gcodeCache'
 import { errorMessage } from './ui'
 
 type LoadState =
@@ -40,6 +52,10 @@ function AuthShell({ children, stateLabel }: { children: ReactNode; stateLabel: 
   </div>
 }
 
+function gcodeCacheScope(session: AuthSession, capabilities: Capabilities): string {
+	return `${session.user?.username ? `user:${session.user.username}` : 'local'}:${capabilities.libraryId ?? capabilities.libraryAlias}`
+}
+
 export function App() {
   const [state, setState] = useState<LoadState>({ kind: 'loading' })
   const [networkOffline, setNetworkOffline] = useState(() => !navigator.onLine)
@@ -49,10 +65,24 @@ export function App() {
   const [loggingOut, setLoggingOut] = useState(false)
   const [logoutError, setLogoutError] = useState<string>()
   const focusWorkspace = useRef(false)
-  const retry = useCallback(() => { setState({ kind: 'loading' }); setAttempt((value) => value + 1) }, [])
+  const cacheScopeRef = useRef<string>()
+	const authAttemptGenerationRef = useRef(0)
+	const authContinuationControllerRef = useRef<AbortController>()
+  const retry = useCallback(() => {
+		authAttemptGenerationRef.current += 1
+		authContinuationControllerRef.current?.abort()
+		setState({ kind: 'loading' })
+		setAttempt((value) => value + 1)
+	}, [])
 
   useEffect(() => {
     setUnauthorizedHandler(() => {
+		authAttemptGenerationRef.current += 1
+		authContinuationControllerRef.current?.abort()
+      const scope = cacheScopeRef.current
+      if (scope) {
+	        void blockGCodeCacheScope(scope).then((token) => clearGCodeCacheScope(scope, token))
+      }
       setLoggingOut(false)
       setLogoutError(undefined)
       setReadiness({ ok: true })
@@ -62,17 +92,49 @@ export function App() {
   }, [])
 
   useEffect(() => {
-    const controller = new AbortController()
+    cacheScopeRef.current = state.kind === 'ready'
+      ? `${state.session.user?.username ? `user:${state.session.user.username}` : 'local'}:${state.capabilities.libraryId ?? state.capabilities.libraryAlias}`
+      : undefined
+  }, [state])
+
+  useEffect(() => {
+		const controller = new AbortController()
+		const generation = authAttemptGenerationRef.current + 1
+		authAttemptGenerationRef.current = generation
+		const current = () => !controller.signal.aborted && authAttemptGenerationRef.current === generation
     const load = async () => {
       try {
+				const cacheAuthGeneration = await captureDurableGCodeCacheAuthGeneration()
+				if (!current()) return
         const session = await getAuthSession(controller.signal)
+				if (!current()) return
         if (!session.authenticated) {
           setState({ kind: 'guest' })
           return
         }
+				if (!await reconcileStaleAuthSession(session, controller.signal)) {
+					if (!current()) return
+					clearApiSession()
+					setState({ kind: 'guest', message: 'Предыдущий вход был отменён выходом. Войдите снова.' })
+					return
+				}
         const capabilities = await getCapabilities(controller.signal)
+				if (!current()) return
+				const scope = gcodeCacheScope(session, capabilities)
+				controller.signal.throwIfAborted()
+				const allowed = await allowGCodeCacheScope(scope, undefined, cacheAuthGeneration)
+				if (!current()) {
+					if (allowed) void blockGCodeCacheScope(scope).then((token) => clearGCodeCacheScope(scope, token))
+					return
+				}
+				if (!allowed) {
+					clearApiSession()
+					setState({ kind: 'guest', message: 'Сессия изменилась во время входа. Войдите снова.' })
+					return
+				}
         setState({ kind: 'ready', capabilities, session })
       } catch (error) {
+				if (!current()) return
         if (error instanceof DOMException && error.name === 'AbortError') return
         if (error instanceof ApiError && error.status === 401) {
           clearApiSession()
@@ -86,13 +148,66 @@ export function App() {
     return () => controller.abort()
   }, [attempt])
 
-  const onAuthenticated = useCallback((session: AuthSession) => {
+  const onAuthenticated = useCallback((session: AuthSession, cacheAuthGeneration = captureGCodeCacheAuthGeneration()) => {
+		authContinuationControllerRef.current?.abort()
+		const controller = new AbortController()
+		authContinuationControllerRef.current = controller
+		const generation = authAttemptGenerationRef.current + 1
+		authAttemptGenerationRef.current = generation
+		const current = () => !controller.signal.aborted && authAttemptGenerationRef.current === generation
+		const revokeStaleLogin = async () => {
+			await logoutSessionIfCurrent(session.csrfToken)
+		}
     focusWorkspace.current = true
     setLogoutError(undefined)
     setState({ kind: 'loading' })
-    void getCapabilities().then(
-      (capabilities) => setState({ kind: 'ready', capabilities, session }),
-      (error: unknown) => {
+		void (async () => {
+			const proof = await quarantineExplicitAuthSession(session)
+			if (!proof) {
+				await revokeStaleLogin()
+				if (current()) setState({ kind: 'guest', message: 'Браузер не смог надёжно защитить новую сессию. Повторите вход.' })
+				return
+			}
+			if (!await activateExplicitAuthSession(session, proof)) {
+				await revokeStaleLogin()
+				if (current()) setState({ kind: 'guest', message: 'Браузер не смог подтвердить защищённую сессию. Повторите вход.' })
+				return
+			}
+			if (!current()) {
+				await revokeStaleLogin()
+				return
+			}
+			const capabilities = await getCapabilities(controller.signal)
+				if (!current()) {
+					await revokeStaleLogin()
+					return
+				}
+				const scope = gcodeCacheScope(session, capabilities)
+				const allowed = await allowGCodeCacheScope(scope, undefined, cacheAuthGeneration)
+				if (!current()) {
+					if (allowed) void blockGCodeCacheScope(scope).then((token) => clearGCodeCacheScope(scope, token))
+					await revokeStaleLogin()
+					return
+				}
+				if (!allowed) {
+					await revokeStaleLogin()
+					setState({ kind: 'guest', message: 'Сессия изменилась во время входа. Войдите снова.' })
+					return
+				}
+				await acceptExplicitAuthSession(session, proof)
+				if (!current()) {
+					void blockGCodeCacheScope(scope).then((token) => clearGCodeCacheScope(scope, token))
+					await revokeStaleLogin()
+					return
+				}
+        setState({ kind: 'ready', capabilities, session })
+		})().catch(async (error: unknown) => {
+				if (!current()) {
+					await revokeStaleLogin()
+					return
+				}
+			await revokeStaleLogin()
+			if (!current()) return
         if (error instanceof DOMException && error.name === 'AbortError') return
         if (error instanceof ApiError && error.status === 401) {
           clearApiSession()
@@ -100,8 +215,7 @@ export function App() {
           return
         }
         setState({ kind: 'unavailable', message: error instanceof ApiError ? error.message : 'Не удалось получить конфигурацию приложения.' })
-      },
-    )
+			})
   }, [])
 
   useEffect(() => {
@@ -130,16 +244,41 @@ export function App() {
     return () => { controller.abort(); window.clearInterval(interval) }
   }, [readinessAttempt, state.kind])
 
-  const signOut = async () => {
-    if (loggingOut) return
+  const signOut = async (): Promise<boolean> => {
+    if (loggingOut) return false
+		authAttemptGenerationRef.current += 1
+		authContinuationControllerRef.current?.abort()
+		const scope = state.kind === 'ready' ? gcodeCacheScope(state.session, state.capabilities) : cacheScopeRef.current
     setLoggingOut(true)
     setLogoutError(undefined)
+		const blockToken = scope ? await blockGCodeCacheScope(scope) : undefined
+		if (scope && !blockToken) {
+			setLogoutError('Браузер не смог надёжно закрыть локальный кэш. Повторите выход или закройте доступ к этому устройству.')
+			setLoggingOut(false)
+			return false
+		}
+		const cacheAuthGeneration = captureGCodeCacheAuthGeneration()
     try {
       await logout()
+			if (scope) await clearGCodeCacheScope(scope, blockToken)
       setReadiness({ ok: true })
       setState({ kind: 'guest', message: 'Вы вышли из Web Setup Manager.' })
+      return true
     } catch (reason) {
-      if (!(reason instanceof ApiError && reason.status === 401)) setLogoutError(errorMessage(reason))
+      if (reason instanceof ApiError && reason.status === 401) {
+				if (scope) await clearGCodeCacheScope(scope, blockToken)
+        setReadiness({ ok: true })
+        setState({ kind: 'guest', message: 'Вы вышли из Web Setup Manager.' })
+        return true
+      }
+			if (scope && !await allowGCodeCacheScope(scope, blockToken, cacheAuthGeneration)) {
+				clearApiSession()
+				setReadiness({ ok: true })
+				setState({ kind: 'guest', message: 'Сессия была завершена в другой операции.' })
+				return true
+			}
+      setLogoutError(errorMessage(reason))
+      return false
     } finally { setLoggingOut(false) }
   }
 
@@ -152,7 +291,7 @@ export function App() {
       readiness={readiness}
       loggingOut={loggingOut}
       logoutError={logoutError}
-      onLogout={() => void signOut()}
+      onLogout={signOut}
       onRetryReadiness={() => setReadinessAttempt((value) => value + 1)}
     />
   }
@@ -162,6 +301,6 @@ export function App() {
   return <AuthShell stateLabel={label}>
     {state.kind === 'loading' ? <LoadingWorkspace /> : null}
     {state.kind === 'unavailable' ? <BackendUnavailable message={state.message} onRetry={retry} /> : null}
-    {state.kind === 'guest' ? <LoginView message={state.message} onAuthenticated={onAuthenticated} /> : null}
+    {state.kind === 'guest' ? <LoginView message={state.message} onAuthenticated={onAuthenticated} captureAuthGeneration={captureDurableGCodeCacheAuthGeneration} /> : null}
   </AuthShell>
 }

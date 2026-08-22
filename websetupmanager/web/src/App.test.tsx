@@ -3,11 +3,17 @@ import userEvent from '@testing-library/user-event'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { ApiError, type CatalogSetup, type CatalogSnapshot } from './api'
 import { App } from './App'
+import { allowGCodeCacheScope, blockGCodeCacheScope, captureGCodeCacheAuthGeneration } from './gcodeCache'
 
 const mocks = vi.hoisted(() => ({
+	activateExplicitAuthSession: vi.fn(),
+	acceptExplicitAuthSession: vi.fn(),
+	quarantineExplicitAuthSession: vi.fn(),
   getAuthSession: vi.fn(),
   login: vi.fn(),
   logout: vi.fn(),
+  logoutSessionIfCurrent: vi.fn(),
+	reconcileStaleAuthSession: vi.fn(),
   setUnauthorizedHandler: vi.fn(),
   clearApiSession: vi.fn(),
   getCapabilities: vi.fn(),
@@ -24,7 +30,12 @@ const mocks = vi.hoisted(() => ({
   newIdempotencyKey: vi.fn(),
 }))
 
-const previewMode = vi.hoisted(() => ({ real: false }))
+const previewMode = vi.hoisted(() => ({
+  real: false,
+  mountCount: 0,
+  completeAnalysis: undefined as (() => void) | undefined,
+  completeTruncatedAnalysis: undefined as (() => void) | undefined,
+}))
 
 vi.mock('./api', async (loadOriginal) => ({
   ...await loadOriginal<typeof import('./api')>(),
@@ -33,13 +44,37 @@ vi.mock('./api', async (loadOriginal) => ({
 }))
 
 vi.mock('./components/GCodePreview', async (loadOriginal) => {
+  const React = await import('react')
   const actual = await loadOriginal<typeof import('./components/GCodePreview')>()
   const ActualGCodePreview = actual.GCodePreview
   return {
     ...actual,
-    GCodePreview: (props: Parameters<typeof ActualGCodePreview>[0]) => previewMode.real
-      ? <ActualGCodePreview {...props} />
-      : <div data-testid="gcode-preview">Preview: {props.artifact.displayName} · {props.contentUrl}</div>,
+    GCodePreview: (props: Parameters<typeof ActualGCodePreview>[0]) => {
+      React.useEffect(() => { previewMode.mountCount += 1 }, [])
+      previewMode.completeAnalysis = () => props.onAnalysisChanged?.({
+        artifactId: props.artifact.artifactId,
+        version: props.artifact.version,
+        progress: 1,
+        complete: true,
+        lineCount: 20,
+        tools: [{ toolNumber: 7, firstLine: 12, references: 2, changes: 1 }],
+        toolsTruncated: false,
+        validation: 'online',
+      })
+      previewMode.completeTruncatedAnalysis = () => props.onAnalysisChanged?.({
+        artifactId: props.artifact.artifactId,
+        version: props.artifact.version,
+        progress: 1,
+        complete: true,
+        lineCount: 20,
+        tools: [],
+        toolsTruncated: true,
+        validation: 'online',
+      })
+      return previewMode.real
+        ? <ActualGCodePreview {...props} />
+        : <div data-testid="gcode-preview">Preview: {props.artifact.displayName} · {props.contentUrl}</div>
+    },
   }
 })
 
@@ -76,13 +111,52 @@ const snapshot: CatalogSnapshot = {
   setups: [catalogSetup],
 }
 
-beforeEach(() => {
+let originalLocks: PropertyDescriptor | undefined
+
+function installSerialWebLocks(): void {
+	let tail = Promise.resolve()
+	Object.defineProperty(navigator, 'locks', {
+		configurable: true,
+		value: {
+			request: vi.fn(async (_name: string, _options: object, operation: () => Promise<unknown>) => {
+				let release!: () => void
+				const previous = tail
+				tail = new Promise<void>((resolve) => { release = resolve })
+				await previous
+				try {
+					return await operation()
+				} finally {
+					release()
+				}
+			}),
+		},
+	})
+}
+
+beforeEach(async () => {
+	originalLocks = Object.getOwnPropertyDescriptor(navigator, 'locks')
+	installSerialWebLocks()
+	await allowGCodeCacheScope('local:LinuxCNC')
+	await allowGCodeCacheScope('user:operator:LinuxCNC')
+	window.localStorage.clear()
   previewMode.real = false
+  previewMode.mountCount = 0
+  previewMode.completeAnalysis = undefined
+  previewMode.completeTruncatedAnalysis = undefined
   Object.values(mocks).forEach((mock) => mock.mockReset())
   mocks.getAuthSession.mockResolvedValue({ authenticated: true, loginRequired: false, user: null, csrfToken: 'local-token' })
   mocks.newIdempotencyKey.mockReturnValue('test-idempotency-key')
   mocks.login.mockResolvedValue({ authenticated: true, loginRequired: true, user: { username: 'operator' }, csrfToken: 'remote-token' })
   mocks.logout.mockResolvedValue(undefined)
+  mocks.logoutSessionIfCurrent.mockResolvedValue(true)
+	mocks.activateExplicitAuthSession.mockResolvedValue(true)
+	mocks.acceptExplicitAuthSession.mockResolvedValue(undefined)
+	mocks.quarantineExplicitAuthSession.mockResolvedValue({
+		schema: 1,
+		fingerprint: `sha256:${'a'.repeat(64)}`,
+		supersededMarkers: [],
+	})
+	mocks.reconcileStaleAuthSession.mockResolvedValue(true)
   mocks.getCapabilities.mockResolvedValue({ libraryAlias: 'LinuxCNC', gcodeExtensions: ['.ngc'], requireSetupSheetForReady: false, features: {} })
   mocks.getReadiness.mockResolvedValue({ ok: true })
   mocks.getCatalog.mockResolvedValue(snapshot)
@@ -104,21 +178,27 @@ beforeEach(() => {
   }))
 })
 
-afterEach(() => vi.unstubAllGlobals())
+afterEach(() => {
+	vi.unstubAllGlobals()
+	if (originalLocks) Object.defineProperty(navigator, 'locks', originalLocks)
+	else Reflect.deleteProperty(navigator, 'locks')
+})
 
 describe('catalog workbench', () => {
   it('completes login, left-tree file navigation, direct upload, preview search, line jump, and logout by keyboard', async () => {
     previewMode.real = true
     const user = userEvent.setup()
     const gcode = new TextEncoder().encode('G0 X0\nG1 X10\nM3 S1000\nM30')
+		let indexedUploadFile: File | undefined
 
     class PreviewWorker {
       private listener?: (event: MessageEvent<unknown>) => void
       addEventListener(_type: string, listener: EventListener) { this.listener = listener as (event: MessageEvent<unknown>) => void }
       removeEventListener() { this.listener = undefined }
       terminate() { this.listener = undefined }
-      postMessage(message: { type: string; requestId: string; query?: string }) {
+			postMessage(message: { type: string; requestId: string; query?: string; file?: File }) {
         if (message.type === 'index') {
+					if (message.file) indexedUploadFile = message.file
           queueMicrotask(() => this.listener?.({ data: {
             type: 'indexResult', requestId: message.requestId, lineCount: 4,
             entries: [{ line: 1, byteOffset: 0 }],
@@ -142,7 +222,10 @@ describe('catalog workbench', () => {
       const end = Number(match[2])
       return Promise.resolve(new Response(gcode.slice(start, end + 1), {
         status: 206,
-        headers: { etag: headers?.['If-Match'] ?? '' },
+        headers: {
+          etag: headers?.['If-Match'] ?? '',
+          'content-range': `bytes ${start}-${end}/${gcode.byteLength}`,
+        },
       }))
     }))
 
@@ -231,6 +314,7 @@ describe('catalog workbench', () => {
     await waitFor(() => expect(uploadButton).toHaveFocus())
     expect(await screen.findByLabelText('G-code keyboard.ngc')).toBeInTheDocument()
     expect(screen.getByText('M30')).toBeInTheDocument()
+		expect(indexedUploadFile).toBe(program)
 
     const search = screen.getByRole('searchbox', { name: 'Поиск' })
     for (let step = 0; step < 40 && document.activeElement !== search; step += 1) await user.tab()
@@ -273,9 +357,141 @@ describe('catalog workbench', () => {
 
     expect(await screen.findByLabelText('Файлы сетапов')).toBeInTheDocument()
     expect(mocks.login).toHaveBeenCalledWith('operator', 'secret', false)
+		expect(mocks.quarantineExplicitAuthSession).toHaveBeenCalledWith(expect.objectContaining({ csrfToken: 'remote-token' }))
+		expect(mocks.activateExplicitAuthSession).toHaveBeenCalledWith(
+			expect.objectContaining({ csrfToken: 'remote-token' }),
+			expect.objectContaining({ schema: 1 }),
+		)
+		expect(mocks.acceptExplicitAuthSession).toHaveBeenCalledWith(
+			expect.objectContaining({ csrfToken: 'remote-token' }),
+			expect.objectContaining({ schema: 1 }),
+		)
+		expect(mocks.quarantineExplicitAuthSession.mock.invocationCallOrder[0]).toBeLessThan(mocks.getCapabilities.mock.invocationCallOrder[0])
+		expect(mocks.activateExplicitAuthSession.mock.invocationCallOrder[0]).toBeLessThan(mocks.getCapabilities.mock.invocationCallOrder[0])
+		expect(mocks.getCapabilities.mock.invocationCallOrder[0]).toBeLessThan(mocks.acceptExplicitAuthSession.mock.invocationCallOrder[0])
     expect(screen.getByText('operator')).toBeInTheDocument()
     await waitFor(() => expect(document.getElementById('catalog-editor')).toHaveFocus())
   })
+
+	it('revokes and refuses an explicit session that cannot seal its provisional browser journal', async () => {
+		mocks.getAuthSession.mockResolvedValueOnce({ authenticated: false, loginRequired: true, user: null })
+		mocks.quarantineExplicitAuthSession.mockResolvedValueOnce(undefined)
+		const user = userEvent.setup()
+		render(<App />)
+		await screen.findByRole('heading', { name: 'Вход в систему' })
+		await user.type(screen.getByRole('textbox', { name: 'Имя пользователя' }), 'operator')
+		await user.type(screen.getByLabelText('Пароль'), 'secret')
+		await user.click(screen.getByRole('button', { name: 'Открыть каталог сетапов' }))
+
+		expect(await screen.findByText(/не смог надёжно защитить новую сессию/i)).toBeInTheDocument()
+		expect(mocks.logoutSessionIfCurrent).toHaveBeenCalledWith('remote-token')
+		expect(mocks.getCapabilities).not.toHaveBeenCalled()
+		expect(screen.queryByLabelText('Файлы сетапов')).not.toBeInTheDocument()
+	})
+
+	it('revokes and refuses an explicit session whose server activation cannot be confirmed', async () => {
+		mocks.getAuthSession.mockResolvedValueOnce({ authenticated: false, loginRequired: true, user: null })
+		mocks.activateExplicitAuthSession.mockResolvedValueOnce(false)
+		const user = userEvent.setup()
+		render(<App />)
+		await screen.findByRole('heading', { name: 'Вход в систему' })
+		await user.type(screen.getByRole('textbox', { name: 'Имя пользователя' }), 'operator')
+		await user.type(screen.getByLabelText('Пароль'), 'secret')
+		await user.click(screen.getByRole('button', { name: 'Открыть каталог сетапов' }))
+
+		expect(await screen.findByText(/не смог подтвердить защищённую сессию/i)).toBeInTheDocument()
+		expect(mocks.logoutSessionIfCurrent).toHaveBeenCalledWith('remote-token')
+		expect(mocks.getCapabilities).not.toHaveBeenCalled()
+	})
+
+	it('revokes a journaled explicit session when its capability continuation fails', async () => {
+		mocks.getAuthSession.mockResolvedValueOnce({ authenticated: false, loginRequired: true, user: null })
+		mocks.getCapabilities.mockRejectedValueOnce(new ApiError({
+			message: 'Configuration temporarily unavailable.', status: 503, code: 'UNAVAILABLE', retryable: true,
+		}))
+		const user = userEvent.setup()
+		render(<App />)
+		await screen.findByRole('heading', { name: 'Вход в систему' })
+		await user.type(screen.getByRole('textbox', { name: 'Имя пользователя' }), 'operator')
+		await user.type(screen.getByLabelText('Пароль'), 'secret')
+		await user.click(screen.getByRole('button', { name: 'Открыть каталог сетапов' }))
+
+		expect(await screen.findByRole('alert')).toHaveTextContent('Configuration temporarily unavailable.')
+		expect(mocks.logoutSessionIfCurrent).toHaveBeenCalledWith('remote-token')
+		expect(mocks.acceptExplicitAuthSession).not.toHaveBeenCalled()
+		expect(screen.queryByLabelText('Файлы сетапов')).not.toBeInTheDocument()
+	})
+
+	 it('does not mount a stale authenticated workspace after a newer logout block', async () => {
+		let release!: () => void
+		let started!: () => void
+		const gate = new Promise<void>((resolve) => { release = resolve })
+		const matchStarted = new Promise<void>((resolve) => { started = resolve })
+		let gated = false
+		const cache = {
+			match: vi.fn(async (request: Request) => {
+				if (!gated && request.url.includes('kind=scope-block')) {
+					gated = true
+					started()
+					await gate
+				}
+				return undefined
+			}),
+			put: vi.fn().mockResolvedValue(undefined),
+			keys: vi.fn().mockResolvedValue([]),
+			delete: vi.fn().mockResolvedValue(true),
+		}
+		vi.stubGlobal('caches', { open: vi.fn().mockResolvedValue(cache) })
+		render(<App />)
+		await matchStarted
+		const newerToken = await blockGCodeCacheScope('local:LinuxCNC')
+		release()
+
+		expect(await screen.findByRole('heading', { name: 'Вход в систему' })).toBeInTheDocument()
+		expect(screen.getByText(/Сессия изменилась во время входа/)).toBeInTheDocument()
+		expect(screen.queryByLabelText('Файлы сетапов')).not.toBeInTheDocument()
+
+		expect(await allowGCodeCacheScope('local:LinuxCNC', newerToken, captureGCodeCacheAuthGeneration())).toBe(true)
+	 })
+
+	it('invalidates a pending authentication continuation when an unauthorized response arrives', async () => {
+		let resolveCapabilities!: (value: Awaited<ReturnType<typeof mocks.getCapabilities>>) => void
+		mocks.getCapabilities.mockReturnValue(new Promise((resolve) => { resolveCapabilities = resolve }))
+		render(<App />)
+		await waitFor(() => expect(mocks.getCapabilities).toHaveBeenCalledTimes(1))
+		const unauthorized = mocks.setUnauthorizedHandler.mock.calls
+			.map((call) => call[0] as (() => void) | undefined)
+			.find((handler) => typeof handler === 'function')!
+		act(() => unauthorized())
+		expect(await screen.findByRole('heading', { name: 'Вход в систему' })).toBeInTheDocument()
+
+		await act(async () => {
+			resolveCapabilities({ libraryAlias: 'LinuxCNC', gcodeExtensions: ['.ngc'], requireSetupSheetForReady: false, features: {} })
+			await Promise.resolve()
+		})
+		expect(screen.getByRole('heading', { name: 'Вход в систему' })).toBeInTheDocument()
+		expect(screen.queryByLabelText('Файлы сетапов')).not.toBeInTheDocument()
+	})
+
+	it('revokes a PAM session whose login continuation lost to a concurrent logout generation', async () => {
+		mocks.getAuthSession.mockResolvedValueOnce({ authenticated: false, loginRequired: true, user: null })
+		let resolveCapabilities!: (value: Awaited<ReturnType<typeof mocks.getCapabilities>>) => void
+		mocks.getCapabilities.mockReturnValue(new Promise((resolve) => { resolveCapabilities = resolve }))
+		const user = userEvent.setup()
+		render(<App />)
+		await screen.findByRole('heading', { name: 'Вход в систему' })
+		await user.type(screen.getByRole('textbox', { name: 'Имя пользователя' }), 'operator')
+		await user.type(screen.getByLabelText('Пароль'), 'secret')
+		await user.click(screen.getByRole('button', { name: 'Открыть каталог сетапов' }))
+		await waitFor(() => expect(mocks.login).toHaveBeenCalledTimes(1))
+		const newerToken = await blockGCodeCacheScope('user:operator:LinuxCNC')
+
+		resolveCapabilities({ libraryAlias: 'LinuxCNC', gcodeExtensions: ['.ngc'], requireSetupSheetForReady: false, features: {} })
+		expect(await screen.findByRole('heading', { name: 'Вход в систему' })).toBeInTheDocument()
+		expect(mocks.logoutSessionIfCurrent).toHaveBeenCalledWith('remote-token')
+		expect(screen.queryByLabelText('Файлы сетапов')).not.toBeInTheDocument()
+		expect(await allowGCodeCacheScope('user:operator:LinuxCNC', newerToken, captureGCodeCacheAuthGeneration())).toBe(true)
+	})
 
   it('renders the file tree on the left, the viewer on the right, and one exact LinuxCNC destination line', async () => {
     render(<App />)
@@ -291,12 +507,27 @@ describe('catalog workbench', () => {
     expect(screen.queryByText(/готовност|проверить сетап|текущий сетап/i)).not.toBeInTheDocument()
   })
 
-  it('switches the inline G-code and Setup Sheet tabs with arrow keys', async () => {
+  it('navigates Program, empty Toolpath, generated Tool Table, and Setup Sheet tabs by keyboard', async () => {
     const user = userEvent.setup()
     render(<App />)
     const programTab = await screen.findByRole('tab', { name: 'bracket.ngc' })
     programTab.focus()
     await user.keyboard('{ArrowRight}')
+    const toolpathTab = screen.getByRole('tab', { name: 'Toolpath' })
+    expect(toolpathTab).toHaveFocus()
+    expect(screen.getByRole('heading', { name: 'Toolpath' })).toBeInTheDocument()
+    await user.keyboard('{ArrowRight}')
+    const toolTableTab = screen.getByRole('tab', { name: 'Tool Table' })
+    expect(toolTableTab).toHaveFocus()
+    expect(screen.getByText('Проверяем версию программы…')).toBeInTheDocument()
+    act(() => previewMode.completeAnalysis?.())
+    expect(await screen.findByRole('rowheader', { name: 'T7' })).toBeInTheDocument()
+		expect(screen.getByRole('progressbar', { name: 'Прогресс индексации G-code' })).toHaveAttribute('value', '1')
+		expect(screen.getByText('Индекс 100%')).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Строка 12' }))
+    expect(programTab).toHaveFocus()
+    expect(programTab).toHaveAttribute('aria-selected', 'true')
+    await user.keyboard('{End}')
     const sheetTab = screen.getByRole('tab', { name: /bracket\.pdf/ })
     expect(sheetTab).toHaveFocus()
     expect(sheetTab).toHaveAttribute('aria-selected', 'true')
@@ -305,6 +536,18 @@ describe('catalog workbench', () => {
     expect(programTab).toHaveFocus()
     expect(programTab).toHaveAttribute('aria-selected', 'true')
     expect(screen.getByTestId('gcode-preview')).toBeInTheDocument()
+  })
+
+  it('does not hide a truncated Tool Table when no static tool was found in the processed prefix', async () => {
+    const user = userEvent.setup()
+    render(<App />)
+    await user.click(await screen.findByRole('tab', { name: 'Tool Table' }))
+    act(() => previewMode.completeTruncatedAnalysis?.())
+
+    expect(await screen.findByRole('heading', { name: 'Инструменты не найдены' })).toBeInTheDocument()
+    expect(screen.getByText(/В обработанной части программы/)).toBeInTheDocument()
+    expect(screen.getByText(/Результат ограничен первыми 1024/)).toBeInTheDocument()
+    expect(screen.queryByText('В программе нет статических целочисленных слов T.')).not.toBeInTheDocument()
   })
 
   it('keeps a legacy sheet-only record recoverable without making it a new-setup workflow', async () => {
@@ -633,6 +876,59 @@ describe('catalog workbench', () => {
     expect(await screen.findByRole('status')).toHaveTextContent('Сессия истекла')
     expect(screen.queryByLabelText('Файлы сетапов')).not.toBeInTheDocument()
     expect(screen.getByRole('textbox', { name: 'Имя пользователя' })).toHaveFocus()
+  })
+
+	it('waits for an expired-session cache cleanup before allowing the same principal again', async () => {
+		mocks.getAuthSession.mockResolvedValue({ authenticated: true, loginRequired: true, user: { username: 'operator' }, csrfToken: 'remote-token' })
+		let releaseCleanup!: () => void
+		let cleanupStarted!: () => void
+		const cleanupGate = new Promise<void>((resolve) => { releaseCleanup = resolve })
+		const started = new Promise<void>((resolve) => { cleanupStarted = resolve })
+		const values = new Map<string, Response>()
+		let gateKeys = false
+		vi.stubGlobal('caches', { open: vi.fn().mockResolvedValue({
+			match: (request: Request) => Promise.resolve(values.get(request.url)?.clone()),
+			put: (request: Request, response: Response) => { values.set(request.url, response.clone()); return Promise.resolve() },
+			delete: (request: Request) => Promise.resolve(values.delete(request.url)),
+			keys: async () => {
+				if (gateKeys) {
+					cleanupStarted()
+					await cleanupGate
+				}
+				return [...values.keys()].map((url) => new Request(url))
+			},
+		}) })
+		const user = userEvent.setup()
+		render(<App />)
+		await screen.findByLabelText('Файлы сетапов')
+		gateKeys = true
+		const handler = mocks.setUnauthorizedHandler.mock.calls
+			.map(([candidate]) => candidate as (() => void) | undefined)
+			.find(Boolean)
+		act(() => handler?.())
+		await started
+		await user.type(screen.getByRole('textbox', { name: 'Имя пользователя' }), 'operator')
+		await user.type(screen.getByLabelText('Пароль'), 'secret')
+		await user.click(screen.getByRole('button', { name: 'Открыть каталог сетапов' }))
+		expect(mocks.login).not.toHaveBeenCalled()
+		expect(screen.queryByLabelText('Файлы сетапов')).not.toBeInTheDocument()
+		expect(screen.getByRole('button', { name: 'Выполняется вход…' })).toBeDisabled()
+		releaseCleanup()
+		await waitFor(() => expect(mocks.login).toHaveBeenCalled())
+		expect(await screen.findByLabelText('Файлы сетапов')).toBeInTheDocument()
+	}, 15_000)
+
+  it('unblocks the cache and remounts the preview after a failed logout', async () => {
+    mocks.getAuthSession.mockResolvedValue({ authenticated: true, loginRequired: true, user: { username: 'operator' }, csrfToken: 'remote-token' })
+    mocks.logout.mockRejectedValue(new TypeError('network down'))
+    const user = userEvent.setup()
+    render(<App />)
+    await screen.findByTestId('gcode-preview')
+    const mountsBefore = previewMode.mountCount
+    await user.click(screen.getByRole('button', { name: 'Выйти' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('Не удалось выйти')
+    expect(screen.getByTestId('gcode-preview')).toBeInTheDocument()
+    await waitFor(() => expect(previewMode.mountCount).toBeGreaterThan(mountsBefore))
   })
 
   it('keeps the editor visible while readiness reports a recoverable catalog error', async () => {

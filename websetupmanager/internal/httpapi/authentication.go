@@ -41,7 +41,7 @@ func requestPrincipalFrom(ctx context.Context) (requestPrincipal, bool) {
 
 func isPublicRemoteRoute(requestPath string) bool {
 	switch requestPath {
-	case "/healthz", "/readyz", "/api/v1/auth/login", "/api/v1/auth/session", "/api/v1/auth/logout":
+	case "/healthz", "/readyz", "/api/v1/auth/login", "/api/v1/auth/session", "/api/v1/auth/activate", "/api/v1/auth/logout", "/api/v1/auth/revoke-stale":
 		return true
 	default:
 		// The embedded SPA and its fingerprinted assets contain no credentials or
@@ -70,6 +70,10 @@ func (s *Server) authenticateRemote(w http.ResponseWriter, r *http.Request, requ
 			_ = s.authSessions.Delete(token)
 			s.clearSessionCookie(w)
 		}
+		s.writeAuthenticationRequired(w, requestID)
+		return requestPrincipal{}, false
+	}
+	if !session.Activated {
 		s.writeAuthenticationRequired(w, requestID)
 		return requestPrincipal{}, false
 	}
@@ -226,7 +230,43 @@ func (s *Server) authenticationSession(w http.ResponseWriter, r *http.Request, r
 		})
 		return
 	}
+	if !session.Activated {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"authenticated": false, "loginRequired": true, "user": nil,
+		})
+		return
+	}
 	writeJSON(w, http.StatusOK, authenticationResponse(session, true))
+}
+
+func (s *Server) activateSession(w http.ResponseWriter, r *http.Request, requestID string) {
+	w.Header().Set("Cache-Control", "no-store")
+	if !allowMethods(w, r, http.MethodPost) {
+		writeError(w, http.StatusMethodNotAllowed, requestID, "METHOD_NOT_ALLOWED", "The method is not allowed.", nil, false)
+		return
+	}
+	if !s.config.RemoteAccess {
+		writeError(w, http.StatusNotFound, requestID, "NOT_FOUND", "The requested resource was not found.", nil, false)
+		return
+	}
+	token, session, ok := s.browserSession(r)
+	if !ok || session.Username != s.config.AllowedUser {
+		s.writeAuthenticationRequired(w, requestID)
+		return
+	}
+	if code, message := s.sessionMutationRejection(r, session); code != "" {
+		writeError(w, http.StatusForbidden, requestID, code, message, nil, false)
+		return
+	}
+	if _, activated, err := s.authSessions.Activate(token, r.Header.Get("X-CSRF-Token")); err != nil {
+		s.logger.Error("activate authentication session", "operation", "auth-activate", "result", "failed", "error_code", "AUTHENTICATION_UNAVAILABLE")
+		writeError(w, http.StatusServiceUnavailable, requestID, "AUTHENTICATION_UNAVAILABLE", "Authentication is temporarily unavailable.", nil, true)
+		return
+	} else if !activated {
+		s.writeAuthenticationRequired(w, requestID)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) logout(w http.ResponseWriter, r *http.Request, requestID string) {
@@ -259,6 +299,42 @@ func (s *Server) logout(w http.ResponseWriter, r *http.Request, requestID string
 		return
 	}
 	s.clearSessionCookie(w)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// revokeStale invalidates exactly the session bound to the request cookie and
+// CSRF token without emitting Set-Cookie. Omitting a cookie mutation is
+// intentional: a delayed stale-login revocation response must not erase a
+// newer login cookie that the browser accepted while this request was in
+// flight.
+func (s *Server) revokeStale(w http.ResponseWriter, r *http.Request, requestID string) {
+	w.Header().Set("Cache-Control", "no-store")
+	if !allowMethods(w, r, http.MethodPost) {
+		writeError(w, http.StatusMethodNotAllowed, requestID, "METHOD_NOT_ALLOWED", "The method is not allowed.", nil, false)
+		return
+	}
+	if !s.config.RemoteAccess {
+		writeError(w, http.StatusNotFound, requestID, "NOT_FOUND", "The requested resource was not found.", nil, false)
+		return
+	}
+	token, session, ok := s.browserSession(r)
+	if !ok || session.Username != s.config.AllowedUser {
+		if token != "" {
+			_ = s.authSessions.Delete(token)
+		}
+		s.writeAuthenticationRequired(w, requestID)
+		return
+	}
+	if !s.authorizeSessionMutation(r, session) {
+		code, message := s.sessionMutationRejection(r, session)
+		writeError(w, http.StatusForbidden, requestID, code, message, nil, false)
+		return
+	}
+	if err := s.authSessions.Delete(token); err != nil {
+		s.logger.Error("delete stale authentication session", "operation", "auth-revoke-stale", "result", "failed", "error_code", "AUTHENTICATION_UNAVAILABLE")
+		writeError(w, http.StatusServiceUnavailable, requestID, "AUTHENTICATION_UNAVAILABLE", "Authentication is temporarily unavailable.", nil, true)
+		return
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 

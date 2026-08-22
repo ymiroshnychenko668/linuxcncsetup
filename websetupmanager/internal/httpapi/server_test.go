@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/ymiroshnychenko668/linuxcncsetup/websetupmanager/internal/auth"
+	appdb "github.com/ymiroshnychenko668/linuxcncsetup/websetupmanager/internal/database"
 )
 
 type checkStub struct{ err error }
@@ -62,6 +63,13 @@ func (f *fakeAuthenticator) calls() ([]string, []string) {
 
 func newRemoteTestServer(t *testing.T, token string, authenticator *fakeAuthenticator, concurrency, attempts int) *Server {
 	t.Helper()
+	sessions := auth.NewStore(30*time.Minute, 12*time.Hour, 32)
+	t.Cleanup(func() { _ = sessions.Close() })
+	return newRemoteTestServerWithStore(t, token, authenticator, concurrency, attempts, sessions)
+}
+
+func newRemoteTestServerWithStore(t *testing.T, token string, authenticator *fakeAuthenticator, concurrency, attempts int, sessions *auth.Store) *Server {
+	t.Helper()
 	files := fstest.MapFS{
 		"index.html":             &fstest.MapFile{Data: []byte("<!doctype html><h1>Setups</h1>")},
 		"assets/app-deadbeef.js": &fstest.MapFile{Data: []byte("console.log('app')")},
@@ -75,8 +83,6 @@ func newRemoteTestServer(t *testing.T, token string, authenticator *fakeAuthenti
 	if attempts == 0 {
 		attempts = 5
 	}
-	sessions := auth.NewStore(30*time.Minute, 12*time.Hour, 32)
-	t.Cleanup(func() { _ = sessions.Close() })
 	server, err := NewAuthenticated(Config{
 		ListenAddress: "0.0.0.0:8443", LibraryID: "id", LibraryAlias: "Setups",
 		RemoteAccess: true, AllowedUser: "operator", AuthRememberTimeout: 30 * 24 * time.Hour,
@@ -93,6 +99,7 @@ func newRemoteTestServer(t *testing.T, token string, authenticator *fakeAuthenti
 
 type authenticationResult struct {
 	cookie        *http.Cookie
+	cookies       []*http.Cookie
 	csrf          string
 	authenticated bool
 	loginRequired bool
@@ -144,7 +151,8 @@ func decodeAuthenticationResult(t *testing.T, response *httptest.ResponseRecorde
 			result.username = payload.User.Username
 		}
 	}
-	for _, cookie := range response.Result().Cookies() {
+	result.cookies = response.Result().Cookies()
+	for _, cookie := range result.cookies {
 		if cookie.Name == remoteSessionCookieName {
 			result.cookie = cookie
 		}
@@ -165,6 +173,56 @@ func remoteRequest(server http.Handler, method, target string, cookie *http.Cook
 	response := httptest.NewRecorder()
 	server.ServeHTTP(response, request)
 	return response
+}
+
+func activateRemoteSession(t *testing.T, server http.Handler, result authenticationResult) authenticationResult {
+	t.Helper()
+	if result.status != http.StatusOK || result.cookie == nil || result.csrf == "" {
+		t.Fatalf("cannot activate invalid login result: %+v", result)
+	}
+	request := httptest.NewRequest(http.MethodPost, "https://machine.example:8443/api/v1/auth/activate", nil)
+	request.Host = "machine.example:8443"
+	request.AddCookie(result.cookie)
+	request.Header.Set("Origin", "https://machine.example:8443")
+	request.Header.Set("X-CSRF-Token", result.csrf)
+	response := httptest.NewRecorder()
+	server.ServeHTTP(response, request)
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("activate remote session = %d %s", response.Code, response.Body.String())
+	}
+	if cookies := response.Result().Cookies(); len(cookies) != 0 {
+		t.Fatalf("session activation emitted Set-Cookie: %+v", cookies)
+	}
+	return result
+}
+
+func activatedRemoteRequest(server http.Handler, method, target string, cookie *http.Cookie, csrf string) *httptest.ResponseRecorder {
+	request := httptest.NewRequest(method, "https://machine.example:8443"+target, nil)
+	request.Host = "machine.example:8443"
+	if cookie != nil {
+		request.AddCookie(cookie)
+	}
+	if isMutation(method) {
+		request.Header.Set("Origin", "https://machine.example:8443")
+		request.Header.Set("X-CSRF-Token", csrf)
+	}
+	response := httptest.NewRecorder()
+	server.ServeHTTP(response, request)
+	return response
+}
+
+func assertRemoteSessionCookieCleared(t *testing.T, response *httptest.ResponseRecorder) {
+	t.Helper()
+	cookies := response.Result().Cookies()
+	if len(cookies) != 1 {
+		t.Fatalf("cleared cookie count = %d, cookies=%+v", len(cookies), cookies)
+	}
+	session := cookies[0]
+	if session == nil || session.Value != "" || session.MaxAge != -1 || !session.Secure || !session.HttpOnly ||
+		session.Name != remoteSessionCookieName || session.Path != "/" || session.Domain != "" ||
+		session.SameSite != http.SameSiteStrictMode || session.Expires.IsZero() {
+		t.Fatalf("cleared session cookie = %+v", session)
+	}
 }
 
 func newTestServer(t *testing.T, databaseErr, storageErr error) (*Server, *bytes.Buffer) {
@@ -220,6 +278,9 @@ func TestCapabilitiesAreDomainOnlyAndSecured(t *testing.T) {
 	}
 	if policy := response.Header().Get("Content-Security-Policy"); !strings.Contains(policy, "frame-src 'self' blob:") {
 		t.Fatalf("application CSP must allow only the intended same-origin/sanitized-blob frames: %q", policy)
+	}
+	if policy := response.Header().Get("Content-Security-Policy"); strings.Contains(policy, "'"+sanitizedHTMLStyleHash+"'") || !strings.Contains(policy, "style-src 'self' 'unsafe-inline'") {
+		t.Fatalf("application CSP must permit the trusted React shell's dynamic geometry styles: %q", policy)
 	}
 	response = request(server, http.MethodPost, "/api/v1/capabilities")
 	if response.Code != http.StatusMethodNotAllowed || response.Header().Get("Allow") != "GET, HEAD" {
@@ -362,20 +423,131 @@ func TestRemoteLoginCreatesSecureOpaqueSessionAndCapabilitiesUseItsCSRF(t *testi
 		result.cookie.Value == result.csrf {
 		t.Fatalf("session cookie/CSRF contract = cookie=%+v csrf=%q", result.cookie, result.csrf)
 	}
+	if len(result.cookies) != 1 {
+		t.Fatalf("login must set only the provisional HttpOnly session cookie: %+v", result.cookies)
+	}
 	users, passwords := authenticator.calls()
 	if len(users) != 1 || users[0] != "operator" || passwords[0] != "correct-password" {
 		t.Fatalf("PAM calls = users %#v passwords %#v", users, passwords)
 	}
 
-	sessionResponse := remoteRequest(server, http.MethodGet, "/api/v1/auth/session", result.cookie, "")
+	result = activateRemoteSession(t, server, result)
+	sessionResponse := activatedRemoteRequest(server, http.MethodGet, "/api/v1/auth/session", result.cookie, result.csrf)
 	session := decodeAuthenticationResult(t, sessionResponse)
 	if !session.authenticated || session.csrf != result.csrf || session.username != "operator" {
 		t.Fatalf("restored session = %+v", session)
 	}
-	capabilities := remoteRequest(server, http.MethodGet, "/api/v1/capabilities", result.cookie, "")
+	capabilities := activatedRemoteRequest(server, http.MethodGet, "/api/v1/capabilities", result.cookie, result.csrf)
 	if capabilities.Code != http.StatusOK || !strings.Contains(capabilities.Body.String(), result.csrf) ||
 		strings.Contains(capabilities.Body.String(), server.csrfToken) {
 		t.Fatalf("session capabilities leaked/replaced CSRF: %d %s", capabilities.Code, capabilities.Body.String())
+	}
+}
+
+func TestProvisionalRemoteSessionRequiresExplicitActivation(t *testing.T) {
+	server := newRemoteTestServer(t, "", nil, 0, 0)
+	login := remoteLogin(t, server, "operator", "secret", false)
+	if login.status != http.StatusOK || login.cookie == nil || login.csrf == "" {
+		t.Fatalf("login = %+v", login)
+	}
+	if _, session, ok := server.browserSession(requestWithCookie(login.cookie)); !ok || session.Activated {
+		t.Fatal("provisional server session was not created")
+	}
+
+	response := remoteRequest(server, http.MethodGet, "/api/v1/auth/session", login.cookie, "")
+	result := decodeAuthenticationResult(t, response)
+	if result.status != http.StatusOK || result.authenticated || !result.loginRequired || result.username != "" || result.csrf != "" {
+		t.Fatalf("provisional session probe = %+v", result)
+	}
+	if cookies := response.Result().Cookies(); len(cookies) != 0 {
+		t.Fatalf("provisional session probe mutated cookies: %+v", cookies)
+	}
+	if _, session, ok := server.browserSession(requestWithCookie(login.cookie)); !ok || session.Activated {
+		t.Fatal("provisional session probe deleted the server session")
+	}
+
+	if unauthorized := remoteRequest(server, http.MethodGet, "/api/v1/capabilities", login.cookie, ""); unauthorized.Code != http.StatusUnauthorized || len(unauthorized.Result().Cookies()) != 0 {
+		t.Fatalf("provisional session reached protected API: %d cookies=%+v body=%s", unauthorized.Code, unauthorized.Result().Cookies(), unauthorized.Body.String())
+	}
+	login = activateRemoteSession(t, server, login)
+	if _, session, ok := server.browserSession(requestWithCookie(login.cookie)); !ok || !session.Activated {
+		t.Fatal("exact activation did not promote the server session")
+	}
+	after := activatedRemoteRequest(server, http.MethodGet, "/api/v1/auth/session", login.cookie, login.csrf)
+	activated := decodeAuthenticationResult(t, after)
+	if !activated.authenticated || activated.username != "operator" || activated.csrf != login.csrf {
+		t.Fatalf("activated session = %+v", activated)
+	}
+}
+
+func TestRemoteSessionActivationRequiresExactOriginAndCSRF(t *testing.T) {
+	server := newRemoteTestServer(t, "", nil, 0, 0)
+	login := remoteLogin(t, server, "operator", "secret", false)
+	for _, test := range []struct {
+		name      string
+		origin    string
+		csrf      string
+		errorCode string
+	}{
+		{name: "missing origin", csrf: login.csrf, errorCode: "ORIGIN_REJECTED"},
+		{name: "HTTP origin", origin: "http://machine.example:8443", csrf: login.csrf, errorCode: "ORIGIN_REJECTED"},
+		{name: "wrong CSRF", origin: "https://machine.example:8443", csrf: "wrong", errorCode: "CSRF_REJECTED"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPost, "https://machine.example:8443/api/v1/auth/activate", nil)
+			request.Host = "machine.example:8443"
+			request.AddCookie(login.cookie)
+			if test.origin != "" {
+				request.Header.Set("Origin", test.origin)
+			}
+			request.Header.Set("X-CSRF-Token", test.csrf)
+			response := httptest.NewRecorder()
+			server.ServeHTTP(response, request)
+			if response.Code != http.StatusForbidden || !strings.Contains(response.Body.String(), test.errorCode) {
+				t.Fatalf("activation rejection = %d %s", response.Code, response.Body.String())
+			}
+			if cookies := response.Result().Cookies(); len(cookies) != 0 {
+				t.Fatalf("rejected activation mutated browser cookies: %+v", cookies)
+			}
+			if _, session, ok := server.browserSession(requestWithCookie(login.cookie)); !ok || session.Activated {
+				t.Fatalf("rejected activation changed the provisional session: %+v, %v", session, ok)
+			}
+		})
+	}
+	_ = activateRemoteSession(t, server, login)
+}
+
+func TestStaleActivationCannotActivateOrDamageNewerSession(t *testing.T) {
+	server := newRemoteTestServer(t, "", nil, 0, 0)
+	stale := remoteLogin(t, server, "operator", "first-password", false)
+	current := remoteLogin(t, server, "operator", "second-password", false)
+	if stale.cookie == nil || current.cookie == nil || stale.cookie.Value == current.cookie.Value || stale.csrf == current.csrf {
+		t.Fatalf("independent login sessions = stale=%+v current=%+v", stale, current)
+	}
+
+	request := httptest.NewRequest(http.MethodPost, "https://machine.example:8443/api/v1/auth/activate", nil)
+	request.Host = "machine.example:8443"
+	request.AddCookie(current.cookie)
+	request.Header.Set("Origin", "https://machine.example:8443")
+	request.Header.Set("X-CSRF-Token", stale.csrf)
+	response := httptest.NewRecorder()
+	server.ServeHTTP(response, request)
+	if response.Code != http.StatusForbidden || !strings.Contains(response.Body.String(), "CSRF_REJECTED") || len(response.Result().Cookies()) != 0 {
+		t.Fatalf("stale activation = %d cookies=%+v body=%s", response.Code, response.Result().Cookies(), response.Body.String())
+	}
+	if _, session, ok := server.browserSession(requestWithCookie(current.cookie)); !ok || session.Activated {
+		t.Fatalf("stale CSRF activated or deleted current session: %+v, %v", session, ok)
+	}
+	if probe := remoteRequest(server, http.MethodGet, "/api/v1/auth/session", current.cookie, ""); decodeAuthenticationResult(t, probe).authenticated {
+		t.Fatal("current provisional session authenticated after stale activation")
+	}
+
+	current = activateRemoteSession(t, server, current)
+	if capabilities := activatedRemoteRequest(server, http.MethodGet, "/api/v1/capabilities", current.cookie, current.csrf); capabilities.Code != http.StatusOK {
+		t.Fatalf("current session was damaged by stale activation: %d %s", capabilities.Code, capabilities.Body.String())
+	}
+	if _, session, ok := server.browserSession(requestWithCookie(stale.cookie)); !ok || session.Activated {
+		t.Fatalf("stale session changed unexpectedly: %+v, %v", session, ok)
 	}
 }
 
@@ -389,20 +561,57 @@ func TestRememberedLoginSetsPersistentStrictCookie(t *testing.T) {
 	if delta := result.cookie.Expires.Sub(before); delta < -2*time.Second || delta > 2*time.Second {
 		t.Fatalf("remembered expiry = %s want near %s", result.cookie.Expires, before)
 	}
+	_ = activateRemoteSession(t, server, result)
+}
+
+func TestRememberedSessionActivationSurvivesStoreAndServerRestart(t *testing.T) {
+	db, err := appdb.Open(context.Background(), t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	const scope = "https://machine.example:8443/library/id"
+	firstStore, err := auth.NewPersistentStore(db.SQL(), 30*time.Minute, 12*time.Hour, 32, "operator", scope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = firstStore.Close() })
+	firstServer := newRemoteTestServerWithStore(t, "", nil, 0, 0, firstStore)
+	login := activateRemoteSession(t, firstServer, remoteLogin(t, firstServer, "operator", "secret", true))
+	if err := firstStore.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	restoredStore, err := auth.NewPersistentStore(db.SQL(), 30*time.Minute, 12*time.Hour, 32, "operator", scope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = restoredStore.Close() })
+	restoredServer := newRemoteTestServerWithStore(t, "", nil, 0, 0, restoredStore)
+	response := activatedRemoteRequest(restoredServer, http.MethodGet, "/api/v1/auth/session", login.cookie, login.csrf)
+	restored := decodeAuthenticationResult(t, response)
+	if !restored.authenticated || restored.username != "operator" || restored.csrf != login.csrf {
+		t.Fatalf("remembered activation after restart = %+v", restored)
+	}
+	if _, session, ok := restoredServer.browserSession(requestWithCookie(login.cookie)); !ok || !session.Activated || !session.Remembered {
+		t.Fatalf("restored server session = %+v, %v", session, ok)
+	}
 }
 
 func TestSuccessfulReloginRotatesExistingBrowserSession(t *testing.T) {
 	server := newRemoteTestServer(t, "", nil, 0, 0)
-	first := remoteLogin(t, server, "operator", "first-password", true)
+	first := activateRemoteSession(t, server, remoteLogin(t, server, "operator", "first-password", true))
 	second := remoteLoginWithCookie(t, server, "operator", "second-password", false, first.cookie)
 	if first.status != http.StatusOK || second.status != http.StatusOK || second.cookie == nil ||
 		second.cookie.Value == first.cookie.Value || second.csrf == first.csrf {
 		t.Fatalf("relogin did not rotate credentials: first=%+v second=%+v", first, second)
 	}
-	if stale := remoteRequest(server, http.MethodGet, "/api/v1/capabilities", first.cookie, ""); stale.Code != http.StatusUnauthorized {
+	second = activateRemoteSession(t, server, second)
+	if stale := activatedRemoteRequest(server, http.MethodGet, "/api/v1/capabilities", first.cookie, first.csrf); stale.Code != http.StatusUnauthorized {
 		t.Fatalf("old browser session survived relogin: %d", stale.Code)
 	}
-	if current := remoteRequest(server, http.MethodGet, "/api/v1/capabilities", second.cookie, ""); current.Code != http.StatusOK {
+	if current := activatedRemoteRequest(server, http.MethodGet, "/api/v1/capabilities", second.cookie, second.csrf); current.Code != http.StatusOK {
 		t.Fatalf("replacement browser session is unusable: %d %s", current.Code, current.Body.String())
 	}
 }
@@ -550,7 +759,7 @@ func TestSessionMutationUsesExactOriginAndPerSessionCSRF(t *testing.T) {
 
 func TestLogoutRequiresSessionOriginAndCSRFThenRevokesCookie(t *testing.T) {
 	server := newRemoteTestServer(t, "", nil, 0, 0)
-	login := remoteLogin(t, server, "operator", "secret", false)
+	login := activateRemoteSession(t, server, remoteLogin(t, server, "operator", "secret", false))
 	for _, test := range []struct {
 		name      string
 		origin    string
@@ -574,34 +783,51 @@ func TestLogoutRequiresSessionOriginAndCSRFThenRevokesCookie(t *testing.T) {
 			if response.Code != http.StatusForbidden || !strings.Contains(response.Body.String(), test.errorCode) {
 				t.Fatalf("logout rejection = %d %s", response.Code, response.Body.String())
 			}
-			if stillValid := remoteRequest(server, http.MethodGet, "/api/v1/capabilities", login.cookie, ""); stillValid.Code != http.StatusOK {
+			if cookies := response.Result().Cookies(); len(cookies) != 0 {
+				t.Fatalf("rejected logout mutated browser cookies: %+v", cookies)
+			}
+			if stillValid := activatedRemoteRequest(server, http.MethodGet, "/api/v1/capabilities", login.cookie, login.csrf); stillValid.Code != http.StatusOK {
 				t.Fatalf("rejected logout revoked session: %d", stillValid.Code)
 			}
 		})
 	}
 
-	response := remoteRequest(server, http.MethodPost, "/api/v1/auth/logout", login.cookie, login.csrf)
+	response := activatedRemoteRequest(server, http.MethodPost, "/api/v1/auth/logout", login.cookie, login.csrf)
 	if response.Code != http.StatusNoContent {
 		t.Fatalf("logout = %d %s", response.Code, response.Body.String())
 	}
-	var cleared *http.Cookie
-	for _, cookie := range response.Result().Cookies() {
-		if cookie.Name == remoteSessionCookieName {
-			cleared = cookie
-		}
-	}
-	if cleared == nil || cleared.MaxAge != -1 || !cleared.Secure || !cleared.HttpOnly || cleared.Path != "/" ||
-		cleared.SameSite != http.SameSiteStrictMode {
-		t.Fatalf("cleared cookie = %+v", cleared)
-	}
-	if after := remoteRequest(server, http.MethodGet, "/api/v1/capabilities", login.cookie, ""); after.Code != http.StatusUnauthorized {
+	assertRemoteSessionCookieCleared(t, response)
+	if after := activatedRemoteRequest(server, http.MethodGet, "/api/v1/capabilities", login.cookie, login.csrf); after.Code != http.StatusUnauthorized {
 		t.Fatalf("logged-out cookie remained valid: %d", after.Code)
+	}
+}
+
+func TestStaleSessionRevocationNeverMutatesBrowserCookie(t *testing.T) {
+	server := newRemoteTestServer(t, "", nil, 0, 0)
+	login := activateRemoteSession(t, server, remoteLogin(t, server, "operator", "secret", false))
+
+	rejectedRequest := httptest.NewRequest(http.MethodPost, "https://machine.example:8443/api/v1/auth/revoke-stale", nil)
+	rejectedRequest.Host = "machine.example:8443"
+	rejectedRequest.AddCookie(login.cookie)
+	rejectedRequest.Header.Set("Origin", "https://machine.example:8443")
+	rejectedRequest.Header.Set("X-CSRF-Token", "wrong")
+	rejected := httptest.NewRecorder()
+	server.ServeHTTP(rejected, rejectedRequest)
+	if rejected.Code != http.StatusForbidden || len(rejected.Result().Cookies()) != 0 {
+		t.Fatalf("rejected stale revoke = %d cookies=%+v body=%s", rejected.Code, rejected.Result().Cookies(), rejected.Body.String())
+	}
+	response := activatedRemoteRequest(server, http.MethodPost, "/api/v1/auth/revoke-stale", login.cookie, login.csrf)
+	if response.Code != http.StatusNoContent || len(response.Result().Cookies()) != 0 {
+		t.Fatalf("stale revoke = %d cookies=%+v body=%s", response.Code, response.Result().Cookies(), response.Body.String())
+	}
+	if after := activatedRemoteRequest(server, http.MethodGet, "/api/v1/capabilities", login.cookie, login.csrf); after.Code != http.StatusUnauthorized {
+		t.Fatalf("stale-revoked session remained valid: %d", after.Code)
 	}
 }
 
 func TestExplicitInvalidAuthorizationDoesNotFallBackToValidCookie(t *testing.T) {
 	server := newRemoteTestServer(t, strings.Repeat("b", 40), nil, 0, 0)
-	login := remoteLogin(t, server, "operator", "secret", false)
+	login := activateRemoteSession(t, server, remoteLogin(t, server, "operator", "secret", false))
 	request := httptest.NewRequest(http.MethodGet, "https://machine.example:8443/api/v1/capabilities", nil)
 	request.AddCookie(login.cookie)
 	request.Header.Set("Authorization", "Bearer wrong")
@@ -630,7 +856,9 @@ func TestAuthenticationEndpointMethodContracts(t *testing.T) {
 	}{
 		{http.MethodGet, "/api/v1/auth/login", http.MethodPost},
 		{http.MethodPost, "/api/v1/auth/session", http.MethodGet},
+		{http.MethodGet, "/api/v1/auth/activate", http.MethodPost},
 		{http.MethodGet, "/api/v1/auth/logout", http.MethodPost},
+		{http.MethodGet, "/api/v1/auth/revoke-stale", http.MethodPost},
 	} {
 		response := remoteRequest(server, test.method, test.target, nil, "")
 		if response.Code != http.StatusMethodNotAllowed || response.Header().Get("Allow") != test.allow {
@@ -641,7 +869,7 @@ func TestAuthenticationEndpointMethodContracts(t *testing.T) {
 
 func TestDuplicateSessionCookiesAreRejectedWithoutAmbiguity(t *testing.T) {
 	server := newRemoteTestServer(t, "", nil, 0, 0)
-	login := remoteLogin(t, server, "operator", "secret", false)
+	login := activateRemoteSession(t, server, remoteLogin(t, server, "operator", "secret", false))
 	request := httptest.NewRequest(http.MethodGet, "https://machine.example:8443/api/v1/capabilities", nil)
 	request.AddCookie(login.cookie)
 	request.AddCookie(&http.Cookie{Name: remoteSessionCookieName, Value: "attacker-controlled"})

@@ -3,7 +3,8 @@ import { ApiError, login, type AuthSession } from '../api'
 
 interface LoginViewProps {
   message?: string
-  onAuthenticated: (session: AuthSession) => void
+  onAuthenticated: (session: AuthSession, cacheAuthGeneration?: string) => void
+	captureAuthGeneration?: () => string | Promise<string>
 }
 
 const isRemotePlainHTTP = (location: Pick<Location, 'protocol' | 'hostname'> = window.location): boolean => {
@@ -15,7 +16,7 @@ const isRemotePlainHTTP = (location: Pick<Location, 'protocol' | 'hostname'> = w
   return location.protocol === 'http:' && !loopback
 }
 
-export function LoginView({ message, onAuthenticated }: LoginViewProps) {
+export function LoginView({ message, onAuthenticated, captureAuthGeneration }: LoginViewProps) {
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
   const [rememberMe, setRememberMe] = useState(false)
@@ -44,7 +45,10 @@ export function LoginView({ message, onAuthenticated }: LoginViewProps) {
         setError(reason instanceof Error ? reason.message : 'Не удалось войти. Повторите попытку.')
       }
     }
-    void Promise.resolve(login(normalizedUsername, password, rememberMe)).then((session) => {
+		void Promise.resolve().then(() => captureAuthGeneration?.()).then(async (cacheAuthGeneration) => ({
+			cacheAuthGeneration,
+			session: await login(normalizedUsername, password, rememberMe),
+		})).then(({ session, cacheAuthGeneration }) => {
       if (!session.authenticated) {
         throw new ApiError({
           message: 'Authentication failed.',
@@ -53,7 +57,8 @@ export function LoginView({ message, onAuthenticated }: LoginViewProps) {
         })
       }
       setPassword('')
-      onAuthenticated(session)
+			if (cacheAuthGeneration === undefined) onAuthenticated(session)
+			else onAuthenticated(session, cacheAuthGeneration)
     }).catch((reason: unknown) => {
       rejectLogin(reason)
     }).finally(() => {

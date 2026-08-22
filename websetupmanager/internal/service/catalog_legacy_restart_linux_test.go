@@ -73,7 +73,8 @@ func TestLegacyCatalogMigrationResumesPopulatedVersionThreeLinkedSetup(t *testin
 	}
 	if _, err := raw.Exec(`DROP INDEX catalog_setups_legacy_source;
 		ALTER TABLE catalog_setups DROP COLUMN legacy_source_key;
-		DELETE FROM schema_migrations WHERE version = 4;`); err != nil {
+		ALTER TABLE auth_sessions DROP COLUMN activated;
+		DELETE FROM schema_migrations WHERE version >= 4;`); err != nil {
 		_ = raw.Close()
 		t.Fatal(err)
 	}

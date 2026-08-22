@@ -14,6 +14,7 @@ const setup: Setup = {
   setupId: sheet.setupId, libraryId: 'd'.repeat(32), name: 'Комплект', status: 'draft',
   revision: 1, source: 'created', artifacts: [sheet], createdAt: '', updatedAt: '',
 }
+const completionSuffix = '</body></html><!--websetupmanager:sanitized-html-complete:v1-->'
 
 describe('SetupSheetViewer', () => {
   afterEach(() => vi.unstubAllGlobals())
@@ -24,7 +25,7 @@ describe('SetupSheetViewer', () => {
     const revokeObjectURL = vi.fn()
     vi.stubGlobal('URL', { createObjectURL, revokeObjectURL })
     const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(new Response(
-      '<!doctype html><meta http-equiv="Content-Security-Policy" content="default-src none"><p>Safe</p>', {
+      `<!doctype html><meta http-equiv="Content-Security-Policy" content="default-src none"><body><p>Safe</p>${completionSuffix}`, {
       status: 200, headers: { 'content-type': 'text/html; charset=utf-8', etag: `"${sheet.version}"` },
       },
     ))
@@ -66,9 +67,24 @@ describe('SetupSheetViewer', () => {
     expect(replace).toHaveBeenCalledOnce()
   })
 
+  it('rejects a successful HTTP response whose sanitized stream is incomplete', async () => {
+    const createObjectURL = vi.fn(() => 'blob:https://microb.int/incomplete-sheet')
+    vi.stubGlobal('URL', { createObjectURL, revokeObjectURL: vi.fn() })
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockResolvedValue(new Response(
+	  `<!doctype html><body><p>Early marker</p>${completionSuffix}<p>Trailing truncation</p>`,
+      { status: 200, headers: { 'content-type': 'text/html; charset=utf-8', etag: `"${sheet.version}"` } },
+    )))
+
+    render(<SetupSheetViewer setup={setup} artifact={sheet} onClose={vi.fn()} onReplace={vi.fn()} />)
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('повреждён или изменён')
+    expect(screen.queryByTitle('Setup Sheet instructions.html')).not.toBeInTheDocument()
+    expect(createObjectURL).not.toHaveBeenCalled()
+  })
+
   it('renders the safe document as an inline editor pane without a modal', async () => {
     vi.stubGlobal('URL', { createObjectURL: vi.fn(() => 'blob:https://microb.int/inline-sheet'), revokeObjectURL: vi.fn() })
-    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockResolvedValue(new Response('<p>Safe</p>', {
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockResolvedValue(new Response(`<body><p>Safe</p>${completionSuffix}`, {
       status: 200,
       headers: { 'content-type': 'text/html; charset=utf-8', etag: `"${sheet.version}"` },
     })))

@@ -1015,8 +1015,13 @@ func TestHTTPHTMLSetupSheetStreamsBeyondFormerViewerLimit(t *testing.T) {
 	if viewer.Header().Get("Content-Length") != "" {
 		t.Fatalf("streamed HTML unexpectedly buffered with Content-Length %q", viewer.Header().Get("Content-Length"))
 	}
-	if !strings.Contains(viewer.Body.String()[:1024], "Safe setup instruction") {
+	body := viewer.Body.String()
+	bodyStart := strings.Index(body, "<body>")
+	if bodyStart < 0 || !strings.Contains(body[bodyStart:min(len(body), bodyStart+1024)], "Safe setup instruction") {
 		t.Fatal("streamed HTML viewer omitted safe content")
+	}
+	if !strings.HasSuffix(body, sanitizedHTMLCompletionSuffix) {
+		t.Fatal("streamed HTML viewer omitted completion marker")
 	}
 }
 

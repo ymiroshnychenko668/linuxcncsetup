@@ -44,6 +44,28 @@ func TestStoreCreatesOpaqueTokensAndExpiresIdleSession(t *testing.T) {
 	}
 }
 
+func TestStoreActivatesOnlyTheExactProvisionalSession(t *testing.T) {
+	store := NewStore(time.Minute, time.Hour, 2)
+	store.random = bytes.NewReader(bytes.Repeat([]byte{0x45}, 128))
+	token, session, err := store.Create("operator")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if session.Activated {
+		t.Fatal("new session was not provisional")
+	}
+	if _, activated, err := store.Activate(token, "wrong"); err != nil || activated {
+		t.Fatalf("wrong-CSRF activation = %v, %v", activated, err)
+	}
+	activatedSession, activated, err := store.Activate(token, session.CSRFToken)
+	if err != nil || !activated || !activatedSession.Activated {
+		t.Fatalf("exact activation = %+v, %v, %v", activatedSession, activated, err)
+	}
+	if repeated, ok, err := store.Activate(token, session.CSRFToken); err != nil || !ok || !repeated.Activated {
+		t.Fatalf("idempotent activation = %+v, %v, %v", repeated, ok, err)
+	}
+}
+
 func TestStoreAbsoluteExpiryCapacityDeleteAndClose(t *testing.T) {
 	now := time.Unix(2000, 0)
 	store := NewStore(3*time.Hour, 2*time.Hour, 1)
@@ -129,7 +151,8 @@ func TestRememberedSessionPersistsOnlyHashAcrossRestartAndLogout(t *testing.T) {
 	}
 
 	var tokenHash, username, csrf string
-	if err := db.SQL().QueryRow(`SELECT token_hash, username, csrf_token FROM auth_sessions`).Scan(&tokenHash, &username, &csrf); err != nil {
+	var activated int
+	if err := db.SQL().QueryRow(`SELECT token_hash, username, csrf_token, activated FROM auth_sessions`).Scan(&tokenHash, &username, &csrf, &activated); err != nil {
 		t.Fatal(err)
 	}
 	wantHash := sha256.Sum256([]byte(token))
@@ -141,6 +164,12 @@ func TestRememberedSessionPersistsOnlyHashAcrossRestartAndLogout(t *testing.T) {
 			t.Fatal("persistent authentication state contains a raw browser token")
 		}
 	}
+	if activated != 0 {
+		t.Fatalf("new remembered session activation = %d, want provisional", activated)
+	}
+	if activatedSession, ok, err := store.Activate(token, created.CSRFToken); err != nil || !ok || !activatedSession.Activated {
+		t.Fatalf("remembered activation = %+v, %v, %v", activatedSession, ok, err)
+	}
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -150,7 +179,7 @@ func TestRememberedSessionPersistsOnlyHashAcrossRestartAndLogout(t *testing.T) {
 		t.Fatal(err)
 	}
 	restoredSession, ok := restored.Get(token)
-	if !ok || restoredSession.CSRFToken != created.CSRFToken || !restoredSession.Remembered {
+	if !ok || restoredSession.CSRFToken != created.CSRFToken || !restoredSession.Remembered || !restoredSession.Activated {
 		t.Fatalf("restored remembered session = %+v, %v", restoredSession, ok)
 	}
 	if _, ok := restored.Get(ordinaryToken); ok {

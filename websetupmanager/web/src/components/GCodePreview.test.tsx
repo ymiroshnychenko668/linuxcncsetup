@@ -1,4 +1,4 @@
-import { act, render, screen, waitFor } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { GCodePreview } from './GCodePreview'
@@ -13,6 +13,10 @@ const artifact: Artifact = {
 const setup: Setup = {
   setupId: artifact.setupId, libraryId: 'd'.repeat(32), name: 'Корпус', status: 'draft',
   revision: 2, source: 'created', artifacts: [artifact], createdAt: '', updatedAt: '',
+}
+
+function rangeHeaders(version: string, start: number, end: number, total: number): Record<string, string> {
+  return { etag: `"${version}"`, 'content-range': `bytes ${start}-${end}/${total}` }
 }
 
 afterEach(() => vi.unstubAllGlobals())
@@ -59,7 +63,7 @@ describe('GCodePreview', () => {
 		}
 		vi.stubGlobal('Worker', IndexWorker)
 		vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(new Uint8Array([0x0a]), {
-			status: 206, headers: { etag: `"${artifact.version}"` },
+			status: 206, headers: rangeHeaders(artifact.version, 0, 0, 1),
 		})))
 		const user = userEvent.setup()
 		render(<GCodePreview setup={setup} artifact={{ ...artifact, byteSize: 1 }} />)
@@ -85,7 +89,7 @@ describe('GCodePreview', () => {
 		}
 		vi.stubGlobal('Worker', StableWorker)
 		vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(new Uint8Array([0x0a]), {
-			status: 206, headers: { etag: `"${artifact.version}"` },
+			status: 206, headers: rangeHeaders(artifact.version, 0, 0, 1),
 		})))
 		const view = render(<GCodePreview setup={setup} artifact={{ ...artifact, byteSize: 1 }} onArtifactChanged={() => undefined} />)
 			await waitFor(() => expect(workerCount).toBe(1))
@@ -120,7 +124,7 @@ describe('GCodePreview', () => {
 
 			const prefix = new Uint8Array(65_536).fill(0x20)
 			prefix.set(new TextEncoder().encode('G90\nG0 X0\n'))
-			resolvePrefix(new Response(prefix, { status: 206, headers: { etag: `"${artifact.version}"` } }))
+			resolvePrefix(new Response(prefix, { status: 206, headers: rangeHeaders(artifact.version, 0, 65_535, 70_000) }))
 
 			expect(await screen.findByText('G90')).toBeInTheDocument()
 			await waitFor(() => expect(workers).toBe(1))
@@ -143,7 +147,7 @@ describe('GCodePreview', () => {
 			view.rerender(<GCodePreview compact setup={setup} artifact={newer} />)
 			await act(async () => {
 				resolveNew(new Response(new TextEncoder().encode('NEW\n'), {
-					status: 206, headers: { etag: `"${newer.version}"` },
+					status: 206, headers: rangeHeaders(newer.version, 0, 3, 4),
 				}))
 				await Promise.resolve()
 			})
@@ -151,7 +155,7 @@ describe('GCodePreview', () => {
 
 			await act(async () => {
 				resolveOld(new Response(new TextEncoder().encode('OLD\n'), {
-					status: 206, headers: { etag: `"${artifact.version}"` },
+					status: 206, headers: rangeHeaders(artifact.version, 0, 3, 4),
 				}))
 				await Promise.resolve()
 			})
@@ -186,8 +190,10 @@ describe('GCodePreview', () => {
 				ranges.push(range)
 				const match = /^bytes=(\d+)-(\d+)$/.exec(range)
 				if (!match) throw new Error(`unexpected range ${range}`)
-				return Promise.resolve(new Response(bytes.slice(Number(match[1]), Number(match[2]) + 1), {
-					status: 206, headers: { etag: `"${artifact.version}"` },
+				const start = Number(match[1])
+				const end = Number(match[2])
+				return Promise.resolve(new Response(bytes.slice(start, end + 1), {
+					status: 206, headers: rangeHeaders(artifact.version, start, end, bytes.byteLength),
 				}))
 			}))
 
@@ -235,7 +241,7 @@ describe('GCodePreview', () => {
 			requestedStarts.push(start)
 			requestedVersions.push(headers?.['If-Match'] ?? '')
 			return Promise.resolve(new Response(bytes.slice(start, end + 1), {
-				status: 206, headers: { etag: `"${artifact.version}"` },
+				status: 206, headers: rangeHeaders(artifact.version, start, end, bytes.byteLength),
 			}))
 		}))
 		render(<GCodePreview setup={setup} artifact={{ ...artifact, byteSize: bytes.byteLength }} initialLine={2} />)
@@ -262,7 +268,7 @@ describe('GCodePreview', () => {
 		}
 		vi.stubGlobal('Worker', HugeIndexWorker)
 		vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(new Uint8Array([0x0a]), {
-			status: 206, headers: { etag: `"${artifact.version}"` },
+			status: 206, headers: rangeHeaders(artifact.version, 0, 0, 1),
 		})))
 		const user = userEvent.setup()
 		const { container } = render(<GCodePreview setup={setup} artifact={{ ...artifact, byteSize: 1 }} />)
@@ -304,7 +310,7 @@ describe('GCodePreview', () => {
 		}
 		vi.stubGlobal('Worker', SearchWorker)
 		vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(new Uint8Array([0x0a]), {
-			status: 206, headers: { etag: `"${artifact.version}"` },
+			status: 206, headers: rangeHeaders(artifact.version, 0, 0, 1),
 		})))
 		const user = userEvent.setup()
 		render(<GCodePreview setup={setup} artifact={{ ...artifact, byteSize: 1 }} />)
@@ -318,5 +324,128 @@ describe('GCodePreview', () => {
 		expect(await screen.findByText(/1001 из 1001 · компактные страницы/)).toBeInTheDocument()
 		expect(requestedOffsets).toEqual([0, 512])
 		expect(screen.getByRole('button', { name: 'Совпадение 1001, строка 1001' })).toHaveAttribute('aria-current', 'true')
+	})
+
+	it('reports an index Worker failure to derived Tool Table consumers', async () => {
+		class ErrorWorker {
+			private listener?: (event: MessageEvent<unknown>) => void
+			addEventListener(_type: string, listener: EventListener) { this.listener = listener as (event: MessageEvent<unknown>) => void }
+			removeEventListener() { this.listener = undefined }
+			terminate() { this.listener = undefined }
+			postMessage(message: { type: string; requestId: string }) {
+				if (message.type === 'index') queueMicrotask(() => this.listener?.({ data: {
+					type: 'error', requestId: message.requestId, code: 'UNSUPPORTED_ENCODING',
+				} } as MessageEvent<unknown>))
+			}
+		}
+		vi.stubGlobal('Worker', ErrorWorker)
+		vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(Uint8Array.from([0x0a]), {
+			status: 206, headers: rangeHeaders(artifact.version, 0, 0, 1),
+		})))
+		const analysis = vi.fn()
+		render(<GCodePreview compact setup={setup} artifact={{ ...artifact, byteSize: 1 }} onAnalysisChanged={analysis} />)
+		await waitFor(() => expect(analysis).toHaveBeenCalledWith(expect.objectContaining({ error: 'UNSUPPORTED_ENCODING' })))
+	})
+
+	it('reports a module Worker construction failure instead of loading forever', async () => {
+		class UnavailableWorker {
+			constructor() { throw new Error('module workers disabled') }
+		}
+		vi.stubGlobal('Worker', UnavailableWorker)
+		const analysis = vi.fn()
+		render(<GCodePreview compact setup={setup} artifact={artifact} onAnalysisChanged={analysis} />)
+		await waitFor(() => expect(analysis).toHaveBeenCalledWith(expect.objectContaining({
+			complete: false,
+			error: 'WORKER_UNAVAILABLE',
+		})))
+		expect(screen.getByRole('alert')).toHaveTextContent('Текстовый preview недоступен.')
+	})
+
+	it('reports a Worker runtime crash while indexing', async () => {
+		class CrashedWorker {
+			private listeners = new Map<string, EventListener>()
+			addEventListener(type: string, listener: EventListener) { this.listeners.set(type, listener) }
+			removeEventListener(type: string) { this.listeners.delete(type) }
+			terminate() { this.listeners.clear() }
+			postMessage(message: { type: string }) {
+				if (message.type === 'index') queueMicrotask(() => this.listeners.get('error')?.(new Event('error')))
+			}
+		}
+		vi.stubGlobal('Worker', CrashedWorker)
+		const analysis = vi.fn()
+		render(<GCodePreview compact setup={setup} artifact={artifact} onAnalysisChanged={analysis} />)
+		await waitFor(() => expect(analysis).toHaveBeenCalledWith(expect.objectContaining({
+			complete: false,
+			error: 'WORKER_ERROR',
+		})))
+	})
+
+	it('keeps completed derived analysis valid if the Worker later crashes during search', async () => {
+		class SearchCrashWorker {
+			private listeners = new Map<string, EventListener>()
+			addEventListener(type: string, listener: EventListener) { this.listeners.set(type, listener) }
+			removeEventListener(type: string) { this.listeners.delete(type) }
+			terminate() { this.listeners.clear() }
+			postMessage(message: { type: string; requestId: string }) {
+				if (message.type === 'index') queueMicrotask(() => this.listeners.get('message')?.({ data: {
+					type: 'indexResult', requestId: message.requestId, lineCount: 1,
+					entries: [{ line: 1, byteOffset: 0 }],
+					tools: [{ toolNumber: 7, firstLine: 1, references: 1, changes: 0 }], toolsTruncated: false,
+				} } as MessageEvent<unknown>))
+				if (message.type === 'search') queueMicrotask(() => this.listeners.get('error')?.(new Event('error')))
+			}
+		}
+		vi.stubGlobal('Worker', SearchCrashWorker)
+		const analysis = vi.fn()
+		render(<GCodePreview setup={setup} artifact={artifact} onAnalysisChanged={analysis} />)
+		await waitFor(() => expect(analysis).toHaveBeenCalledWith(expect.objectContaining({
+			complete: true,
+			tools: [expect.objectContaining({ toolNumber: 7 })],
+			error: undefined,
+		})))
+		fireEvent.change(screen.getByRole('searchbox'), { target: { value: 'X' } })
+		fireEvent.submit(screen.getByRole('search'))
+		expect(await screen.findByText('Поиск не выполнен.')).toBeInTheDocument()
+		expect(analysis.mock.calls.at(-1)?.[0]).toEqual(expect.objectContaining({ complete: true, error: undefined }))
+	})
+
+	it('reports prefix validation failure instead of leaving derived views loading forever', async () => {
+		vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(Uint8Array.from([0x0a]), {
+			status: 206,
+			headers: { etag: `"${artifact.version}"`, 'content-range': 'bytes 0-0/2' },
+		})))
+		const analysis = vi.fn()
+		render(<GCodePreview compact setup={setup} artifact={{ ...artifact, byteSize: 1 }} onAnalysisChanged={analysis} />)
+		await waitFor(() => expect(analysis).toHaveBeenCalledWith(expect.objectContaining({ error: 'RANGE_FAILED', validation: 'pending' })))
+	})
+
+	it('keeps a completed Tool Table valid when only literal search fails', async () => {
+		class SearchErrorWorker {
+			private listener?: (event: MessageEvent<unknown>) => void
+			addEventListener(_type: string, listener: EventListener) { this.listener = listener as (event: MessageEvent<unknown>) => void }
+			removeEventListener() { this.listener = undefined }
+			terminate() { this.listener = undefined }
+			postMessage(message: { type: string; requestId: string }) {
+				if (message.type === 'index') queueMicrotask(() => this.listener?.({ data: {
+					type: 'indexResult', requestId: message.requestId, lineCount: 2,
+					entries: [{ line: 1, byteOffset: 0 }],
+					tools: [{ toolNumber: 2, firstLine: 1, references: 1, changes: 1 }], toolsTruncated: false,
+				} } as MessageEvent<unknown>))
+				if (message.type === 'search') queueMicrotask(() => this.listener?.({ data: {
+					type: 'error', requestId: message.requestId, code: 'QUERY_TOO_LONG',
+				} } as MessageEvent<unknown>))
+			}
+		}
+		vi.stubGlobal('Worker', SearchErrorWorker)
+		vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(Uint8Array.from([0x0a]), {
+			status: 206, headers: rangeHeaders(artifact.version, 0, 0, 1),
+		})))
+		const analysis = vi.fn()
+		render(<GCodePreview setup={setup} artifact={{ ...artifact, byteSize: 1 }} onAnalysisChanged={analysis} />)
+		await waitFor(() => expect(analysis).toHaveBeenCalledWith(expect.objectContaining({ progress: 1, tools: [expect.objectContaining({ toolNumber: 2 })], error: undefined })))
+		fireEvent.change(screen.getByRole('searchbox'), { target: { value: 'X' } })
+		fireEvent.submit(screen.getByRole('search'))
+		expect(await screen.findByText('Поиск не выполнен.')).toBeInTheDocument()
+		expect(analysis.mock.calls.at(-1)?.[0]).toEqual(expect.objectContaining({ progress: 1, error: undefined }))
 	})
 })

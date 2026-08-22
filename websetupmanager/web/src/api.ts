@@ -67,11 +67,23 @@ type JsonRecord = Record<string, unknown>
 let csrfToken: string | undefined
 let authenticatedSession = false
 let unauthorizedHandler: (() => void) | undefined
+const STALE_AUTH_SESSION_KEY = 'web-setup-manager.stale-auth-session.v1'
+const STALE_AUTH_SESSION_MARKER_PREFIX = 'web-setup-manager.stale-auth-session.v2.'
+const STALE_AUTH_CACHE_NAME = 'web-setup-manager-auth-quarantine-v1'
+const STALE_AUTH_CACHE_URL = 'https://web-setup-manager.invalid/__auth_quarantine_v1__'
+const STALE_AUTH_CACHE_SCHEMA = 1
+const MAX_STALE_AUTH_CACHE_CHARS = 512
+const MAX_STALE_AUTH_MARKERS = 32
+const MAX_LOCAL_STORAGE_SCAN_KEYS = 4_096
+const STALE_AUTH_MUTATION_LOCK = 'web-setup-manager-auth-quarantine-v1'
+const staleAuthSessionFallback = new Set<string>()
+let staleAuthMutationTail: Promise<void> = Promise.resolve()
 
 interface ApiRequestOptions {
   csrf?: boolean
   suppressUnauthorized?: boolean
   csrfRetryAttempted?: boolean
+	csrfTokenOverride?: string
 }
 
 function isRecord(value: unknown): value is JsonRecord {
@@ -187,6 +199,358 @@ export function clearApiSession(): void {
   authenticatedSession = false
 }
 
+type StaleAuthSessionMarker = 'unknown' | `sha256:${string}`
+
+function isStaleAuthSessionMarker(value: unknown): value is StaleAuthSessionMarker {
+  return value === 'unknown' || (typeof value === 'string' && /^sha256:[0-9a-f]{64}$/.test(value))
+}
+
+function staleAuthCacheRequest(marker: string): Request {
+  const url = new URL(STALE_AUTH_CACHE_URL)
+  url.searchParams.set('schema', String(STALE_AUTH_CACHE_SCHEMA))
+  url.searchParams.set('marker', marker)
+  return new Request(url, { method: 'GET', credentials: 'omit' })
+}
+
+function markerFromStaleAuthCacheRequest(request: Request): string | undefined {
+  try {
+    const expected = new URL(STALE_AUTH_CACHE_URL)
+    const url = new URL(request.url)
+    if (url.origin !== expected.origin || url.pathname !== expected.pathname ||
+      url.searchParams.get('schema') !== String(STALE_AUTH_CACHE_SCHEMA) ||
+      [...url.searchParams.keys()].some((key) => key !== 'schema' && key !== 'marker')) return undefined
+    const marker = url.searchParams.get('marker')
+    return isStaleAuthSessionMarker(marker) ? marker : undefined
+  } catch {
+    return undefined
+  }
+}
+
+function addBoundedMarker(markers: Set<string>, marker: string): void {
+  if (markers.has('unknown')) return
+  if (markers.has(marker)) return
+  if (marker === 'unknown' || markers.size >= MAX_STALE_AUTH_MARKERS - 1) {
+    markers.add('unknown')
+    return
+  }
+  markers.add(marker)
+}
+
+function mergeBoundedMarkers(target: Set<string>, source: Iterable<string>): void {
+  for (const marker of source) addBoundedMarker(target, marker)
+}
+
+interface StaleAuthCacheSnapshot {
+  available: boolean
+  cache?: Cache
+  markers: Set<string>
+}
+
+async function readStaleAuthCacheMarkers(): Promise<StaleAuthCacheSnapshot> {
+  if (typeof caches === 'undefined') return { available: false, markers: new Set() }
+  try {
+    const cache = await caches.open(STALE_AUTH_CACHE_NAME)
+    const requests = await cache.keys()
+    if (requests.length > MAX_STALE_AUTH_MARKERS) {
+      return { available: true, cache, markers: new Set(['unknown']) }
+    }
+    const markers = new Set<string>()
+    for (const request of requests) {
+      const requestMarker = markerFromStaleAuthCacheRequest(request)
+      if (!requestMarker) {
+        addBoundedMarker(markers, 'unknown')
+        continue
+      }
+      const response = await cache.match(request)
+      if (!response) continue
+      const text = await response.text()
+      if (text.length > MAX_STALE_AUTH_CACHE_CHARS) {
+        addBoundedMarker(markers, 'unknown')
+        continue
+      }
+      try {
+        const parsed = JSON.parse(text) as unknown
+        if (!isRecord(parsed) || parsed.schema !== STALE_AUTH_CACHE_SCHEMA || parsed.marker !== requestMarker) {
+          addBoundedMarker(markers, 'unknown')
+          continue
+        }
+      } catch {
+        addBoundedMarker(markers, 'unknown')
+        continue
+      }
+      addBoundedMarker(markers, requestMarker)
+    }
+    return { available: true, cache, markers }
+  } catch {
+    return { available: false, markers: new Set() }
+  }
+}
+
+function readLocalStaleAuthMarkers(): Set<string> {
+  const markers = new Set<string>()
+  if (typeof window === 'undefined') return markers
+  try {
+    const stored = window.localStorage.getItem(STALE_AUTH_SESSION_KEY)
+    if (stored !== null) {
+      if (isStaleAuthSessionMarker(stored)) addBoundedMarker(markers, stored)
+      else if (stored.length > MAX_STALE_AUTH_CACHE_CHARS * MAX_STALE_AUTH_MARKERS) {
+        addBoundedMarker(markers, 'unknown')
+      } else {
+        const parsed = JSON.parse(stored) as unknown
+        if (!isRecord(parsed) || parsed.schema !== STALE_AUTH_CACHE_SCHEMA || !Array.isArray(parsed.markers) ||
+          parsed.markers.length > MAX_STALE_AUTH_MARKERS || !parsed.markers.every(isStaleAuthSessionMarker)) {
+          addBoundedMarker(markers, 'unknown')
+        } else {
+          mergeBoundedMarkers(markers, parsed.markers)
+        }
+      }
+    }
+
+    const length = window.localStorage.length
+    if (length > MAX_LOCAL_STORAGE_SCAN_KEYS) {
+      addBoundedMarker(markers, 'unknown')
+      return markers
+    }
+    for (let index = 0; index < length; index += 1) {
+      const key = window.localStorage.key(index)
+      if (!key?.startsWith(STALE_AUTH_SESSION_MARKER_PREFIX)) continue
+      const marker = key.slice(STALE_AUTH_SESSION_MARKER_PREFIX.length)
+      const value = window.localStorage.getItem(key)
+      if (!isStaleAuthSessionMarker(marker) || value !== marker) {
+        addBoundedMarker(markers, 'unknown')
+        continue
+      }
+      addBoundedMarker(markers, marker)
+    }
+  } catch {
+    // localStorage denial is not corruption; Cache Storage and memory remain authoritative.
+  }
+  return markers
+}
+
+function localStaleAuthMarkerKey(marker: string): string {
+  return `${STALE_AUTH_SESSION_MARKER_PREFIX}${marker}`
+}
+
+function writeLocalStaleAuthMarker(marker: string): boolean {
+  if (typeof window === 'undefined') return false
+  try {
+    window.localStorage.setItem(localStaleAuthMarkerKey(marker), marker)
+    return true
+  } catch {
+    return false
+  }
+}
+
+function removeLocalStaleAuthMarker(marker: string): boolean {
+  if (typeof window === 'undefined') return false
+  try {
+    window.localStorage.removeItem(localStaleAuthMarkerKey(marker))
+    return true
+  } catch {
+    return false
+  }
+}
+
+async function withStaleAuthMutationLock<T>(operation: (originLocked: boolean) => Promise<T>): Promise<T> {
+  if (typeof navigator !== 'undefined' && navigator.locks) {
+    let entered = false
+    try {
+      const result = await navigator.locks.request(STALE_AUTH_MUTATION_LOCK, { mode: 'exclusive' }, async () => {
+        entered = true
+        return operation(true)
+      }) as unknown
+      return result as T
+    } catch (error) {
+      if (entered) throw error
+    }
+  }
+  let release!: () => void
+  const previous = staleAuthMutationTail
+  staleAuthMutationTail = new Promise<void>((resolve) => { release = resolve })
+  await previous
+  try {
+    return await operation(false)
+  } finally {
+    release()
+  }
+}
+
+function staleAuthMarkerResponse(marker: string): Response {
+  return new Response(JSON.stringify({ schema: STALE_AUTH_CACHE_SCHEMA, marker }), {
+    headers: { 'Content-Type': 'application/json' },
+  })
+}
+
+async function cacheStaleAuthMarkerMatches(cache: Cache, marker: string): Promise<boolean> {
+  try {
+    const response = await cache.match(staleAuthCacheRequest(marker))
+    if (!response) return false
+    const text = await response.text()
+    if (text.length > MAX_STALE_AUTH_CACHE_CHARS) return false
+    const parsed = JSON.parse(text) as unknown
+    return isRecord(parsed) && parsed.schema === STALE_AUTH_CACHE_SCHEMA && parsed.marker === marker
+  } catch {
+    return false
+  }
+}
+
+async function persistStaleAuthSessionMarker(
+  marker: string,
+  localSnapshot = readLocalStaleAuthMarkers(),
+  durableSnapshot?: StaleAuthCacheSnapshot,
+  originLocked = false,
+): Promise<boolean> {
+  addBoundedMarker(staleAuthSessionFallback, marker)
+  let migrated = true
+  if (originLocked) {
+    for (const existing of localSnapshot) migrated = writeLocalStaleAuthMarker(existing) && migrated
+    if (migrated && typeof window !== 'undefined') {
+      try { window.localStorage.removeItem(STALE_AUTH_SESSION_KEY) } catch { migrated = false }
+    }
+  }
+  const localTarget = localSnapshot.has('unknown') ||
+      (!localSnapshot.has(marker) && localSnapshot.size >= MAX_STALE_AUTH_MARKERS - 1)
+    ? 'unknown' : marker
+  addBoundedMarker(staleAuthSessionFallback, localTarget)
+  const localSealed = localSnapshot.has(marker) ||
+    (localTarget === marker && writeLocalStaleAuthMarker(localTarget))
+
+  const durable = durableSnapshot ?? await readStaleAuthCacheMarkers()
+  if (!durable.cache) return localSealed
+  const target = durable.markers.has('unknown') ||
+      (!durable.markers.has(marker) && durable.markers.size >= MAX_STALE_AUTH_MARKERS - 1)
+      ? 'unknown' : marker
+  addBoundedMarker(staleAuthSessionFallback, target)
+  let cacheSealed = target === marker && durable.markers.has(marker)
+  try {
+    await durable.cache.put(staleAuthCacheRequest(target), staleAuthMarkerResponse(target))
+    if (target === marker) cacheSealed = await cacheStaleAuthMarkerMatches(durable.cache, marker)
+  } catch {
+    // The local/in-memory seals remain fail-closed if Cache Storage rejects the write.
+  }
+  return localSealed || cacheSealed
+}
+
+async function addStaleAuthSessionMarker(marker: string): Promise<void> {
+  addBoundedMarker(staleAuthSessionFallback, marker)
+  await withStaleAuthMutationLock(async (originLocked) => {
+    await persistStaleAuthSessionMarker(marker, undefined, undefined, originLocked)
+  })
+}
+
+async function removeStaleAuthSessionMarkers(markers: ReadonlySet<string>, allowUnknown: boolean): Promise<void> {
+  for (const marker of markers) {
+    if (marker !== 'unknown') staleAuthSessionFallback.delete(marker)
+  }
+  await withStaleAuthMutationLock(async (originLocked) => {
+    const removable = [...markers].filter((marker) => marker !== 'unknown' || (allowUnknown && originLocked))
+    if (removable.includes('unknown')) staleAuthSessionFallback.delete('unknown')
+    const durable = await readStaleAuthCacheMarkers()
+    if (durable.cache) {
+      for (const marker of removable) await durable.cache.delete(staleAuthCacheRequest(marker))
+    }
+
+    for (const marker of removable) removeLocalStaleAuthMarker(marker)
+    // Migrate the legacy scalar/set only with an origin-wide lock. Per-marker v2
+    // keys above are commutative and remain correct without Web Locks.
+    if (originLocked) {
+      const local = readLocalStaleAuthMarkers()
+      for (const marker of removable) local.delete(marker)
+      let migrated = true
+      for (const marker of local) migrated = writeLocalStaleAuthMarker(marker) && migrated
+      if (migrated && typeof window !== 'undefined') {
+        try { window.localStorage.removeItem(STALE_AUTH_SESSION_KEY) } catch { /* retain fail-closed legacy */ }
+      }
+    }
+  })
+}
+
+async function readStaleAuthSessionMarkers(): Promise<Set<string>> {
+  const result = new Set<string>()
+  mergeBoundedMarkers(result, staleAuthSessionFallback)
+  mergeBoundedMarkers(result, readLocalStaleAuthMarkers())
+  const durable = await readStaleAuthCacheMarkers()
+  mergeBoundedMarkers(result, durable.markers)
+  mergeBoundedMarkers(staleAuthSessionFallback, result)
+  return result
+}
+
+async function authSessionFingerprint(token: string): Promise<string | undefined> {
+	try {
+		if (!globalThis.crypto?.subtle) return undefined
+		const digest = new Uint8Array(await globalThis.crypto.subtle.digest('SHA-256', new TextEncoder().encode(token)))
+		return `sha256:${Array.from(digest, (value) => value.toString(16).padStart(2, '0')).join('')}`
+	} catch {
+		return undefined
+	}
+}
+
+async function rememberStaleAuthSession(token: string): Promise<void> {
+	await addStaleAuthSessionMarker(await authSessionFingerprint(token) ?? 'unknown')
+}
+
+export interface ExplicitAuthQuarantineProof {
+  readonly schema: 1
+  readonly fingerprint: string
+  readonly supersededMarkers: readonly string[]
+}
+
+/**
+ * Journals a freshly issued explicit-login session before any asynchronous
+ * authorization/cache continuation. The returned proof is intentionally made
+ * only of digests; callers finalize it only after that continuation succeeds.
+ */
+export async function quarantineExplicitAuthSession(session: AuthSession): Promise<ExplicitAuthQuarantineProof | undefined> {
+  if (!session.authenticated || !session.csrfToken) return undefined
+  const fingerprint = await authSessionFingerprint(session.csrfToken)
+  if (!fingerprint) {
+    await addStaleAuthSessionMarker('unknown')
+    return undefined
+  }
+  return withStaleAuthMutationLock(async (originLocked) => {
+    const local = readLocalStaleAuthMarkers()
+    const durable = await readStaleAuthCacheMarkers()
+    const existing = new Set<string>()
+    mergeBoundedMarkers(existing, staleAuthSessionFallback)
+    mergeBoundedMarkers(existing, local)
+    mergeBoundedMarkers(existing, durable.markers)
+    const canFinalize = !existing.has('unknown') &&
+      (existing.has(fingerprint) || existing.size < MAX_STALE_AUTH_MARKERS - 1)
+    const sealed = await persistStaleAuthSessionMarker(fingerprint, local, durable, originLocked)
+    if (!canFinalize || !sealed) return undefined
+    return Object.freeze({
+      schema: 1 as const,
+      fingerprint,
+      supersededMarkers: Object.freeze([...existing]),
+    })
+  })
+}
+
+/**
+ * Activates the server-side browser session only after its exact fingerprint
+ * has a confirmed durable quarantine marker. The value is a SHA-256 digest,
+ * never the HttpOnly cookie or raw CSRF token.
+ */
+export async function activateExplicitAuthSession(
+  session: AuthSession,
+  proof: ExplicitAuthQuarantineProof,
+): Promise<boolean> {
+  if (!validExplicitAuthQuarantineProof(proof) || !session.authenticated || !session.csrfToken) return false
+  const fingerprint = await authSessionFingerprint(session.csrfToken)
+  if (!fingerprint || fingerprint !== proof.fingerprint) return false
+  try {
+		await apiRequest<void>('/api/v1/auth/activate', { method: 'POST' }, {
+			csrfRetryAttempted: true,
+			csrfTokenOverride: session.csrfToken,
+			suppressUnauthorized: true,
+		})
+		return true
+	} catch {
+		return false
+	}
+}
+
 export function setUnauthorizedHandler(handler?: () => void): void {
   unauthorizedHandler = handler
 }
@@ -207,14 +571,15 @@ export async function apiRequest<T>(
   headers.set('Accept', 'application/json')
 
   if (!isSafeMethod(method) && options.csrf !== false) {
-    if (!csrfToken) {
+    const requestCSRFToken = options.csrfTokenOverride ?? csrfToken
+    if (!requestCSRFToken) {
       throw new ApiError({
         message: 'The security token is unavailable. Refresh the application and try again.',
         status: 0,
         code: 'CSRF_TOKEN_MISSING',
       })
     }
-    headers.set('X-CSRF-Token', csrfToken)
+    headers.set('X-CSRF-Token', requestCSRFToken)
   }
 
   let response: Response
@@ -1140,6 +1505,65 @@ export async function login(
 export async function logout(signal?: AbortSignal): Promise<void> {
   await apiRequest<void>('/api/v1/auth/logout', { method: 'POST', signal })
   clearApiSession()
+}
+
+/**
+ * Best-effort revocation for an explicit login continuation that became stale.
+ * The CSRF comparison prevents an old continuation from logging out a newer
+ * session adopted by this realm; the backend repeats that binding against the
+ * HttpOnly cookie.
+ */
+export async function logoutSessionIfCurrent(expectedCSRFToken: string | undefined, signal?: AbortSignal): Promise<boolean> {
+	if (!expectedCSRFToken || csrfToken !== expectedCSRFToken) return false
+	try {
+		await apiRequest<void>('/api/v1/auth/revoke-stale', { method: 'POST', signal }, {
+			csrfRetryAttempted: true,
+			suppressUnauthorized: true,
+		})
+		if (csrfToken === expectedCSRFToken) clearApiSession()
+		const fingerprint = await authSessionFingerprint(expectedCSRFToken)
+		if (fingerprint) await removeStaleAuthSessionMarkers(new Set([fingerprint]), false)
+		return true
+	} catch (error) {
+		if (error instanceof ApiError && error.status === 401) {
+			if (csrfToken === expectedCSRFToken) clearApiSession()
+			const fingerprint = await authSessionFingerprint(expectedCSRFToken)
+			if (fingerprint) await removeStaleAuthSessionMarkers(new Set([fingerprint]), false)
+			return true
+		}
+		if (csrfToken === expectedCSRFToken) await rememberStaleAuthSession(expectedCSRFToken)
+		return false
+	}
+}
+
+/**
+ * Refuses to adopt a session whose stale-login revocation was not confirmed.
+ * A successful explicit PAM login rotates CSRF, so a different fingerprint is
+ * safe and clears the old quarantine.
+ */
+export async function reconcileStaleAuthSession(session: AuthSession, signal?: AbortSignal): Promise<boolean> {
+	const markers = await readStaleAuthSessionMarkers()
+	if (markers.size === 0 || !session.authenticated || !session.csrfToken) return true
+	await logoutSessionIfCurrent(session.csrfToken, signal)
+	return false
+}
+
+function validExplicitAuthQuarantineProof(value: ExplicitAuthQuarantineProof): boolean {
+  return value.schema === 1 && isStaleAuthSessionMarker(value.fingerprint) && value.fingerprint !== 'unknown' &&
+    Array.isArray(value.supersededMarkers) && value.supersededMarkers.length <= MAX_STALE_AUTH_MARKERS &&
+    value.supersededMarkers.every(isStaleAuthSessionMarker)
+}
+
+export async function acceptExplicitAuthSession(
+  session: AuthSession,
+  proof?: ExplicitAuthQuarantineProof,
+): Promise<void> {
+	if (!proof || !validExplicitAuthQuarantineProof(proof) || !session.csrfToken) return
+	const fingerprint = await authSessionFingerprint(session.csrfToken)
+	if (!fingerprint || fingerprint !== proof.fingerprint) return
+	const accepted = new Set<string>(proof.supersededMarkers)
+	accepted.add(fingerprint)
+	await removeStaleAuthSessionMarkers(accepted, true)
 }
 
 function normalizeCapabilities(body: unknown): Capabilities {

@@ -206,9 +206,12 @@ func TestHTTPCatalogRangeETagReplacementAndSanitizedHTML(t *testing.T) {
 	sheetURL := "/api/v1/catalog/setups/" + setup.ID + "/setup-sheet/content?version=" + setup.SetupSheet.Version
 	sheet := h.request(http.MethodGet, sheetURL, nil, map[string]string{"If-Match": `"` + setup.SetupSheet.Version + `"`})
 	requireHTTPStatus(t, sheet, http.StatusOK)
-	if !strings.Contains(sheet.Body.String(), "Safe sheet") || strings.Contains(strings.ToLower(sheet.Body.String()), "script") ||
+	if !strings.Contains(sheet.Body.String(), "Safe sheet") || strings.Contains(strings.ToLower(sheet.Body.String()), "<script") ||
 		strings.Contains(sheet.Body.String(), "evil.invalid") || sheet.Header().Get("Content-Security-Policy") != sanitizedHTMLCSP {
 		t.Fatalf("unsafe HTML response: headers=%+v body=%s", sheet.Header(), sheet.Body.String())
+	}
+	if !strings.HasSuffix(sheet.Body.String(), sanitizedHTMLCompletionSuffix) {
+		t.Fatalf("catalog HTML response lacks completion suffix: %s", sheet.Body.String())
 	}
 
 	pdfSetup := createCatalogSetupHTTP(t, h, "content-pdf-setup", "", "PDF")

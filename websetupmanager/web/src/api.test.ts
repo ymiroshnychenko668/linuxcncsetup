@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
+	activateExplicitAuthSession,
+	acceptExplicitAuthSession,
   ApiError,
   apiRequest,
   clearApiSession,
@@ -17,6 +19,9 @@ import {
 	setUnauthorizedHandler,
 	login,
 	logout,
+	logoutSessionIfCurrent,
+	quarantineExplicitAuthSession,
+	reconcileStaleAuthSession,
 	uploadSetupSheet,
 } from './api'
 
@@ -28,9 +33,65 @@ function jsonResponse(body: unknown, init: ResponseInit = {}): Response {
   })
 }
 
+class AuthMemoryCache {
+  readonly values = new Map<string, Response>()
+
+  match(request: RequestInfo | URL): Promise<Response | undefined> {
+    const key = request instanceof Request ? request.url : String(request)
+    return Promise.resolve(this.values.get(key)?.clone())
+  }
+
+  put(request: RequestInfo | URL, response: Response): Promise<void> {
+    const key = request instanceof Request ? request.url : String(request)
+    this.values.set(key, response.clone())
+    return Promise.resolve()
+  }
+
+  keys(): Promise<readonly Request[]> {
+    return Promise.resolve([...this.values.keys()].map((url) => new Request(url)))
+  }
+
+  delete(request: RequestInfo | URL): Promise<boolean> {
+    const key = request instanceof Request ? request.url : String(request)
+    return Promise.resolve(this.values.delete(key))
+  }
+}
+
+function installSerialAuthWebLocks(): () => void {
+  const original = Object.getOwnPropertyDescriptor(navigator, 'locks')
+  let tail = Promise.resolve()
+  Object.defineProperty(navigator, 'locks', {
+    configurable: true,
+    value: {
+      request: vi.fn(async (_name: string, _options: LockOptions, operation: () => Promise<unknown>) => {
+        let release!: () => void
+        const previous = tail
+        tail = new Promise<void>((resolve) => { release = resolve })
+        await previous
+        try {
+          return await operation()
+        } finally {
+          release()
+        }
+      }),
+    },
+  })
+  return () => {
+    if (original) Object.defineProperty(navigator, 'locks', original)
+    else Reflect.deleteProperty(navigator, 'locks')
+  }
+}
+
 afterEach(() => {
   clearApiSession()
   setUnauthorizedHandler(undefined)
+  try {
+    window.localStorage.removeItem('web-setup-manager.stale-auth-session.v1')
+    for (let index = window.localStorage.length - 1; index >= 0; index -= 1) {
+      const key = window.localStorage.key(index)
+      if (key?.startsWith('web-setup-manager.stale-auth-session.v2.')) window.localStorage.removeItem(key)
+    }
+  } catch { /* denied */ }
   vi.unstubAllGlobals()
 })
 
@@ -84,6 +145,373 @@ describe('API client', () => {
     expect(localStorage).toHaveLength(localStorageLength)
     expect(sessionStorage).toHaveLength(sessionStorageLength)
   })
+
+	it('never refreshes and retries a conditional stale-session revocation', async () => {
+		setCsrfToken('stale-login-csrf')
+		const fetchMock = vi.fn().mockResolvedValue(jsonResponse({
+			error: { code: 'CSRF_REJECTED', message: 'The session token does not match.' },
+		}, { status: 403 }))
+		vi.stubGlobal('fetch', fetchMock)
+
+		expect(await logoutSessionIfCurrent('stale-login-csrf')).toBe(false)
+		expect(fetchMock).toHaveBeenCalledTimes(1)
+		const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit]
+		expect(url).toBe('/api/v1/auth/revoke-stale')
+		expect(new Headers(init.headers).get('X-CSRF-Token')).toBe('stale-login-csrf')
+		expect(await logoutSessionIfCurrent('different-csrf')).toBe(false)
+		expect(fetchMock).toHaveBeenCalledTimes(1)
+		const fresh = { authenticated: true, loginRequired: true, user: { username: 'operator' }, csrfToken: 'fresh-csrf' } as const
+		const proof = await quarantineExplicitAuthSession(fresh)
+		expect(proof).toBeDefined()
+		await acceptExplicitAuthSession(fresh, proof)
+	})
+
+	it('activates only the exact sealed session through the CSRF-bound endpoint', async () => {
+		const session = {
+			authenticated: true,
+			loginRequired: true,
+			user: { username: 'operator' },
+			csrfToken: 'raw-csrf-must-not-enter-the-cookie',
+		} as const
+		const proof = await quarantineExplicitAuthSession(session)
+		if (!proof) throw new Error('expected a durable quarantine proof')
+		const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 204 }))
+		vi.stubGlobal('fetch', fetchMock)
+		try {
+			expect(await activateExplicitAuthSession(session, proof)).toBe(true)
+			expect(fetchMock).toHaveBeenCalledTimes(1)
+			const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit]
+			expect(url).toBe('/api/v1/auth/activate')
+			expect(new Headers(init.headers).get('X-CSRF-Token')).toBe(session.csrfToken)
+		} finally {
+			await acceptExplicitAuthSession(session, proof)
+		}
+	})
+
+	it('keeps an unconfirmed stale login quarantined across a session probe', async () => {
+		setCsrfToken('late-login-csrf')
+		const fetchMock = vi.fn().mockResolvedValue(jsonResponse({
+			error: { code: 'AUTHENTICATION_UNAVAILABLE', message: 'Try again.' },
+		}, { status: 503 }))
+		vi.stubGlobal('fetch', fetchMock)
+		expect(await logoutSessionIfCurrent('late-login-csrf')).toBe(false)
+		expect(await reconcileStaleAuthSession({
+			authenticated: true,
+			loginRequired: true,
+			user: { username: 'operator' },
+			csrfToken: 'late-login-csrf',
+		})).toBe(false)
+		expect(fetchMock).toHaveBeenCalledTimes(2)
+
+		const fresh = {
+			authenticated: true,
+			loginRequired: true,
+			user: { username: 'operator' },
+			csrfToken: 'fresh-login-csrf',
+		} as const
+		const proof = await quarantineExplicitAuthSession(fresh)
+		expect(proof).toBeDefined()
+		await acceptExplicitAuthSession(fresh, proof)
+	})
+
+	it('keeps a stale explicit-login session quarantined in Cache Storage when localStorage is unavailable', async () => {
+		const memoryCache = new AuthMemoryCache()
+		const restoreLocks = installSerialAuthWebLocks()
+		vi.stubGlobal('caches', {
+			open: vi.fn().mockResolvedValue(memoryCache),
+		})
+		const unavailableStorage = {
+			getItem: vi.fn(() => { throw new DOMException('Storage denied', 'SecurityError') }),
+			setItem: vi.fn(() => { throw new DOMException('Storage denied', 'SecurityError') }),
+			removeItem: vi.fn(() => { throw new DOMException('Storage denied', 'SecurityError') }),
+		} as unknown as Storage
+		const storageDescriptor = Object.getOwnPropertyDescriptor(window, 'localStorage')
+		Object.defineProperty(window, 'localStorage', { configurable: true, value: unavailableStorage })
+
+		const staleToken = 'late-login-csrf-must-never-be-persisted'
+		const fetchMock = vi.fn().mockResolvedValue(jsonResponse({
+			error: { code: 'AUTHENTICATION_UNAVAILABLE', message: 'Try again.' },
+		}, { status: 503 }))
+		vi.stubGlobal('fetch', fetchMock)
+		try {
+			setCsrfToken(staleToken)
+			expect(await logoutSessionIfCurrent(staleToken)).toBe(false)
+
+			const persisted = [...memoryCache.values.values()][0]
+			if (!persisted) throw new Error('expected a durable quarantine marker')
+			const persistedText = await persisted.clone().text()
+			expect(persistedText).not.toContain(staleToken)
+			const persistedRecord: unknown = JSON.parse(persistedText)
+			if (!persistedRecord || typeof persistedRecord !== 'object') throw new Error('invalid durable marker')
+			const marker = (persistedRecord as { marker?: unknown }).marker
+			expect((persistedRecord as { schema?: unknown }).schema).toBe(1)
+			if (typeof marker !== 'string') throw new Error('invalid durable marker')
+			expect(marker).toMatch(/^(?:unknown|sha256:[0-9a-f]{64})$/)
+
+			// A new module instance models a tab reload: its realm-local fallback is empty,
+			// while the origin's Cache Storage survives.
+			vi.resetModules()
+			const reloaded = await import('./api')
+			reloaded.setCsrfToken(staleToken)
+			expect(await reloaded.reconcileStaleAuthSession({
+				authenticated: true,
+				loginRequired: true,
+				user: { username: 'operator' },
+				csrfToken: staleToken,
+			})).toBe(false)
+			expect(fetchMock).toHaveBeenCalledTimes(2)
+
+			const fresh = {
+				authenticated: true,
+				loginRequired: true,
+				user: { username: 'operator' },
+				csrfToken: 'rotated-login-csrf',
+			} as const
+			const proof = await reloaded.quarantineExplicitAuthSession(fresh)
+			expect(proof).toBeDefined()
+			await reloaded.acceptExplicitAuthSession(fresh, proof)
+			expect(memoryCache.values).toHaveLength(0)
+
+			// Also clear the statically imported module's realm-local fallback.
+			await acceptExplicitAuthSession(fresh, proof)
+			reloaded.clearApiSession()
+		} finally {
+			restoreLocks()
+			if (storageDescriptor) Object.defineProperty(window, 'localStorage', storageDescriptor)
+		}
+	})
+
+	it('refuses to issue an explicit-login proof when neither durable store can seal it', async () => {
+		vi.stubGlobal('caches', { open: vi.fn().mockRejectedValue(new DOMException('Cache denied', 'SecurityError')) })
+		const unavailableStorage = {
+			getItem: vi.fn(() => { throw new DOMException('Storage denied', 'SecurityError') }),
+			setItem: vi.fn(() => { throw new DOMException('Storage denied', 'SecurityError') }),
+			removeItem: vi.fn(() => { throw new DOMException('Storage denied', 'SecurityError') }),
+		} as unknown as Storage
+		const storageDescriptor = Object.getOwnPropertyDescriptor(window, 'localStorage')
+		Object.defineProperty(window, 'localStorage', { configurable: true, value: unavailableStorage })
+		const session = {
+			authenticated: true,
+			loginRequired: true,
+			user: { username: 'operator' },
+			csrfToken: 'unsealed-session',
+		} as const
+		try {
+			await expect(quarantineExplicitAuthSession(session)).resolves.toBeUndefined()
+			setCsrfToken(session.csrfToken)
+			vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(null, { status: 204 })))
+			await logoutSessionIfCurrent(session.csrfToken)
+		} finally {
+			if (storageDescriptor) Object.defineProperty(window, 'localStorage', storageDescriptor)
+		}
+	})
+
+	it('clears the durable stale-session quarantine after confirmed revocation', async () => {
+		const memoryCache = new AuthMemoryCache()
+		const restoreLocks = installSerialAuthWebLocks()
+		vi.stubGlobal('caches', { open: vi.fn().mockResolvedValue(memoryCache) })
+		const fetchMock = vi.fn()
+			.mockResolvedValueOnce(jsonResponse({
+				error: { code: 'AUTHENTICATION_UNAVAILABLE', message: 'Try again.' },
+			}, { status: 503 }))
+			.mockResolvedValueOnce(new Response(null, { status: 204 }))
+		vi.stubGlobal('fetch', fetchMock)
+
+		try {
+			setCsrfToken('eventually-revoked-csrf')
+			expect(await logoutSessionIfCurrent('eventually-revoked-csrf')).toBe(false)
+			expect(memoryCache.values).toHaveLength(1)
+			expect(await logoutSessionIfCurrent('eventually-revoked-csrf')).toBe(true)
+			expect(memoryCache.values).toHaveLength(0)
+		} finally {
+			restoreLocks()
+		}
+	})
+
+	it('removes only stale marker A when revocation A completes after concurrent failure B', async () => {
+		const memoryCache = new AuthMemoryCache()
+		const restoreLocks = installSerialAuthWebLocks()
+		vi.stubGlobal('caches', { open: vi.fn().mockResolvedValue(memoryCache) })
+		let finishARevocation!: (response: Response) => void
+		const delayedARevocation = new Promise<Response>((resolve) => { finishARevocation = resolve })
+		let aCalls = 0
+		const unavailable = () => jsonResponse({
+			error: { code: 'AUTHENTICATION_UNAVAILABLE', message: 'Try again.' },
+		}, { status: 503 })
+		const fetchMock = vi.fn((_url: RequestInfo | URL, init?: RequestInit) => {
+			const token = new Headers(init?.headers).get('X-CSRF-Token')
+			if (token === 'session-a') {
+				aCalls += 1
+				return Promise.resolve(aCalls === 1 ? unavailable() : delayedARevocation)
+			}
+			return Promise.resolve(unavailable())
+		})
+		vi.stubGlobal('fetch', fetchMock)
+
+		try {
+			vi.resetModules()
+			const tabA = await import('./api')
+			vi.resetModules()
+			const tabB = await import('./api')
+			tabA.setCsrfToken('session-a')
+			tabB.setCsrfToken('session-b')
+
+			expect(await tabA.logoutSessionIfCurrent('session-a')).toBe(false)
+			const finishingA = tabA.logoutSessionIfCurrent('session-a')
+			expect(await tabB.logoutSessionIfCurrent('session-b')).toBe(false)
+			finishARevocation(new Response(null, { status: 204 }))
+			expect(await finishingA).toBe(true)
+
+			expect(memoryCache.values).toHaveLength(1)
+			const remaining = [...memoryCache.values.values()][0]
+			if (!remaining) throw new Error('expected marker B to remain durable')
+			const remainingText = await remaining.clone().text()
+			expect(remainingText).not.toMatch(/session-[ab]/)
+
+			// A fresh realm still rejects B, proving A's late completion did not clear it.
+			vi.resetModules()
+			const reloaded = await import('./api')
+			reloaded.setCsrfToken('session-b')
+			expect(await reloaded.reconcileStaleAuthSession({
+				authenticated: true,
+				loginRequired: true,
+				user: { username: 'operator' },
+				csrfToken: 'session-b',
+			})).toBe(false)
+
+			const fresh = {
+				authenticated: true,
+				loginRequired: true,
+				user: { username: 'operator' },
+				csrfToken: 'fresh-session-c',
+			} as const
+			const proof = await tabB.quarantineExplicitAuthSession(fresh)
+			expect(proof).toBeDefined()
+			await tabB.acceptExplicitAuthSession(fresh, proof)
+			tabA.clearApiSession()
+			tabB.clearApiSession()
+			reloaded.clearApiSession()
+		} finally {
+			restoreLocks()
+		}
+	})
+
+	it('finalizes only the explicit-login snapshot and preserves a later marker B', async () => {
+		const memoryCache = new AuthMemoryCache()
+		const restoreLocks = installSerialAuthWebLocks()
+		vi.stubGlobal('caches', { open: vi.fn().mockResolvedValue(memoryCache) })
+		vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse({
+			error: { code: 'AUTHENTICATION_UNAVAILABLE', message: 'Try again.' },
+		}, { status: 503 })))
+
+		try {
+			vi.resetModules()
+			const tabA = await import('./api')
+			vi.resetModules()
+			const tabB = await import('./api')
+			vi.resetModules()
+			const tabC = await import('./api')
+			tabA.setCsrfToken('stale-session-a')
+			tabB.setCsrfToken('stale-session-b')
+			expect(await tabA.logoutSessionIfCurrent('stale-session-a')).toBe(false)
+
+			const freshC = {
+				authenticated: true,
+				loginRequired: true,
+				user: { username: 'operator' },
+				csrfToken: 'fresh-session-c',
+			} as const
+			const proofC = await tabC.quarantineExplicitAuthSession(freshC)
+			expect(proofC).toBeDefined()
+			expect(memoryCache.values).toHaveLength(2)
+
+			// B is journaled after C captured its proof and must not be swept by finalize(C).
+			expect(await tabB.logoutSessionIfCurrent('stale-session-b')).toBe(false)
+			expect(memoryCache.values).toHaveLength(3)
+			await tabC.acceptExplicitAuthSession(freshC, proofC)
+			expect(memoryCache.values).toHaveLength(1)
+
+			vi.resetModules()
+			const reloaded = await import('./api')
+			reloaded.setCsrfToken('stale-session-b')
+			expect(await reloaded.reconcileStaleAuthSession({
+				authenticated: true,
+				loginRequired: true,
+				user: { username: 'operator' },
+				csrfToken: 'stale-session-b',
+			})).toBe(false)
+			tabA.clearApiSession()
+			tabB.clearApiSession()
+			tabC.clearApiSession()
+			reloaded.clearApiSession()
+		} finally {
+			restoreLocks()
+		}
+	})
+
+	it('keeps per-fingerprint localStorage markers race-safe without Web Locks or Cache Storage', async () => {
+		const locksDescriptor = Object.getOwnPropertyDescriptor(navigator, 'locks')
+		Reflect.deleteProperty(navigator, 'locks')
+		vi.stubGlobal('caches', undefined)
+		let finishARevocation!: (response: Response) => void
+		const delayedARevocation = new Promise<Response>((resolve) => { finishARevocation = resolve })
+		let aCalls = 0
+		const unavailable = () => jsonResponse({
+			error: { code: 'AUTHENTICATION_UNAVAILABLE', message: 'Try again.' },
+		}, { status: 503 })
+		vi.stubGlobal('fetch', vi.fn((_url: RequestInfo | URL, init?: RequestInit) => {
+			const token = new Headers(init?.headers).get('X-CSRF-Token')
+			if (token === 'local-session-a') {
+				aCalls += 1
+				return Promise.resolve(aCalls === 1 ? unavailable() : delayedARevocation)
+			}
+			return Promise.resolve(unavailable())
+		}))
+
+		try {
+			vi.resetModules()
+			const tabA = await import('./api')
+			vi.resetModules()
+			const tabB = await import('./api')
+			tabA.setCsrfToken('local-session-a')
+			tabB.setCsrfToken('local-session-b')
+			expect(await tabA.logoutSessionIfCurrent('local-session-a')).toBe(false)
+			const finishingA = tabA.logoutSessionIfCurrent('local-session-a')
+			expect(await tabB.logoutSessionIfCurrent('local-session-b')).toBe(false)
+			finishARevocation(new Response(null, { status: 204 }))
+			expect(await finishingA).toBe(true)
+
+			const markerKeys = Array.from({ length: localStorage.length }, (_, index) => localStorage.key(index))
+				.filter((key): key is string => key?.startsWith('web-setup-manager.stale-auth-session.v2.') === true)
+			expect(markerKeys).toHaveLength(1)
+			expect(`${markerKeys[0]}:${localStorage.getItem(markerKeys[0])}`).not.toMatch(/local-session-[ab]/)
+
+			vi.resetModules()
+			const reloaded = await import('./api')
+			reloaded.setCsrfToken('local-session-b')
+			expect(await reloaded.reconcileStaleAuthSession({
+				authenticated: true,
+				loginRequired: true,
+				user: { username: 'operator' },
+				csrfToken: 'local-session-b',
+			})).toBe(false)
+
+			const fresh = {
+				authenticated: true,
+				loginRequired: true,
+				user: { username: 'operator' },
+				csrfToken: 'local-session-c',
+			} as const
+			const proof = await tabB.quarantineExplicitAuthSession(fresh)
+			expect(proof).toBeDefined()
+			await tabB.acceptExplicitAuthSession(fresh, proof)
+			tabA.clearApiSession()
+			tabB.clearApiSession()
+			reloaded.clearApiSession()
+		} finally {
+			if (locksDescriptor) Object.defineProperty(navigator, 'locks', locksDescriptor)
+		}
+	})
 
   it('keeps session CSRF authoritative when capabilities include a compatibility token', async () => {
     const fetchMock = vi.fn()

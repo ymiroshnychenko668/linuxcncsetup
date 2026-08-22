@@ -12,6 +12,11 @@ interface Props {
   inline?: boolean
 }
 
+// The backend writes this only after a clean, version-consistent source EOF.
+// Source comments are removed by the sanitizer, so uploaded content cannot
+// forge a successful tail after an interrupted streaming response.
+const sanitizedHTMLCompletionSuffix = '</body></html><!--websetupmanager:sanitized-html-complete:v1-->'
+
 export function SetupSheetViewer({ setup, artifact, contentUrl, onClose, onReplace, inline = false }: Props) {
   const surfaceRef = useRef<HTMLDivElement>(null)
   const [failed, setFailed] = useState(false)
@@ -52,6 +57,10 @@ export function SetupSheetViewer({ setup, artifact, contentUrl, onClose, onRepla
         throw new Error('SETUP_SHEET_VERSION_MISMATCH')
       }
       const sanitizedDocument = await response.blob()
+      const completion = await sanitizedDocument.slice(-sanitizedHTMLCompletionSuffix.length).text()
+      if (completion !== sanitizedHTMLCompletionSuffix) {
+        throw new Error('SETUP_SHEET_INCOMPLETE')
+      }
       if (controller.signal.aborted) return
       objectURL = URL.createObjectURL(new Blob([sanitizedDocument], { type: 'text/html;charset=utf-8' }))
       setHTMLDocument({ source: versionedContentURL, objectURL })

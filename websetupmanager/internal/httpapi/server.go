@@ -27,7 +27,11 @@ import (
 	"golang.org/x/net/http/httpguts"
 )
 
-const appCSP = "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'self'; form-action 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; connect-src 'self'; worker-src 'self' blob:; frame-src 'self' blob:"
+// React uses narrowly scoped dynamic style attributes for resizer geometry,
+// tree indentation, icon transforms and setup-sheet zoom. This applies only to
+// the trusted application shell; sanitized HTML sheets carry their own strict,
+// hash-only CSP inside a sandboxed document.
+const appCSP = "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'self'; form-action 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; worker-src 'self' blob:; frame-src 'self' blob:"
 
 const remoteSessionCookieName = "__Host-websetupmanager_session"
 
@@ -317,8 +321,12 @@ func safeRouteContext(requestPath string) (route, setupID, artifactID, importID,
 		return "auth-login", "", "", "", ""
 	case "/api/v1/auth/session":
 		return "auth-session", "", "", "", ""
+	case "/api/v1/auth/activate":
+		return "auth-activate", "", "", "", ""
 	case "/api/v1/auth/logout":
 		return "auth-logout", "", "", "", ""
+	case "/api/v1/auth/revoke-stale":
+		return "auth-revoke-stale", "", "", "", ""
 	case "/api/v1/catalog":
 		return "catalog", "", "", "", ""
 	case "/api/v1/catalog/folders":
@@ -433,8 +441,12 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, requestID string)
 		s.login(w, r, requestID)
 	case "/api/v1/auth/session":
 		s.authenticationSession(w, r, requestID)
+	case "/api/v1/auth/activate":
+		s.activateSession(w, r, requestID)
 	case "/api/v1/auth/logout":
 		s.logout(w, r, requestID)
+	case "/api/v1/auth/revoke-stale":
+		s.revokeStale(w, r, requestID)
 	default:
 		if strings.HasPrefix(r.URL.Path, "/api/v1/catalog") && s.routeCatalog(w, r, requestID) {
 			return

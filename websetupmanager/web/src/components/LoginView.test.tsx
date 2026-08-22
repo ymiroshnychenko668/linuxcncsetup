@@ -46,6 +46,28 @@ describe('LoginView', () => {
     expect(sessionStorage).toHaveLength(sessionStorageLength)
   })
 
+	it('captures cache authority before starting the PAM request', async () => {
+		const onAuthenticated = vi.fn()
+		const captureAuthGeneration = vi.fn().mockReturnValue('generation-before-login')
+		mocks.login.mockResolvedValue({
+			authenticated: true,
+			loginRequired: true,
+			user: { username: 'operator' },
+			csrfToken: 'token',
+		})
+		render(<LoginView onAuthenticated={onAuthenticated} captureAuthGeneration={captureAuthGeneration} />)
+		const user = userEvent.setup()
+		await user.type(screen.getByLabelText('Имя пользователя'), 'operator')
+		await user.type(screen.getByLabelText('Пароль'), 'secret')
+		await user.click(screen.getByRole('button', { name: 'Открыть каталог сетапов' }))
+
+		await waitFor(() => expect(onAuthenticated).toHaveBeenCalledWith(
+			expect.objectContaining({ authenticated: true }),
+			'generation-before-login',
+		))
+		expect(captureAuthGeneration.mock.invocationCallOrder[0]).toBeLessThan(mocks.login.mock.invocationCallOrder[0])
+	})
+
   it('disables the form and prevents a second submission while PAM is pending', async () => {
     const onAuthenticated = vi.fn()
     let resolveLogin!: (value: unknown) => void
