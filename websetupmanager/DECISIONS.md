@@ -3,7 +3,7 @@
 Неоднозначности требований фиксируются здесь до реализации. Решения `D-001`–
 `D-020` сохраняют историю первой managed-library версии. Прямое продуктовое
 решение владельца станка от 2026-08-21 имеет больший приоритет и зафиксировано в
-`D-021`–`D-035` и
+`D-021`–`D-037` и
 [PRODUCT_REQUIREMENTS.ru.md](PRODUCT_REQUIREMENTS.ru.md). Старое решение нельзя
 использовать для восстановления multi-program/validation/dashboard UX вопреки
 новой модели.
@@ -359,6 +359,53 @@ SQLite до ответа 204; provisional remembered login после browser/se
 не принимает просто «другой» token как доказательство свежести. Journal —
 recovery aid, а не credential или server-side session authority.
 
+## D-036: MUI является расширяемой основой стандартных UI-компонентов
+
+Стандартные интерактивные элементы React SPA строятся на exact-pinned
+`@mui/material` 9.3.1 и Emotion 11.14.x. Для React 18.3.1 закреплён
+`react-is` 18.3.1 и npm override, чтобы всё дерево зависимостей использовало
+одну совместимую версию. Импорты идут из конкретных `@mui/material/*` modules,
+а React/MUI/Emotion runtime выделен Vite в отдельный `ui-vendor` chunk.
+
+Корневой `StyledEngineProvider injectFirst`, `CssBaseline` и светлая
+`appTheme` задают login/application shell. Workbench получает вложенную плотную
+тёмную `workbenchTheme`; она также окрашивает portalled Dialog и Snackbar. MUI
+отвечает за Button/IconButton, формы, Dialog, Alert, progress, Tabs, Table,
+Card/Chip и прочие повторяемые controls. Существующие product CSS class names
+пока сохранены как compatibility/layout hooks, поэтому миграция не меняет
+компоновку и может продолжаться по компонентам.
+
+Специализированные primitives не заменяются только ради единообразия: roving
+catalog tree, resize splitter, virtualized G-code rows/search results, canvas
+PDF, sandboxed iframe, скрытые native file inputs, byte-progress и необходимые
+native select/radio остаются собственными/native. Их поведение, производительность
+или browser semantics важнее абстракции UI kit. Compatibility wrapper над MUI
+Dialog сохраняет детерминированные initial/return-focus и application fallback;
+одновременно активен только один focus trap.
+
+Emotion допустим текущей CSP trusted React shell (`style-src 'unsafe-inline'`).
+Это разрешение не переносится в originless Setup Sheet: её hash-only CSP и
+пустой iframe sandbox остаются прежними. При будущем отказе shell от
+`unsafe-inline` Emotion потребуется nonce-aware CacheProvider до ужесточения
+policy.
+
+## D-037: dependency audit debt не маскируется MUI-миграцией
+
+После clean `npm ci` `npm audit` на feature branch и на чистом исходном commit
+до MUI сообщает одинаковые 8 advisories: 2 low, 3 moderate, 2 high и 1
+critical. Ни одна не относится к MUI/Emotion. Vite/Vitest/esbuild advisories
+затрагивают development server/test UI и требуют согласованного major-upgrade
+toolchain; development listeners остаются loopback и Vitest UI не запускается.
+
+Production advisory относится к `pdfjs-dist` 5.6.205. Viewer уже не включает
+XFA/action/annotation layer, загружает без credentials и передаёт
+`isEvalSupported: false`, но это defense-in-depth, а не исправление advisory.
+Исправленная 6.2.108 является major и требует Node >=22.13, тогда как текущий
+repository contract поддерживает Node 18–22. Поэтому MUI-изменение не выполняет
+скрытый toolchain/runtime migration и не объявляет `npm audit` зелёным;
+PDF.js/Node/Vite/Vitest upgrade остаётся отдельной явно записанной security
+работой с viewer regression и target-browser проверкой.
+
 ## Статус исторических решений
 
 | Решение | Статус в catalog-версии |
@@ -368,12 +415,12 @@ recovery aid, а не credential или server-side session authority.
 | `D-003`, `D-004`, `D-011` | заменены `D-021`–`D-023` |
 | `D-009`, `D-010`, `D-012`, `D-013`, `D-016`, `D-020` | частично применимы к новым catalog mutations; legacy workflow не нормативен |
 | `D-018` | backup boundary расширен до `PROGRAM_ROOT`; legacy текст ниже исторический |
-| `D-025`–`D-035` | текущие exact precondition, migration provenance/backfill, HTML credential/render boundary, direct HTTPS, editor containment, focus-return, left-tree/inline-sheet, browser cache, derived-tab и provisional-login quarantine/activation решения |
+| `D-025`–`D-037` | текущие exact precondition, migration provenance/backfill, HTML credential/render boundary, direct HTTPS, editor containment, focus-return, left-tree/inline-sheet, browser cache, derived-tab, provisional-login quarantine/activation, MUI foundation и dependency-audit решения |
 
 ## Исторический журнал D-001–D-020
 
 Текст ниже сохранён без переписывания исходной мотивации. При конфликте
-применяются `D-021`–`D-035`.
+применяются `D-021`–`D-037`.
 
 ## D-001: production baseline
 

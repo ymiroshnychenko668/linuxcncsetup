@@ -21,6 +21,9 @@ baseline в [functional-requirements.ru.md](functional-requirements.ru.md).
 
 - один непривилегированный Go-процесс и embedded SQLite;
 - встроенная production-сборка React/TypeScript, Node.js на станке не нужен;
+- exact-pinned MUI/Emotion component foundation с отдельными светлой shell и
+  плотной тёмной Workbench themes; специализированные tree/virtualized viewer/
+  canvas/sandboxed iframe остаются собственными primitives;
 - scoped `/api/v1/catalog` без универсального `/fs` и без выбора host root;
 - folders и setups с устойчивыми IDs и относительными путями;
 - direct streaming/atomic publish именованных файлов в `PROGRAM_PREFIX`;
@@ -145,6 +148,11 @@ make typecheck
 make vet
 make build
 ```
+
+Frontend dependencies и lockfile закреплены точно. Используйте `npm ci` (его
+также вызывает `make build`), чтобы не получить другое MUI/Emotion/react-is
+дерево. Текущие pre-existing npm advisories и граница отдельного major-upgrade
+зафиксированы в `D-037`; они не появились из-за MUI.
 
 `make build` сначала создаёт Vite bundle, затем выполняет
 `CGO_ENABLED=1 go build -tags "production pam"` и встраивает `web/dist` в

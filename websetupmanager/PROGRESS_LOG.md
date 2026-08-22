@@ -1,6 +1,6 @@
 # Web Setup Manager — progress log
 
-Последнее обновление: 2026-08-22. Ветка: `codex/web-setup-manager`.
+Последнее обновление: 2026-08-22. Ветка: `codex/mui-migration`.
 
 Лог отделяет успешные automated/production-host проверки от оставшейся
 внешней LAN/browser/QtDragon qualification. Статусы требований и точное evidence
@@ -306,6 +306,43 @@ evidence новой catalog-модели. Актуальные требован�
   screenshots Tool Table / Sheet:
   `9ba5d3a313a7fdf024881e375170687128b85f86828f30cff6c04b4181b62a08` /
   `dda443d4edd71573740d70c2214cf9ce5d03ab2d2debc6f5d96aa5c0422a30fd`.
+
+## Этап 18 — MUI component foundation
+
+- Добавлены exact-pinned MUI 9.3.1, Emotion и React 18-compatible
+  `react-is` override; чистый `npm ci` и полное deduplicated dependency tree
+  проверены.
+- `StyledEngineProvider`, `CssBaseline`, светлая application theme и вложенная
+  тёмная Workbench theme теперь задают общую основу для дальнейшего расширения.
+- На MUI переведены обычные buttons/icon buttons, text fields, checkbox,
+  alerts/progress, dialogs, tabs, Tool Table, snackbar, login и retained future
+  setup screens. Product class hooks и domain/API callbacks сохранены.
+- Catalog tree, splitter, virtual G-code, PDF canvas, sandboxed HTML, native
+  file/select/radio и byte-progress намеренно сохранены как специализированные
+  primitives.
+- Устранены найденные при аудите регрессии: двойной dialog focus trap,
+  portalled dark-dialog CSS, invalid PDF page label/double input border,
+  Alert inner layout и raw catalog search. Добавлен regression test на
+  доступное имя поиска, очистку и возврат focus.
+- Frontend gate прошёл: ESLint, TypeScript, 17 files / 198 tests и Vite
+  production build. Bundle разделён на application 137.09 KiB
+  (42.71 KiB gzip), `ui-vendor` 403.96 KiB (126.82 KiB gzip) и lazy PDF
+  453.37 KiB (134.70 KiB gzip), без chunk-size warning.
+- `gofmt` не нашёл файлов, `go mod tidy -diff` пуст; vet без tags и с PAM,
+  test без tags и с PAM, race без tags и с PAM прошли. Production+PAM binary
+  собран с Go 1.26.5/cgo и embedded MUI bundle.
+- Disposable exact-binary runtime вернул `/healthz=200`, `/readyz=200` и
+  прежнюю CSP. Firefox BiDi подтвердил desktop G-code viewport 1042 px, `%` в
+  первой строке, inline Sheet 674 px, единственный status path, CTA contrast
+  6.02:1, mobile drawer/inert/focus trap. Screenshots в
+  `/tmp/wsm-mui-smoke.czWcCI/evidence`; SHA-256 program/sheet/mobile:
+  `4ee4e5ff0181ab93aacf66a7275566efad6daac0c8c6e732b1aacdeb986f405a` /
+  `d96dd3bab04d32da70859a66cfa293c6ab9469d01d822b64cea3d338b8c1aba1` /
+  `f12169f4c2fc133290cb827a7b0fafb01b37e19142ba7e2d34bd85d73cac2a20`.
+- Production host и работающий LinuxCNC этой feature branch не изменялись.
+- `npm audit` до и после MUI идентичен (8 старых advisories); MUI/Emotion в них
+  отсутствуют. Отдельный major PDF.js/Node и Vite/Vitest security upgrade
+  описан в `D-037`, текущая миграция не выдаёт audit за зелёный.
 
 ## Discovery и этап 1 — каркас приложения
 

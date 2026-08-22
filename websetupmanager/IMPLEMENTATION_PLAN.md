@@ -1,6 +1,6 @@
 # Web Setup Manager — implementation plan и матрица покрытия
 
-Последнее обновление: 2026-08-22. Ветка: `codex/web-setup-manager`.
+Последнее обновление: 2026-08-22. Ветка: `codex/mui-migration`.
 Текущий normative source:
 [PRODUCT_REQUIREMENTS.ru.md](PRODUCT_REQUIREMENTS.ru.md).
 
@@ -47,6 +47,7 @@ browser не может выбрать другой каталог хоста.
 | 5. Integrated verification | automated catalog regression и production wiring | full build/test gates и host integrity/hash/readiness/no-execution checks прошли |
 | 6. Deployment | cold backup, verified restore rehearsal, versioned release и direct HTTPS smoke | выполнено; внешний LAN client, DHCP reservation, target performance и ручной QtDragon отмечены отдельно |
 | 7. Browser persistence, derived tabs и viewer/auth hardening | version-bound cache, header index progress, File source, Toolpath/Tool Table, readable strict HTML и provisional-login journal/activation | полный Go/PAM/race/frontend/build gate, production deployment и Firefox PAM/cache/tabs/HTML smoke пройдены |
+| 8. MUI component foundation | themes, standard controls/forms/dialogs/feedback/tabs/table и compatibility styling | реализовано в feature branch; full frontend/Go/PAM/race/build gate и disposable desktop/mobile Firefox smoke прошли |
 
 Подробная безопасная последовательность преобразования данных находится в
 [MIGRATION_PLAN.md](MIGRATION_PLAN.md).
@@ -102,6 +103,29 @@ browser не может выбрать другой каталог хоста.
   subtrees остаются подавлены с depth bound 256; empty-sandbox iframe сохраняет
   hash-only document CSP. `unsafe-inline` относится только к trusted React shell
   с его динамическими layout styles и не переносится в Sheet document.
+
+### MUI component foundation от 2026-08-22
+
+- Exact-pinned MUI 9.3.1 и Emotion 11.14.x стали общей компонентной основой;
+  React 18 совместимость закреплена единым `react-is` 18.3.1 через override.
+- Светлая application theme и вложенная плотная dark Workbench theme покрывают
+  обычные и portalled UI surfaces. Login, reusable Dialog, CRUD/import/lifecycle
+  формы, feedback/loading, tabs, Tool Table и retained future setup components
+  используют MUI без изменения domain/API contracts.
+- Native/custom оставлены только там, где это часть безопасного или
+  performance-критичного контракта: file picker, byte progress, catalog tree,
+  splitter, virtual G-code, PDF canvas и sandboxed HTML iframe.
+- Dialog wrapper сохраняет проверенный focus trap/initial/return fallback;
+  search clear возвращает focus; MUI tabs используют keyboard selection.
+- Vite выделяет React/MUI/Emotion в `ui-vendor`, чтобы основной application
+  chunk не превышал прежний warning threshold. Production host этой feature
+  веткой не изменён.
+- Exact production+PAM binary на disposable roots вернул health/ready 200.
+  Firefox BiDi подтвердил desktop G-code viewport 1042 px, inline Sheet 674 px,
+  mobile drawer/focus trap, один status path и primary CTA contrast 6.02:1.
+- Clean audit feature branch и исходного pre-MUI commit совпадает: 8 старых
+  advisories. MUI их не добавил; major PDF.js/Node и Vite/Vitest upgrades
+  вынесены в отдельное security решение `D-037`, а не названы пройденными.
 
 ## Фактическая production generation
 
@@ -275,12 +299,12 @@ session discovery остаётся guest.
 | Storage security | traversal, reserved tree, symlink/hardlink/special substitution, identity races, no-replace, rollback/recovery | target filesystem spot-check |
 | Upload/recovery | streaming unknown length, prepared publication, journal phases, actual subprocess SIGKILL and same-key retry | target disconnect/power-loss drill |
 | Viewer | single 64 KiB prefix-before-Worker test, sparse 10 GiB bounded Range/ETag/Worker suites, cancellable bounded PDF text; sanitizer tests для source-head/style stripping, app stylesheet/hash, completion suffix, bounded suppression и foreign/self-closing cases; новый local exact-binary Firefox readable inline HTML/CSP visual | controlled malicious-document network observation ещё не записано |
-| Frontend | ESLint/typecheck, 17 files / 197 tests/build; left-tree parent/child, inline Sheet, direct dual/single upload, stable retry, later attach и сквозной keyboard-only flow; local exact-binary desktop/mobile Firefox | дополнительный native-key walkthrough на отдельном managed client |
+| Frontend | Production baseline: ESLint/typecheck, 17 files / 197 tests/build, left-tree parent/child, inline Sheet, direct upload и keyboard-only flow. MUI feature branch: clean install, deduplicated dependency tree, lint/typecheck, 17 files / 198 tests и Vite production build прошли | дополнительный native-key walkthrough на отдельном managed client |
 | Browser cache / derived views | 42 cache tests и полный frontend gate покрывают aligned chunks, upload `File` source, online-first/offline fallback, version/principal separation, oversized no-raw-cache, poisoned analysis, bounded budgets, logout late-write/crash recovery, no-Cache/no-Web-Locks/read-only-LS, progress contract, Tool Table parser, Worker errors и keyboard tabs/line jump; production clean-profile smoke подтвердил exact cache/progress/Toolpath/Tool Table | дополнительный quota/offline drill на отдельном LAN client |
 | No execution | catalog-only route gate, exact target publication/root binding и live LinuxCNC snapshot unchanged | дополнительный ручной visual confirmation в QtDragon |
 | Migration | automated 0/1/N/restart/collision suites плюс live manifest/hash/count/restart verification | legacy cleanup только отдельным будущим решением |
 | Authentication | PAM/session/CSRF/throttle, conditional stale revoke и server-side provisional activation; tests покрывают durable-seal failure, reload recovery, late A vs B, out-of-order exact activation, remembered Store/server restart, proof snapshot/finalize и no-Web-Locks per-key journal; новый production Firefox PAM login/session/logout прошёл, Bearer unset | отдельный forced crash в середине browser continuation |
-| Production | full gates, cold backup, versioned release, exact binary/index hash, migration backup, health/ready и desktop/mobile BiDi cache/tabs/HTML evidence | LAN client, DHCP reservation, target performance, manual QtDragon |
+| Production | Deployed baseline: full gates, cold backup, versioned release, exact binary/index hash, migration backup и desktop/mobile BiDi evidence. MUI branch: exact production+PAM build, disposable health/ready, G-code/inline-Sheet/mobile BiDi smoke прошли; production service не изменялся | LAN client, DHCP reservation, target performance, manual QtDragon |
 
 ## Матрица CAT-P0
 
