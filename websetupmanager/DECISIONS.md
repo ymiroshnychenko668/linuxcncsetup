@@ -3,7 +3,7 @@
 Неоднозначности требований фиксируются здесь до реализации. Решения `D-001`–
 `D-020` сохраняют историю первой managed-library версии. Прямое продуктовое
 решение владельца станка от 2026-08-21 имеет больший приоритет и зафиксировано в
-`D-021`–`D-032` и
+`D-021`–`D-035` и
 [PRODUCT_REQUIREMENTS.ru.md](PRODUCT_REQUIREMENTS.ru.md). Старое решение нельзя
 использовать для восстановления multi-program/validation/dashboard UX вопреки
 новой модели.
@@ -142,6 +142,21 @@ Document CSP сохраняет `default-src 'none'`/`connect-src 'none'` и р�
 переключении файла, unmount или version change. Credential разрешён только
 trusted fetch слою; он не передаётся документу viewer.
 
+Sanitizer не переносит source `<head>`, `<title>` или `<style>`. Вместо них он
+вставляет один application-owned stylesheet для читаемой экранной/печатной
+верстки таблиц, заголовков, изображений и legacy CAM classes; его точный
+SHA-256 разрешён document CSP. Source CSS не может закрыть viewer controls или
+добавить network dependency. Публикация HTML считается успешной только при
+наличии application-owned completion suffix: ошибка чтения/записи и усечённый
+stream не превращаются в допустимый документ. Suppressed active/foreign
+subtrees используют только canonical имена и depth limit 256.
+
+React shell использует вычисляемые `style` attributes для zoom, split width,
+tree indentation и disclosure transforms. Поэтому CSP самого trusted SPA
+содержит `style-src 'unsafe-inline'`; это разрешение не наследуется originless
+Sheet iframe. Sheet сохраняет отдельную hash-only CSP, empty `sandbox` и запрет
+script, network, forms и navigation.
+
 ## D-028: production endpoint — direct HTTPS 443 без listener/redirect на 80
 
 Фактический host использует direct TLS на `10.0.1.136:443` и URL
@@ -234,6 +249,116 @@ destination — в единственной status bar. Primary CTA исполь
 iframe остаётся originless с пустым `sandbox`, а встроенная CSP очищенного
 документа сохраняет `default-src 'none'; connect-src 'none'`.
 
+## D-033: browser G-code cache является origin-private, version-bound и bounded
+
+Просьба «сохранять файл в local storage» трактуется как постоянное
+origin-private browser storage, а не как помещение raw G-code в синхронный
+`window.localStorage`. Raw chunks и derived sparse analysis хранятся в Cache
+Storage; `window.localStorage` содержит только bounded manifest с
+progress/completion, line count и компактной Tool Table. Это расширяет
+исторический `D-013`: содержательный browser cache допустим только в описанных
+здесь границах и не заменяет SQLite, program root или backup.
+
+Cache identity равен principal/library scope + opaque artifact ID + exact file
+version + byte size. Имя файла, relative/absolute path, password, session cookie,
+CSRF, Bearer и storage key в cache не входят. Для не только что загруженного
+файла preview сначала проверяет первый 64-КиБ prefix из сети с exact
+`If-Match`/ETag; только network failure разрешает fallback на полностью
+сохранённую точную версию и отмечает её как offline. После успешного upload и
+получения server version/size Worker использует исходный immutable browser
+`File`, строит analysis и наполняет cache без повторного download. Для
+существующего или загруженного другим способом файла тот же Worker читает
+version-bound Range. Разные версии никогда не смешиваются и могут временно
+сосуществовать; их удаляют общий bounded LRU/TTL либо logout, поэтому старый
+mount не способен удалить cache более новой версии.
+
+Raw payload сохраняется только для файла размером не более 32 MiB, полными
+выровненными chunks по 1 MiB. Общий raw budget Cache Storage равен 128 MiB;
+старейшие целые file/version groups вытесняются первыми. Raw и analysis имеют
+TTL 30 суток; browser quota policy может удалить их раньше. Analysis cache
+ограничен 48 records и 4 MiB JSON на record, local manifest — 24 records. Для
+большого G-code может сохраняться bounded derived analysis в пределах его
+лимита, но не полная raw-копия; runtime preview по-прежнему держит максимум
+восемь блоков примерно по 1 MiB.
+
+Cache API/private mode/quota failure являются best-effort degradation и не
+делают проверенный online preview ошибочным. HTTP response сохраняет
+`private, no-store`: явная запись trusted SPA в origin-private Cache Storage не
+делает содержимое пригодным для shared/public cache и не ослабляет
+`SEC-NET-008`. Перед logout scope синхронно блокируется и получает новый epoch,
+block распространяется через `BroadcastChannel` и сохраняется durable marker в
+Cache Storage/localStorage; mutations сериализуются origin-wide Web Lock там,
+где он доступен. Успешный logout выполняет двухпроходную best-effort очистку
+Cache Storage и manifest, включая позднюю конкурентную запись. Если browser
+закрылся посередине, следующий login того же scope сначала возобновляет cleanup
+по marker и только затем разрешает cache. При неуспешном logout cleanup также
+безопасен, после чего scope снова разрешается, поскольку session остаётся
+активной.
+
+## D-034: Toolpath остаётся placeholder, Tool Table является lexical summary
+
+Прямая корректировка владельца возвращает progress индексации в editor header
+и добавляет две вкладки вокруг выбранной программы. Toolpath намеренно пуст:
+он не строит траекторию, не интерпретирует G-code и не обращается к LinuxCNC.
+Tool Table — read-only derived view, а не системный LinuxCNC `TOOL_TABLE`, не
+проверка оснастки и не основание для запуска обработки.
+
+Один UTF-8 Worker-проход одновременно строит sparse line index и lexical Tool
+Table. Он учитывает LinuxCNC whitespace rules и только статические
+целочисленные слова `T0`–`T999999999` вне `;` и parenthesis comments,
+игнорирует expressions, named parameters и O-word labels. Последнее статическое
+`T` задаёт pending tool, а последнее динамическое/нецелое `T` сбрасывает его как
+неизвестный. Наличие `M6`/`M06` связывается с известным последним `T` этой
+строки; иначе известный pending `T` переносится к следующему `M6`. Таблица показывает первую
+физическую строку, число упоминаний `T` и связанных смен; переход по строке
+возвращает focus во вкладку программы. Это намеренно ограниченная лексическая
+эвристика, а не LinuxCNC parser.
+
+Хранятся не более 1024 уникальных tools; строка длиннее 65 536 client string
+units пропускается именно для extraction, чтобы не нарушать memory bound, и UI
+показывает truncated warning. Invalid UTF-8, Worker construction/runtime error
+и version conflict имеют terminal error state с retry/open-program action, а
+100% byte progress отдельно от terminal completion показывается как
+«Финализация…». Header не дублируется внутри compact preview. Roving keyboard
+tabs включают Program → Toolpath → Tool Table → optional Sheet.
+
+## D-035: незавершённый explicit login остаётся в digest-only quarantine
+
+Explicit PAM login может завершиться после logout, другого login или отмены
+React continuation. Обычный `/auth/logout` не подходит для такого ответа:
+запоздавший `Set-Cookie` способен очистить уже более новую browser session.
+Backend поэтому имеет узкий `POST /api/v1/auth/revoke-stale`: он отзывает только
+session, одновременно совпавшую по HttpOnly cookie и CSRF ожидаемой
+continuation, и никогда не изменяет browser cookie в response.
+
+Frontend до запроса capabilities и до разрешения G-code cache помещает новую
+explicit session в bounded quarantine. В persistent browser storage попадает
+только SHA-256 fingerprint CSRF либо fail-closed `unknown`, но не raw CSRF,
+password или cookie. Cache Storage и независимые per-fingerprint localStorage
+keys образуют bounded journal до 32 markers; add/remove конкретного fingerprint
+коммутативны даже без Web Locks, а при наличии Web Locks snapshot/finalize
+сериализуются origin-wide. Proof выдаётся только после подтверждённой durable
+записи exact fingerprint. Если durable seal невозможен, workspace не
+	монтируется, а session условно отзывается.
+
+Ответ login создаёт на Backend только provisional `Session.Activated=false`.
+После durable proof Frontend вызывает узкий `POST /api/v1/auth/activate` с exact
+HttpOnly cookie и CSRF этой же continuation. Store атомарно переводит только
+совпавшую session в activated state; endpoint не отправляет `Set-Cookie`,
+поэтому запоздавший ответ A не способен повредить cookie/session B. До этого
+`/auth/session` возвращает guest, а protected API — 401. Migration
+`005_auth_session_activation.sql` сохраняет activation remembered session в
+SQLite до ответа 204; provisional remembered login после browser/server crash
+не становится аутентифицированным сам по себе.
+
+После успешного capabilities/cache-generation continuation finalize удаляет
+только snapshot и собственный fingerprint; marker более поздней session B не
+стирается поздним завершением A. Успешный conditional revoke/401 также удаляет
+только ожидаемый fingerprint. Не подтверждённый revoke оставляет journal;
+следующий session probe при любом marker fail-closed повторяет exact revoke и
+не принимает просто «другой» token как доказательство свежести. Journal —
+recovery aid, а не credential или server-side session authority.
+
 ## Статус исторических решений
 
 | Решение | Статус в catalog-версии |
@@ -243,12 +368,12 @@ iframe остаётся originless с пустым `sandbox`, а встроен�
 | `D-003`, `D-004`, `D-011` | заменены `D-021`–`D-023` |
 | `D-009`, `D-010`, `D-012`, `D-013`, `D-016`, `D-020` | частично применимы к новым catalog mutations; legacy workflow не нормативен |
 | `D-018` | backup boundary расширен до `PROGRAM_ROOT`; legacy текст ниже исторический |
-| `D-025`–`D-032` | текущие exact precondition, migration provenance/backfill, HTML credential boundary, direct HTTPS, editor containment, focus-return и left-tree/inline-sheet решения |
+| `D-025`–`D-035` | текущие exact precondition, migration provenance/backfill, HTML credential/render boundary, direct HTTPS, editor containment, focus-return, left-tree/inline-sheet, browser cache, derived-tab и provisional-login quarantine/activation решения |
 
 ## Исторический журнал D-001–D-020
 
 Текст ниже сохранён без переписывания исходной мотивации. При конфликте
-применяются `D-021`–`D-032`.
+применяются `D-021`–`D-035`.
 
 ## D-001: production baseline
 

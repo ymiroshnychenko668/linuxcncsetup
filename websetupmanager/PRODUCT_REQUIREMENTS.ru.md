@@ -25,9 +25,10 @@ Web Setup Manager — компактный каталог и инструмен�
 5. отсутствие действий, управляющих LinuxCNC.
 
 Не входят в текущий P0: validation/readiness workflow, проверка корректности
-G-code или траектории, `current setup`, toolpath rendering, редактирование
-tool table, запуск/загрузка программы в LinuxCNC, произвольный доступ ко всей
-файловой системе и универсальный файловый API.
+G-code или траектории, `current setup`, полноценный toolpath rendering,
+редактирование или сверка системного LinuxCNC tool table, запуск/загрузка
+программы в LinuxCNC, произвольный доступ ко всей файловой системе и
+универсальный файловый API.
 
 ## 2. Фактическая интеграция со станком
 
@@ -113,10 +114,33 @@ WEB_SETUP_MANAGER_PROGRAM_ROOT_DISPLAY=~/linuxcnc/nc_files
 | `CAT-P0-022` | `/healthz` проверяет процесс; `/readyz` — SQLite, state/staging и удерживаемый `PROGRAM_ROOT`, включая совпадение с активным INI. |
 | `CAT-P0-023` | Backup/restore включает SQLite state, legacy library до завершения миграции и весь `PROGRAM_ROOT` как одну согласованную generation. |
 | `CAT-P0-024` | Существующие пользовательские данные и legacy managed objects не удаляются автоматически; миграция формирует проверяемый manifest и использует no-replace публикацию. |
+| `CAT-P0-025` | Browser сохраняет небольшой version-bound G-code в ограниченном origin-private cache, разделённом по principal/library/artifact/version/size. Ошибка, отсутствие API или quota cache не ломают online preview; успешный logout блокирует новые записи и очищает пользовательский scope. |
+| `CAT-P0-026` | Фактический прогресс фоновой индексации 0–100% находится в header редактора. Bounded browser-local manifest сохраняет completion, line count и Tool Table точной версии без credentials или физических путей; после reload новый Worker-проход не выдаёт сохранённый частичный процент за подтверждённый текущий прогресс. |
+| `CAT-P0-027` | Editor имеет keyboard-доступные вкладки Toolpath и Tool Table. Toolpath является намеренно пустым placeholder; read-only Tool Table строится тем же потоковым client Worker-проходом из только что загруженного `File` либо version-bound Range и может восстанавливаться из результата точной версии. Вкладки не читают и не меняют системный LinuxCNC `TOOL_TABLE`. |
 
 Проверка имени/расширения, размера, regular-file identity и безопасного пути —
 это security/integrity checks, а не проверка готовности сетапа или корректности
 обработки. Backend не интерпретирует G-code как доказательство его безопасности.
+
+### 4.1. Фиксированные границы browser cache и derived analysis
+
+- Raw bytes сохраняются только для G-code размером не более 32 MiB, полными
+  выровненными chunks по 1 MiB; общий raw budget origin cache равен 128 MiB.
+- Raw chunks и analysis имеют TTL 30 суток и могут быть удалены browser quota
+  policy раньше. Eviction удаляет старейшие version-bound raw-file groups, не
+  смешивая части файлов.
+- Cache Storage хранит raw chunks и не более 48 analysis records; один
+  сериализованный analysis ограничен 4 MiB. `window.localStorage` хранит только
+  не более 24 manifest records с progress/completion/line count/Tool Table, а
+  не bytes G-code.
+- Sparse index ограничен 100 000 рабочими entries; сохранённая структура
+  принимает максимум 100 001 entries. Tool Table содержит максимум 1024
+  уникальных статических целочисленных `T` в диапазоне 0–999 999 999; строка
+  длиннее 65 536 client string units не удерживается ради extraction и даёт
+  явный truncated result.
+- Cache identity содержит только application scope, opaque artifact ID,
+  version и byte size. Password, cookie, CSRF, absolute path и storage key туда
+  не попадают. HTTP content по-прежнему не разрешён shared/public cache.
 
 ## 5. API-границы
 
@@ -150,10 +174,15 @@ WEB_SETUP_MANAGER_PROGRAM_ROOT_DISPLAY=~/linuxcnc/nc_files
 | `CAT-AC-10` | Внешнее изменение между preview/replace и commit вызывает version conflict; существующие bytes не перезаписываются. |
 | `CAT-AC-11` | Полный keyboard-only flow login → left tree/program/sheet → native file picker upload/attach → preview/search → logout имеет корректный порядок focus и возврат focus. |
 | `CAT-AC-12` | Production build, Go unit/integration/race/vet, frontend lint/typecheck/tests, path-security suite, local health/ready и реальный PAM smoke проходят для новой catalog-модели. |
+| `CAT-AC-13` | После индексации программы до 32 MiB повторное открытие той же версии использует сохранённые chunks/index/Tool Table после online ETag validation; другая версия/principal не получает эти данные. Полностью cached exact version доступна при network failure только с явной offline-пометкой, а успешный logout очищает scope, включая конкурентную позднюю запись. |
+| `CAT-AC-14` | Header показывает фактический прогресс индексации 0–100% и completion без второго индикатора внутри compact preview; после reload cached analysis завершается отдельным подтверждённым Worker result, а сохранённый незавершённый процент не показывается как текущий. |
+| `CAT-AC-15` | Клавиатура проходит Program → Toolpath → Tool Table → optional Sheet; Toolpath не запускает вычисление/станок, а Tool Table игнорирует комментарии и динамические T, показывает статические целочисленные T, первую физическую строку, упоминания и связанные M6 с переходом к строке. |
 
 ## 7. Открытые последующие направления
 
-Toolpath renderer, tool table и другие станочные функции могут появиться позже
-как отдельные модули вокруг выбранной программы. Они не должны менять P0-факт:
+Полноценный Toolpath renderer, редактирование/сверка системного tool table и
+другие станочные функции могут появиться позже как отдельные модули вокруг
+выбранной программы. Текущие placeholder и read-only lexical Tool Table не
+интерпретируют фактическое состояние станка. Они не должны менять P0-факт:
 каталог только публикует и показывает файлы; выполнение остаётся явным действием
 оператора в LinuxCNC.

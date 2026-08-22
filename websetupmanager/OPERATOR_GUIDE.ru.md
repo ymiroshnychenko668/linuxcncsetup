@@ -18,6 +18,11 @@ preview-search/line-jump/logout. Отдельный LAN client, DHCP reservation
 controlled target performance и ручной visual QtDragon walkthrough ниже
 оставлены дополнительными проверками.
 
+Browser cache/derived tabs, улучшенная HTML-верстка и stale-login recovery из
+текущей development branch ещё не входят в указанную release generation. Их
+targeted automation описана ниже, но production behavior следует считать
+неизменившимся до полного gate, нового browser smoke и deployment record.
+
 ## 1. Каталог и безопасный рабочий цикл
 
 Setup содержит не более одной G-code-программы и не более одной PDF/HTML Setup
@@ -53,9 +58,13 @@ QtDragon:       User → <каталог> → <программа>.ngc
    вручную.
 5. Справа просматривайте выбранную программу с номерами строк, переходом и
    literal-поиском. Один version-bound prefix до 64 КиБ показывает начало до
-   фонового Worker index; дальнейшее чтение остаётся bounded Range/ETag.
-   Дочерняя Setup Sheet открывается inline в той же editor surface как canvas
-   PDF либо очищенный HTML в sandbox, не во всплывающем окне.
+   фонового Worker index; его фактический progress виден в editor header, а
+   дальнейшее чтение остаётся bounded Range/ETag. Вкладка Toolpath пока является
+   пустым placeholder. Tool Table показывает bounded lexical summary
+   статических `T` и связанных `M6` и умеет вернуться к первой строке
+   инструмента, но не заменяет проверку системного tool table. Дочерняя Setup
+   Sheet открывается inline в той же editor surface как canvas PDF либо
+   очищенный HTML в sandbox, не во всплывающем окне.
 6. При version/revision conflict сначала обновите tree/viewer и сравните
    актуальный файл. Приложение не перезаписывает внешнее изменение молча.
 7. Удаление/перемещение catalog entity меняет именованный файл/каталог только
@@ -72,6 +81,77 @@ create — ровно `If-None-Match: *`, replace/delete — ровно
 `If-Match: "<version>"` из актуального catalog DTO. Одновременно обязательны
 `expectedRevision`, `Idempotency-Key`, CSRF и session/Bearer authentication; не
 подставляйте filename/path вместо opaque Setup ID.
+
+### Browser cache, индекс и derived вкладки
+
+После успешного upload программа сначала атомарно публикуется Backend. Затем
+выбранный immutable browser `File` передаётся Web Worker: он строит sparse line
+index и Tool Table и, если размер допускает, сохраняет полные chunks без
+повторного download. Если файл уже существовал, был добавлен другим browser или
+внешним процессом, Worker получает его exact-version Range blocks от Backend.
+Первый viewport остаётся приоритетнее полного анализа.
+
+Editor header показывает реальный progress текущего Worker-прохода от 0 до
+100%. Прочитанные 100% bytes ещё не означают terminal result: короткое состояние
+«Финализация…» отделяет завершение decode/index/Tool Table. После reload UI не
+показывает незавершённый сохранённый процент как текущий; готовый analysis
+принимается только после отдельного version-bound Worker result. Invalid UTF-8,
+Worker failure и version conflict показывают конечную ошибку и retry, а не
+бесконечный spinner.
+
+Browser storage имеет следующие фиксированные границы:
+
+- raw bytes сохраняются в origin-private Cache Storage только для одного G-code
+  размером до 32 MiB, полными chunks по 1 MiB; общий raw budget приложения —
+  128 MiB;
+- raw chunks и analysis имеют TTL 30 суток, но browser quota policy может
+  удалить их раньше; это cache, а не backup;
+- сохраняется не более 48 analysis records, каждый JSON не более 4 MiB;
+  `window.localStorage` содержит не raw G-code, а максимум 24 manifest records
+  с version-bound progress/completion, line count и Tool Table;
+- большой файл не получает полную persistent raw-копию; preview продолжает
+  читать Range и держит в памяти не более восьми блоков примерно по 1 MiB;
+- Tool Table ограничена 1024 уникальными статическими целочисленными tools
+  `T0`–`T999999999`; строка длиннее 65 536 client string units пропускается для
+  extraction и даёт явное предупреждение об усечении.
+
+Отдельно от этих 24 preview records browser может хранить до 32 digest-only
+auth/cache recovery markers. Они не содержат raw CSRF, cookie или password и
+нужны только для fail-closed cleanup/revoke после race либо reload.
+
+Cached identity включает principal/library scope, opaque artifact ID, exact
+version и byte size. Поэтому другая версия или учётная запись не получает
+старые chunks. При обычном повторном открытии первый prefix проверяется online
+через exact ETag; полностью сохранённая точная версия используется при network
+failure с заметной offline-пометкой. Не считайте offline copy подтверждением
+того, что файл на станке не менялся.
+
+Успешная кнопка «Выйти» сначала блокирует новые writes этого scope во всех
+доступных вкладках, затем очищает его Cache Storage и localStorage manifest.
+Если logout не удался и session осталась активной, scope снова разрешается.
+Password, session cookie, CSRF, Bearer, absolute path и storage key в cache не
+записываются, но сам cached G-code остаётся производственными данными. В local
+loopback mode отдельной login/logout session нет; на общем компьютере очистите
+данные сайта штатной функцией browser profile. Такая очистка удаляет только
+browser cache/настройки и не удаляет файл из LinuxCNC `PROGRAM_PREFIX`.
+
+Toolpath ничего не вычисляет и не обращается к LinuxCNC. Tool Table — только
+read-only lexical подсказка: комментарии `;`/`(...)`, expressions, named
+parameters и O-word labels исключаются; пробелы трактуются по правилам
+LinuxCNC. Последнее динамическое или нецелое `T` сбрасывает неизвестный pending
+tool. `M6`/`M06` относится только к последнему известному статическому `T` этой
+строки либо к известному `T`, перенесённому с предыдущей строки. Таблица не знает фактическую геометрию, offsets,
+износ/наличие инструмента или состояние spindle. Перед обработкой обязательно
+сверьте штатный LinuxCNC tool table и станок.
+
+HTML Setup Sheet получает нейтральную application-owned экранную/печатную
+верстку для таблиц, заголовков и изображений. Исходные `<head>`, `<title>` и
+`<style>` намеренно не сохраняются: внешний вид может отличаться от исходного,
+зато документ не может перекрыть controls viewer или загрузить CSS/шрифты из
+сети. Script, forms, navigation, iframe/object/SVG/MathML active subtrees и event
+handlers удаляются; Sheet остаётся в iframe с пустым `sandbox` и отдельной
+hash-only CSP. Не ослабляйте эти ограничения ради точного воспроизведения
+небезопасного source HTML; для критичной фирменной верстки используйте PDF.
 
 ## 2. Установка
 
@@ -315,6 +395,25 @@ deployment scope; password и raw cookie token не сохраняются. Logo
 индивидуальный session CSRF token. Local loopback mode остаётся implicit и
 использует startup CSRF без login.
 
+Remote UI не монтирует workspace сразу после ответа login. Сначала browser
+записывает bounded digest-only quarantine marker, затем точный cookie+CSRF
+активирует provisional server session через `POST /api/v1/auth/activate`,
+получает capabilities и подтверждает cache generation; только затем exact
+marker финализируется. Activation endpoint не меняет cookie, а remembered
+activation записывается в SQLite. Поэтому закрытие browser/server сразу после
+login не превращает незавершённую session в аутентифицированную после restart.
+Если Cache Storage и localStorage недоступны либо continuation стала stale, UI
+условно отзывает только эту session и возвращается к форме входа. Сообщение
+«Браузер не смог надёжно защитить новую сессию» означает fail-closed browser
+storage condition, а не неверный PAM password: разрешите origin-private site
+storage либо используйте управляемый browser profile и повторите вход.
+
+При crash/reload после не подтверждённого revoke hash-only marker заставляет
+следующий session probe повторить exact revocation. Journal ограничен 32
+markers и не содержит raw CSRF/cookie/password. Не очищайте отдельные journal
+keys вручную, чтобы «починить» вход: штатная очистка всех site data допустима
+только как осознанный сброс browser cache/session на этом client.
+
 HTTP Basic не поддерживается и browser password prompt не используется. Для
 неинтерактивной automation можно отдельно задать случайный
 `WEB_SETUP_MANAGER_REMOTE_AUTH_TOKEN` длиной минимум 32 символа и отправлять
@@ -371,6 +470,8 @@ curl --fail --silent http://127.0.0.1:8080/readyz
 SQLite online backup используется самим migration layer перед необратимой
 миграцией, но отдельного публичного operator CLI для online full-library backup
 нет; поэтому hot copy не документируется как согласованная процедура.
+Origin-private browser cache не входит в cold generation и не используется для
+восстановления: он может быть очищен без изменения catalog/program files.
 State backup содержит hash-only remembered-session rows. Защищайте его как
 authentication state: password/raw cookie там нет, но matching browser token и
 тот же deployment scope могут восстановить session после cold restore.
@@ -494,11 +595,13 @@ program root; частичный откат одной SQLite или тольк�
 | remote startup сообщает `AUTHENTICATION_UNAVAILABLE` | проверить PAM production build/libpam, `/etc/pam.d/websetupmanager` и account status; не включать обход login |
 | startup сообщает account mismatch | сделать `User=`/`Group=` unit равными `ALLOWED_USER`; не запускать от root или другого account |
 | login отклонён/ограничен | проверить точное имя `ALLOWED_USER`, Linux password/account policy, HTTPS Origin и дождаться throttle window; не логировать password |
+| UI сообщает, что browser не смог защитить новую session | проверить, что site storage/Cache Storage разрешены и не исчерпана quota; повторить вход в управляемом profile; не отключать conditional revoke и не переносить CSRF в обычное storage |
+| после crash login снова возвращается к форме | дождаться exact stale-session revoke и повторить вход; при повторении собрать status/request ID без cookie/CSRF/password и проверить browser storage/PAM logs |
 | startup сообщает второй процесс | найти владельца unit/lock; не удалять lock при живом процессе |
 | upload/download завис | проверить network/disk; отменить request/job; sliding I/O idle timeout завершит stall/slow client |
 | `INSUFFICIENT_STORAGE` | освободить место вне `PROGRAM_ROOT`/state или расширить FS; повторить operation |
 | program/sheet показывает conflict | обновить tree/viewer, сравнить relative path/version и только затем явно replace |
-| HTML upload вернул `INVALID_CONTENT` | проверить standalone UTF-8 HTML; разбить text/attribute token >1 MiB на bounded elements; не отключать sanitizer |
+| HTML upload вернул `INVALID_CONTENT` | проверить standalone UTF-8 HTML, завершённый stream и bounded nesting; разбить text/attribute token >1 MiB на bounded elements; не отключать sanitizer |
 | revision conflict | обновить tree/setup, проверить новое имя/место/состав, повторить сохранённый ввод |
 | corrupt/migration checksum | остановить, сохранить roots, восстановить matching backup; не пересоздавать DB |
 | после crash job имеет `PROCESS_INTERRUPTED`/`conflict` | сверить setup revision, terminal job и audit; повторить с новым key только незавершённую operation; при сомнении остановить сервис и restore backup |

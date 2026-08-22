@@ -1,6 +1,6 @@
 # Web Setup Manager — progress log
 
-Последнее обновление: 2026-08-21. Ветка: `codex/web-setup-manager`.
+Последнее обновление: 2026-08-22. Ветка: `codex/web-setup-manager`.
 
 Лог отделяет успешные automated/production-host проверки от оставшейся
 внешней LAN/browser/QtDragon qualification. Статусы требований и точное evidence
@@ -238,6 +238,58 @@ evidence новой catalog-модели. Актуальные требован�
   `/tmp/wsm-production-auth-refinement.OfbZwm`; authenticated desktop/mobile
   SHA-256 `ec322875a2a8aceadd719cd61623ac76a6b71010949f9c91066c75d7edf6310b` /
   `854acd9fe3036114e2b280cbd8f7cb64b99b584be0818d98a208484ee7ccbc0d`.
+
+## Этап 17 — persistent preview, derived tabs, HTML readability и auth races
+
+- Добавлен version-bound origin-private G-code cache. Cache Storage хранит
+  только допустимые complete raw chunks и bounded analysis; localStorage —
+  bounded manifest без raw G-code. Cache identity включает principal/library,
+  opaque artifact ID, exact version и size. Upload pipeline передаёт исходный
+  immutable browser `File` Worker-у без повторного download; остальные файлы
+  индексируются тем же exact-version Range pipeline.
+- Progress текущего Worker-прохода возвращён в единственный editor header.
+  Состояние 100% прочитанных bytes отделено от terminal result через
+  «Финализация…»; stale partial manifest не выдаётся после reload как текущий
+  progress. Добавлены пустая Toolpath и read-only bounded lexical Tool Table с
+  keyboard tabs и возвратом к первой строке инструмента.
+- Logout cache scope получил cross-tab block/generation, durable pending journal
+  и exact cleanup fences. Persistent reads/writes fail-closed без подтверждённой
+  origin-wide mutation coordination; network/File preview остаётся доступным
+  при отказе browser cache. Offline fallback требует полную exact raw copy, а
+  analysis/cache records ограничены по count, size, TTL и total raw budget.
+- HTML sanitizer теперь отбрасывает source head/title/style и вставляет
+  application-owned readable/print stylesheet с CSP hash. Completion suffix не
+  позволяет публиковать усечённый/ошибочный stream; suppression stack хранит
+  только canonical tag names, ограничен глубиной 256 и учитывает
+  self-closing SVG/MathML/template parsing cases. Trusted React shell разрешает
+  собственные dynamic inline layout styles; originless empty-sandbox Sheet
+  сохраняет отдельную hash-only CSP без script/network/forms/navigation.
+- Для stale explicit-login continuation добавлен conditional backend revoke,
+  который удаляет только exact cookie+CSRF session и не меняет browser cookie.
+  Frontend до capabilities/cache allow требует durable SHA-256 quarantine proof;
+  finalize удаляет только proof snapshot/own marker. Per-fingerprint Cache/
+  localStorage journal сохраняет более поздний marker B при позднем завершении
+  A и fail-closed повторяет revoke после reload. Raw CSRF/cookie/password не
+  сохраняются.
+- Login теперь создаёт server-side provisional session. Только после durable
+  browser proof exact `POST /api/v1/auth/activate` атомарно выставляет
+  `Session.Activated`; endpoint не отправляет `Set-Cookie`. Migration 005
+  сохраняет activation remembered session, а provisional login после crash или
+  restart остаётся гостевым. Regression tests покрывают stale A с cookie B и
+  restart Store/Server без browser-global companion-cookie race.
+- Полный локальный gate пройден: gofmt/vet, untagged и PAM Go suites,
+  `go test -race -tags pam ./...`, frontend ESLint/typecheck, 17 files / 197
+  tests, Vite и embedded production binary build. Отдельный cache suite —
+  42/42; командный security review не оставил подтверждённых P0/P1.
+- Exact production binary прошёл локальный runtime smoke (`healthz`/`readyz`,
+  embedded CSP/assets, catalog/API, `/fs` 404, graceful shutdown) и Firefox
+  BiDi visual: program editor `1042 px`, inline sanitized HTML `674 px`, mobile
+  drawer/focus trap. Screenshot SHA-256 program/sheet/mobile:
+  `0126dd6208840d1ad1ef1ac83d722659391b66f0e962bc37d4fa4b61ef49712e`,
+  `6c399ea749a0b2c50c3c399a0e3a18c24caf787d52bf2767b1a77f430b087433`,
+  `2cf54a99ca2d8abf64429ad22efdd8f5d1cc0058dc309a6a3fc0a0fd922359df`.
+  Production deployment/PAM smoke нового binary на момент этой строки ещё не
+  заявлены.
 
 ## Discovery и этап 1 — каркас приложения
 

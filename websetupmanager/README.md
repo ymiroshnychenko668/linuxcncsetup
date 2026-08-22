@@ -31,11 +31,51 @@ baseline в [functional-requirements.ru.md](functional-requirements.ru.md).
   из имени G-code, многошагового create popup нет;
 - первый version-bound prefix G-code ограничен 64 КиБ и показывается до запуска
   Worker index; последующая навигация/поиск используют bounded Range blocks;
-- Web Worker индекс/поиск G-code, PDF.js и sandboxed sanitized HTML viewer;
+- index progress находится в editor header; Web Worker одним bounded проходом
+  строит sparse line index, поиск и read-only lexical Tool Table;
+- editor содержит намеренно пустую вкладку Toolpath и keyboard-доступную Tool
+  Table; они не читают LinuxCNC `TOOL_TABLE`, не строят траекторию и не
+  управляют станком;
+- version-bound origin-private browser cache: Cache Storage для допустимых raw
+  chunks/analysis и `window.localStorage` только для bounded manifest и
+  digest-only auth/cache recovery markers;
+- PDF.js и sandboxed sanitized HTML viewer; source CSS/title/head удаляются,
+  вместо них Backend добавляет application-owned readable/print stylesheet с
+  hash-only document CSP и terminal completion marker;
 - revision/version conflicts, audit, idempotency и recovery собственных temp;
 - в remote mode — Linux PAM login, защищённые browser sessions, logout,
   «Запомнить меня», per-session CSRF и ограничение попыток входа; встроенного
   логина или пароля нет.
+
+Raw browser cache принимает G-code размером не более 32 MiB, полными chunks по
+1 MiB; общий budget равен 128 MiB, TTL raw/analysis — 30 суток. Cache Storage
+удерживает до 48 analysis records размером не более 4 MiB каждый, localStorage
+— до 24 manifest records. Browser может evict данные раньше из-за quota;
+cache/private-mode failure не ломает online preview. Большой G-code не получает
+полную persistent raw-копию и продолжает читаться ограниченными Range blocks.
+Успешный remote logout блокирует новые cache writes и очищает scope текущего
+principal/library, включая позднюю запись из другой вкладки. Password, cookie,
+CSRF, Bearer, absolute path и storage key в этом cache не сохраняются.
+Durable marker заставляет повторный login того же scope сначала завершить
+прерванную browser cleanup после crash/reload.
+
+Explicit-login continuation отдельно защищена от гонок login/logout. До
+capabilities и разрешения cache новая session должна получить durable
+SHA-256-only quarantine proof; если browser не смог записать его ни в Cache
+Storage, ни в per-fingerprint localStorage key, workspace не открывается и
+session условно отзывается. После proof точный cookie+CSRF активирует на Backend
+только эту provisional session через `/api/v1/auth/activate`; endpoint не
+меняет browser cookie, а remembered activation сохраняется в SQLite. До
+активации session discovery остаётся гостевым, поэтому crash после login не
+восстанавливает незавершённый вход. После успешной continuation удаляются только её
+snapshot/own markers: поздний результат A не стирает более новую B. Raw CSRF,
+password и cookie в journal не записываются. Backend conditional revoke не
+отправляет `Set-Cookie`, поэтому stale response не очищает свежую session.
+
+Изменения browser cache/derived tabs, HTML readability и stale-login recovery
+находятся в текущей development branch. Для них добавлены targeted tests, но
+они не входят в указанную ниже production generation 2026-08-21, пока не
+пройдут полный gate, browser smoke и отдельный deployment.
 
 На целевом host root равен `/home/user/linuxcnc/nc_files`, а active INI —
 `/home/user/linuxcnc/configs/corvuscnc/g540.ini`. Сервис обязан проверить их

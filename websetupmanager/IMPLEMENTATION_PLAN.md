@@ -1,6 +1,6 @@
 # Web Setup Manager — implementation plan и матрица покрытия
 
-Последнее обновление: 2026-08-21. Ветка: `codex/web-setup-manager`.
+Последнее обновление: 2026-08-22. Ветка: `codex/web-setup-manager`.
 Текущий normative source:
 [PRODUCT_REQUIREMENTS.ru.md](PRODUCT_REQUIREMENTS.ru.md).
 
@@ -15,18 +15,19 @@ LinuxCNC catalog: один Setup имеет не более одной прог�
 
 ```text
 ┌──────────────────────────── React SPA ─────────────────────────────┐
-│  catalog file tree (слева) │ G-code / inline Setup Sheet (справа) │
+│ catalog tree │ G-code / Sheet / Toolpath / Tool Table editor      │
+│              └─ Worker index + bounded origin-private G-code cache │
 └──────────────────── same-origin /api/v1/catalog ───────────────────┘
-                               │
-                     PAM session + CSRF
-                               │
-                         Go catalog API
-                 ┌─────────────┴─────────────┐
-                 │                           │
-       SQLite IDs/revisions/audit     held PROGRAM_ROOT FD
-                                      named program/sheet files
-                                                │
-                                  LinuxCNC PROGRAM_PREFIX / QtDragon
+              │                                │
+   Cache Storage chunks/analysis     PAM session + CSRF
+   localStorage bounded manifest               │
+                                          Go catalog API
+                               ┌───────────────┴───────────────┐
+                               │                               │
+                     SQLite IDs/revisions/audit         held PROGRAM_ROOT FD
+                                                        named program/sheet files
+                                                                  │
+                                                    LinuxCNC PROGRAM_PREFIX / QtDragon
 ```
 
 Backend не имеет endpoint исполнения и не обращается к LinuxCNC NML. Он только
@@ -45,6 +46,7 @@ browser не может выбрать другой каталог хоста.
 | 4. Legacy migration | 0/1/N split, sheet fan-out, provenance, manifest и no-replace publication | выполнено на host; schema v4, 2 completed mappings и 4 copied manifests, restart idempotent |
 | 5. Integrated verification | automated catalog regression и production wiring | full build/test gates и host integrity/hash/readiness/no-execution checks прошли |
 | 6. Deployment | cold backup, verified restore rehearsal, versioned release и direct HTTPS smoke | выполнено; внешний LAN client, DHCP reservation, target performance и ручной QtDragon отмечены отдельно |
+| 7. Browser persistence, derived tabs и viewer/auth hardening | version-bound cache, header index progress, File source, Toolpath/Tool Table, readable strict HTML и provisional-login journal/activation | полный Go/PAM/race/frontend/build gate и локальный exact-binary Firefox visual пройдены; production deployment/PAM smoke ещё не записаны |
 
 Подробная безопасная последовательность преобразования данных находится в
 [MIGRATION_PLAN.md](MIGRATION_PLAN.md).
@@ -68,6 +70,38 @@ browser не может выбрать другой каталог хоста.
   по-прежнему запрещает script/network/forms/navigation.
 - Исторический sheet-only/empty Setup не скрывается и может быть восстановлен
   добавлением G-code; новый UI такие записи не создаёт.
+
+### Browser cache и derived views от 2026-08-22
+
+- После успешного program upload выбранный immutable browser `File` передаётся
+  Worker: sparse index, Tool Table и допустимые raw chunks строятся без
+  повторного download. Для существующего или внешне добавленного файла тот же
+  pipeline использует exact-version Range.
+- Cache Storage сохраняет raw G-code только до 32 MiB на файл блоками по 1 MiB,
+  с общим raw budget 128 MiB и TTL 30 суток. Analysis хранит до 48 records по
+  4 MiB; localStorage manifest — до 24 records. Cache/quota failure не ломает
+  online preview, большие файлы не получают полную raw-копию.
+- Header показывает фактический Worker progress и отделяет 100% прочитанных
+  bytes от terminal completion состоянием «Финализация…». Незавершённый процент
+  из manifest не выдаётся после reload за текущий; готовый analysis exact
+  version возвращается только terminal Worker result.
+- Toolpath — пустой placeholder без parser/LinuxCNC interaction. Tool Table —
+  read-only bounded lexical summary статических `T`/`M6`, с первой строкой,
+  упоминаниями, сменами, truncated/error/empty/loading состояниями и переходом
+  обратно к строке программы.
+- Успешный logout сначала tombstone-ит principal/library scope во всех доступных
+  tabs, затем удаляет его Cache Storage и localStorage records. Password,
+  cookie, CSRF, absolute path и storage key в browser cache не сохраняются.
+- Explicit login до capabilities/cache allow получает digest-only durable
+  quarantine proof. Невозможность записать exact fingerprint fail-closed
+  отзывает session; finalize после успешного allow удаляет только snapshot/own
+  marker, не стирая более позднюю session. Не подтверждённый conditional revoke
+  восстанавливается при следующем session probe.
+- Sanitized HTML больше не наследует source head/title/style: Backend добавляет
+  собственный readable/print stylesheet с CSP hash и completion suffix. Active
+  subtrees остаются подавлены с depth bound 256; empty-sandbox iframe сохраняет
+  hash-only document CSP. `unsafe-inline` относится только к trusted React shell
+  с его динамическими layout styles и не переносится в Sheet document.
 
 ## Фактическая production generation
 
@@ -136,7 +170,8 @@ browser не может выбрать другой каталог хоста.
 | `catalog_files` | setup ID, unique role `program` или `setup_sheet`, relative basename/path, size/digest, inode/version identity; максимум один файл каждой роли |
 | `catalog_operations` | durable intent/storage/DB/terminal checkpoints для publish, move, delete и folder operations; recovery привязана к ожидаемым identity/digest/version |
 | `catalog_state`, `catalog_legacy_*` | общий migration state, source→target mapping и per-role manifest; completed mapping повторно сверяется с source provenance, catalog row и physical file |
-| auth/session/audit/idempotency | переиспользуются без хранения password/raw remembered token или абсолютного program root в public data |
+| auth/session/audit/idempotency | server session и conditional exact revoke; browser stale-login journal хранит только bounded SHA-256/`unknown` markers, без password/raw cookie/CSRF или абсолютного program root в public data |
+| browser G-code cache | scope + opaque artifact ID + exact version + byte size; Cache Storage raw chunks/analysis, localStorage progress/completion/line count/Tool Table manifest; не является Backend/API entity или backup source |
 | legacy tables/objects | read-only migration/rollback source до отдельного подтверждённого cleanup |
 
 `rootDisplay` — server-configured operator-facing строка
@@ -168,6 +203,17 @@ ETag; каждый Range viewer-запрос посылает `If-Match`.
 Ответы содержат `relativePath`/`rootDisplay`, но не canonical absolute root,
 storage key, inode/device или staging name.
 
+Browser cache не добавляет public endpoint. Trusted SPA явно сохраняет только
+уже version-bound content/analysis; server content response остаётся
+`private, no-store`, а synthetic cache keys не являются fetchable API paths.
+`POST /api/v1/auth/revoke-stale` не является общим logout: запрос связан exact
+session cookie + CSRF и удаляет только эту server session, не посылая
+`Set-Cookie`, чтобы поздний response не очистил более новую browser session.
+`POST /api/v1/auth/activate` аналогично связан exact cookie + CSRF, но только
+атомарно переводит provisional server session в activated state и также не
+посылает `Set-Cookie`. Remembered activation хранится migration 005; до неё
+session discovery остаётся guest.
+
 ## Актуальная storage strategy
 
 - `PROGRAM_ROOT` и `LINUXCNC_INI` canonicalize до listener; INI
@@ -192,6 +238,26 @@ storage key, inode/device или staging name.
   Неизвестные entries и legacy objects не удаляются.
 - Systemd сохраняет `ProtectHome=read-only`, добавляя только точный
   `ReadWritePaths=/home/user/linuxcnc/nc_files`.
+- Browser raw cache принимает только полный aligned 1 MiB chunk (последний
+  chunk короче ровно до `byteSize`) и только для файла ≤32 MiB. Совокупный
+  budget 128 MiB освобождается oldest whole-file groups; raw/analysis TTL —
+  30 суток, browser может evict раньше. Version mismatch, malformed/truncated
+  cache response и invalid analysis дают miss/eviction, а не доверенные bytes.
+- Сохранённый analysis ограничен 100 001 sparse entries, 1024 tools и 4 MiB
+  JSON; Cache Storage удерживает до 48 analysis records, localStorage — до 24
+  manifest records. Разные версии изолированы и удаляются bounded LRU/TTL, а не
+  mount-time purge; principal scope очищается после успешного logout с
+  cross-tab block/epoch/durable-marker защитой от late write и resume cleanup
+  перед повторным login.
+- Stale-login recovery использует отдельный bounded journal (до 32 markers) в
+  Cache Storage и per-fingerprint localStorage keys. Exact add/remove не требует
+  scalar read-modify-write; origin-wide Web Lock, если доступен, защищает
+  snapshot/finalize. Proof не выдаётся без durable exact fingerprint seal;
+  Cache Storage path дополнительно проверяет запись readback-ом.
+- Login response создаёт provisional server session. Только durable browser
+  proof разрешает exact CSRF-bound activation; Store state, а не изменяемая
+  companion cookie, является authority, поэтому concurrent/out-of-order tabs
+  не могут активировать либо стереть более новую session.
 
 ## Актуальная тестовая стратегия
 
@@ -201,11 +267,12 @@ storage key, inode/device или staging name.
 | Domain/API | incomplete/singular CRUD, exact preconditions/routes плюс production Firefox guest/login/catalog/UI/logout smoke | внешний LAN client |
 | Storage security | traversal, reserved tree, symlink/hardlink/special substitution, identity races, no-replace, rollback/recovery | target filesystem spot-check |
 | Upload/recovery | streaming unknown length, prepared publication, journal phases, actual subprocess SIGKILL and same-key retry | target disconnect/power-loss drill |
-| Viewer | single 64 KiB prefix-before-Worker test, sparse 10 GiB bounded Range/ETag/Worker suites, cancellable bounded PDF text и Firefox render G-code/inline HTML | controlled target-hardware performance и malicious-document observation |
-| Frontend | 15 files / 103 tests/build; left-tree parent/child, inline Sheet, direct dual/single upload, stable retry, later attach и сквозной keyboard-only flow; Firefox desktop/mobile smoke | дополнительный native-key walkthrough на отдельном managed client |
+| Viewer | single 64 KiB prefix-before-Worker test, sparse 10 GiB bounded Range/ETag/Worker suites, cancellable bounded PDF text; sanitizer tests для source-head/style stripping, app stylesheet/hash, completion suffix, bounded suppression и foreign/self-closing cases; новый local exact-binary Firefox readable inline HTML/CSP visual | controlled malicious-document network observation ещё не записано |
+| Frontend | ESLint/typecheck, 17 files / 197 tests/build; left-tree parent/child, inline Sheet, direct dual/single upload, stable retry, later attach и сквозной keyboard-only flow; local exact-binary desktop/mobile Firefox | дополнительный native-key walkthrough на отдельном managed client |
+| Browser cache / derived views | 42 cache tests и полный frontend gate покрывают aligned chunks, upload `File` source, online-first/offline fallback, version/principal separation, oversized no-raw-cache, poisoned analysis, bounded budgets, logout late-write/crash recovery, no-Cache/no-Web-Locks/read-only-LS, progress contract, Tool Table parser, Worker errors и keyboard tabs/line jump | production browser/deployment evidence ещё не записано |
 | No execution | catalog-only route gate, exact target publication/root binding и live LinuxCNC snapshot unchanged | дополнительный ручной visual confirmation в QtDragon |
 | Migration | automated 0/1/N/restart/collision suites плюс live manifest/hash/count/restart verification | legacy cleanup только отдельным будущим решением |
-| Authentication | PAM/session/CSRF/throttle suites плюс production Firefox PAM login/session/logout; Bearer unset | внешний managed-client login only if separately required |
+| Authentication | PAM/session/CSRF/throttle, conditional stale revoke и server-side provisional activation; tests покрывают durable-seal failure, reload recovery, late A vs B, out-of-order exact activation, remembered Store/server restart, proof snapshot/finalize и no-Web-Locks per-key journal; прежний production Firefox PAM login/session/logout, Bearer unset | полный новый gate и production stale-continuation/reload smoke ещё не записаны |
 | Production | full gates, backup/restore, release, integrity/hash/ready и desktop/mobile BiDi visual evidence | LAN client, DHCP reservation, target performance, manual QtDragon |
 
 ## Матрица CAT-P0
@@ -228,7 +295,7 @@ browser/live шаг, `D` — процедура документирована, 
 | `CAT-P0-009` | folder/setup create/rename/move/delete, revision and recovery suites | V |
 | `CAT-P0-010` | singular streaming add/replace/delete including unknown-length body tests | V |
 | `CAT-P0-011` | exactly one 64 KiB initial Range becomes visible before Worker; catalog Range/ETag, virtualization/index/search suites remain green | V |
-| `CAT-P0-012` | inline PDF canvas and sanitized HTML CSP/blob/empty-sandbox tests; no Sheet dialog in Workbench | V |
+| `CAT-P0-012` | inline PDF canvas and sanitized HTML CSP/blob/empty-sandbox tests; new sanitizer cases cover readable app stylesheet/hash, source style/title removal, completion suffix and bounded active-subtree suppression; no Sheet dialog in Workbench | V |
 | `CAT-P0-013` | catalog-only production gate, safe route and filename attack tests | V |
 | `CAT-P0-014` | catalog snapshot/API leak assertions cover relative path/root display only | V |
 | `CAT-P0-015` | root-FD traversal/reserved/symlink/hardlink/special/race suite | V |
@@ -237,10 +304,13 @@ browser/live шаг, `D` — процедура документирована, 
 | `CAT-P0-018` | active extensions, reserved tree and special-file rejection tests | V |
 | `CAT-P0-019` | catalog filter plus loading/empty/offline/error/conflict component states | V |
 | `CAT-P0-020` | end-to-end keyboard-only App flow through left tree/child Sheet/native picker/tabs/search/logout plus focused tree/viewer/modal tests | V |
-| `CAT-P0-021` | PAM/session/CSRF/throttle foundation plus production Firefox PAM login/session/logout | V |
+| `CAT-P0-021` | PAM/session/CSRF/throttle foundation plus production Firefox PAM login/session/logout; conditional stale-session revoke and digest-only browser quarantine add race hardening without changing login credential model | V |
 | `CAT-P0-022` | startup/readiness order, root replacement and INI mismatch tests | V |
 | `CAT-P0-023` | three-root cold generation; four archive hashes and full extract/diff `RESTORE_CHECK_OK` | V |
 | `CAT-P0-024` | 0/1/N no-delete migration, provenance, manifest/hash, restart and manual-review tests | V |
+| `CAT-P0-025` | Cache Storage/localStorage targeted tests cover exact chunks, identity/version isolation, upload source, complete online/offline copy, cache failure, oversized no-raw-cache, TTL/poison handling, bounded concurrent budget, logout late-write и interrupted-cleanup recovery | P — implementation/tests present; full gate and browser evidence pending |
+| `CAT-P0-026` | Workbench/App tests assert one header progress path, 100%/completion distinction and terminal Worker/error states | P — implementation/tests present; full gate and browser evidence pending |
+| `CAT-P0-027` | bounded parser/core tests plus App keyboard Toolpath/Tool Table/optional Sheet navigation and line return | P — implementation/tests present; full gate and browser evidence pending |
 
 ## Матрица CAT-AC
 
@@ -258,6 +328,9 @@ browser/live шаг, `D` — процедура документирована, 
 | `CAT-AC-10` | V — external same-content/substitution/version conflict suites passed |
 | `CAT-AC-11` | V — one integration scenario uses keyboard-only login→left tree/child Sheet→native picker trigger→preview search/line jump→logout; focused suites verify roving tree, editor tabs, modal trap/return and visible focus |
 | `CAT-AC-12` | V — production build, Go unit/integration/race/vet, frontend lint/typecheck/tests, path-security, local health/ready and real production PAM smoke all passed |
+| `CAT-AC-13` | P — targeted cache tests cover exact version/principal, online-first/offline fallback, upload source, poisoned entry and logout race; full gate/browser evidence pending |
+| `CAT-AC-14` | P — component/App coverage asserts the header progress contract and error/completion separation; visual browser evidence pending |
+| `CAT-AC-15` | P — parser limits and keyboard tab/first-line return are covered in targeted tests; full gate/browser evidence pending |
 
 ## Историческая implementation/evidence matrix (до 2026-08-21)
 
