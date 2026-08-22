@@ -288,8 +288,24 @@ evidence новой catalog-модели. Актуальные требован�
   `0126dd6208840d1ad1ef1ac83d722659391b66f0e962bc37d4fa4b61ef49712e`,
   `6c399ea749a0b2c50c3c399a0e3a18c24caf787d52bf2767b1a77f430b087433`,
   `2cf54a99ca2d8abf64429ad22efdd8f5d1cc0058dc309a6a3fc0a0fd922359df`.
-  Production deployment/PAM smoke нового binary на момент этой строки ещё не
-  заявлены.
+  Production deployment выполнен из source commit
+  `393ddb68a550eeb5e65cc607032d23d9ab8cc0a1`: release
+  `/opt/websetupmanager/releases/393ddb68a550`, binary SHA-256
+  `294549740ffc2255720403c474beae5be01c652a8fddad93d020d4ec7b37bd48`.
+- Перед switch создана cold generation
+  `/var/backups/websetupmanager/pre-workbench-393ddb68a550-20260822T125008Z`;
+  SHA-256 всех трёх archive прошли проверку. Migration 005 создала отдельный
+  `websetupmanager.pre-migration-v4-to-v5-*.sqlite3`. Atomic symlink switch
+  сохранил прежнюю release; unit active от `user`, `NRestarts=0`, health/ready
+  200, TCP/80 отсутствует, guest/capabilities contract — 200/401.
+- Production Firefox BiDi прошёл реальный PAM login и logout. Для G-code
+  1.7 MiB header дошёл до `Индекс 100%`; новый чистый profile подтвердил 2 raw
+  chunks, 1 analysis и 1 complete localStorage manifest. Toolpath показал
+  намеренно пустой placeholder, Tool Table построила T1/T8/T10, а HTML Sheet
+  загрузилась как readable sandboxed blob iframe `1028x623`. SHA-256
+  screenshots Tool Table / Sheet:
+  `9ba5d3a313a7fdf024881e375170687128b85f86828f30cff6c04b4181b62a08` /
+  `dda443d4edd71573740d70c2214cf9ce5d03ab2d2debc6f5d96aa5c0422a30fd`.
 
 ## Discovery и этап 1 — каркас приложения
 

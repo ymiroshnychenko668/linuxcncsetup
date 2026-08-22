@@ -72,10 +72,9 @@ snapshot/own markers: поздний результат A не стирает б
 password и cookie в journal не записываются. Backend conditional revoke не
 отправляет `Set-Cookie`, поэтому stale response не очищает свежую session.
 
-Изменения browser cache/derived tabs, HTML readability и stale-login recovery
-находятся в текущей development branch. Для них добавлены targeted tests, но
-они не входят в указанную ниже production generation 2026-08-21, пока не
-пройдут полный gate, browser smoke и отдельный deployment.
+Browser cache/derived tabs, HTML readability и stale-login recovery входят в
+production generation 2026-08-22. Помимо targeted automation пройдены полный
+gate, cold backup, versioned deployment и clean-profile Firefox PAM smoke.
 
 На целевом host root равен `/home/user/linuxcnc/nc_files`, а active INI —
 `/home/user/linuxcnc/configs/corvuscnc/g540.ini`. Сервис обязан проверить их
@@ -88,19 +87,21 @@ DHCP reservation, controlled target performance и ручной визуальн
 walkthrough остаются дополнительной qualification. Точный статус ведётся в
 [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md).
 
-Production generation от 2026-08-21:
+Production generation от 2026-08-22:
 
-- release `/opt/websetupmanager/releases/266917d3ed04`, source commit
-  `266917d3ed04b3245f7e0f3461128a6d0d0bea0d`, binary SHA-256
-  `5d50c3b708eff7ba2262d3958d7caa9c533745d351a76de99d24d4c120cfc202`;
-- cold backup `/var/backups/websetupmanager/pre-catalog-20260821T145214Z`;
-  четыре archive checksum прошли сверку, полный extract/diff —
-  `RESTORE_CHECK_OK`;
+- release `/opt/websetupmanager/releases/393ddb68a550`, source commit
+  `393ddb68a550eeb5e65cc607032d23d9ab8cc0a1`, binary SHA-256
+  `294549740ffc2255720403c474beae5be01c652a8fddad93d020d4ec7b37bd48`;
+- cold backup
+  `/var/backups/websetupmanager/pre-workbench-393ddb68a550-20260822T125008Z`;
+  state/library/program-root archive checksum прошли сверку; прежняя полностью
+  restore-проверенная generation сохранена;
 - active unit слушает только direct HTTPS `10.0.1.136:443`; TCP/80 отсутствует,
   `/healthz` и `/readyz` возвращают 200;
-- schema v4 и catalog migration completed: 2 folders, 2 setups, 4 files,
+- schema v5 и catalog migration completed: 2 folders, 2 setups, 4 files,
   2 completed mappings, 4 copied manifests; SQLite integrity/FK, exact
-  source↔target size/SHA и idempotent restart проверены;
+  source↔target size/SHA и idempotent restart проверены; migration 005 создала
+  отдельный automatic pre-v5 SQLite backup;
 - legacy rows/objects сохранены, temp remnants отсутствуют; LinuxCNC snapshot
   остался `file=""`, `state/mode/interp/exec=1/1/1/2`.
 - headless Firefox ESR/WebDriver BiDi прошёл guest, PAM login, ready/catalog/UI
@@ -116,6 +117,10 @@ Production generation от 2026-08-21:
   inline Sheet, direct picker и быстрый 64-КиБ prefix. Финальный production
   Firefox прошёл PAM login, 37 virtual rows, desktop/mobile render и logout;
   current release после restart имеет `NRestarts=0`, health/ready 200.
+- release `393ddb68a550` прошла production Firefox PAM login/logout: header
+  `Индекс 100%`, Cache Storage 2 chunks + 1 analysis, localStorage 1 complete
+  manifest, пустой Toolpath, Tool Table T1/T8/T10 и читаемый sandboxed HTML
+  Setup Sheet. После deployment `NRestarts=0`, health/ready 200, TCP/80 закрыт.
 - read-only QtDragon audit той же `QFileSystemModel` подтвердил доступную
   цепочку `linuxcnc/nc_files/Импортировано/adssad` и строки `1002.ngc`/
   `1003.ngc`; вкладка File и selection работающего LinuxCNC не изменялись.
@@ -226,7 +231,7 @@ CGO_ENABLED=1 go vet -tags pam ./...
 CGO_ENABLED=1 go build -tags "production pam" ./cmd/websetupmanager
 ```
 
-Frontend lint и typecheck прошли; Vitest — 15 files/103 tests; Vite production
+Frontend lint и typecheck прошли; Vitest — 17 files/197 tests; Vite production
 build прошёл и встроен в Go binary. Полный `scripts/build.sh` также прошёл.
 Для финального focus-only release его шаги повторены отдельно; clean detached
 worktree выполнил `npm ci`, Vite build и production PAM Go build.
@@ -234,9 +239,9 @@ worktree выполнил `npm ci`, Vite build и production PAM Go build.
 `AUTHENTICATION_UNAVAILABLE`. Текущий amd64 artifact собран Go 1.26.5 с
 `CGO_ENABLED=1`, tags `production,pam`, использует системный `libpam.so.0` и
 имеет SHA-256
-`5d50c3b708eff7ba2262d3958d7caa9c533745d351a76de99d24d4c120cfc202` и установлен
-как `/opt/websetupmanager/releases/266917d3ed04` из source commit
-`266917d3ed04b3245f7e0f3461128a6d0d0bea0d`.
+`294549740ffc2255720403c474beae5be01c652a8fddad93d020d4ec7b37bd48` и установлен
+как `/opt/websetupmanager/releases/393ddb68a550` из source commit
+`393ddb68a550eeb5e65cc607032d23d9ab8cc0a1`.
 
 Catalog `websetupmanager.service` enabled/active от пользователя `user`, слушает
 `https://microb.int:443`, а `/healthz` и `/readyz` возвращают 200. Listener или

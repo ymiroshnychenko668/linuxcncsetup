@@ -37,7 +37,7 @@ browser не может выбрать другой каталог хоста.
 
 ## Этапы текущей реализации
 
-| Этап | Результат | Статус на 2026-08-21 |
+| Этап | Результат | Статус на 2026-08-22 |
 |---|---|---|
 | 0. Direction reset | новый normative source, decisions, host discovery, migration boundary | выполнено в документации |
 | 1. Catalog backend | config/INI match, additive schema, folders/setups, singular files, scoped API | реализовано; catalog service/HTTP integration suites прошли |
@@ -46,7 +46,7 @@ browser не может выбрать другой каталог хоста.
 | 4. Legacy migration | 0/1/N split, sheet fan-out, provenance, manifest и no-replace publication | выполнено на host; schema v4, 2 completed mappings и 4 copied manifests, restart idempotent |
 | 5. Integrated verification | automated catalog regression и production wiring | full build/test gates и host integrity/hash/readiness/no-execution checks прошли |
 | 6. Deployment | cold backup, verified restore rehearsal, versioned release и direct HTTPS smoke | выполнено; внешний LAN client, DHCP reservation, target performance и ручной QtDragon отмечены отдельно |
-| 7. Browser persistence, derived tabs и viewer/auth hardening | version-bound cache, header index progress, File source, Toolpath/Tool Table, readable strict HTML и provisional-login journal/activation | полный Go/PAM/race/frontend/build gate и локальный exact-binary Firefox visual пройдены; production deployment/PAM smoke ещё не записаны |
+| 7. Browser persistence, derived tabs и viewer/auth hardening | version-bound cache, header index progress, File source, Toolpath/Tool Table, readable strict HTML и provisional-login journal/activation | полный Go/PAM/race/frontend/build gate, production deployment и Firefox PAM/cache/tabs/HTML smoke пройдены |
 
 Подробная безопасная последовательность преобразования данных находится в
 [MIGRATION_PLAN.md](MIGRATION_PLAN.md).
@@ -105,21 +105,23 @@ browser не может выбрать другой каталог хоста.
 
 ## Фактическая production generation
 
-- Release: `/opt/websetupmanager/releases/266917d3ed04`; source commit
-  `266917d3ed04b3245f7e0f3461128a6d0d0bea0d`; SHA-256 binary
-  `5d50c3b708eff7ba2262d3958d7caa9c533745d351a76de99d24d4c120cfc202`.
+- Release: `/opt/websetupmanager/releases/393ddb68a550`; source commit
+  `393ddb68a550eeb5e65cc607032d23d9ab8cc0a1`; SHA-256 binary
+  `294549740ffc2255720403c474beae5be01c652a8fddad93d020d4ec7b37bd48`.
 - Cold generation:
-  `/var/backups/websetupmanager/pre-catalog-20260821T145214Z`; все четыре archive
-  проверены по записанным SHA-256, полный extract/diff завершился marker
-  `RESTORE_CHECK_OK`.
+  `/var/backups/websetupmanager/pre-workbench-393ddb68a550-20260822T125008Z`;
+  state/library/program-root archive проверены по записанным SHA-256. Прежняя
+  restore-qualified generation `pre-catalog-20260821T145214Z` сохранена.
 - Unit enabled/active от `user`, direct HTTPS `10.0.1.136:443`; listener на
   TCP/80 отсутствует; `/healthz` и `/readyz` вернули 200. Optional Bearer не
   настроен. Интерактивный вход использует PAM account `user` и текущий системный
   Linux password; значение password нигде не записывается.
-- SQLite schema v4, `legacy_migration_state=completed`: 2 folders, 2 setups,
+- SQLite schema v5, `legacy_migration_state=completed`: 2 folders, 2 setups,
   4 files, 2 completed mappings и 4 copied manifest rows. `quick_check=ok`,
   foreign-key violations — 0; source/target size и SHA-256 совпали, legacy rows
-  и objects сохранены, journal/staging temp remnants отсутствуют.
+  и objects сохранены, journal/staging temp remnants отсутствуют. Migration 005
+  добавила durable remembered-session activation и создала автоматический
+  pre-v5 SQLite backup.
 - Повторный restart/migration не изменил counts. LinuxCNC snapshot до/после WSM:
   `file=""`, `state/mode/interp/exec=1/1/1/2`; приложение ничего не загрузило и
   не запустило.
@@ -140,6 +142,11 @@ browser не может выбрать другой каталог хоста.
   visual smoke. После atomic release switch production PAM login/catalog/logout
   снова прошли; 37 virtual rows, первая `%`, viewport `1030x625`, health/ready
   200, `NRestarts=0`, TCP/80 отсутствует.
+- Workbench release `393ddb68a550` прошла production PAM login/logout и новый
+  browser acceptance: header `Индекс 100%`, Cache Storage 2 chunks + 1
+  analysis, localStorage 1 complete manifest, empty Toolpath, Tool Table
+  T1/T8/T10 и readable sandboxed HTML iframe `1028x623`. Unit остался active с
+  `NRestarts=0`; live index byte-for-byte совпал с production bundle.
 - Read-only QtDragon audit подтвердил running `g540.ini`, local
   `_CORVUS_FILE_MANAGER`, тот же `PROGRAM_PREFIX` и точную видимую моделью
   цепочку `linuxcnc/nc_files/Импортировано/adssad` со строками `1002.ngc` и
@@ -269,11 +276,11 @@ session discovery остаётся guest.
 | Upload/recovery | streaming unknown length, prepared publication, journal phases, actual subprocess SIGKILL and same-key retry | target disconnect/power-loss drill |
 | Viewer | single 64 KiB prefix-before-Worker test, sparse 10 GiB bounded Range/ETag/Worker suites, cancellable bounded PDF text; sanitizer tests для source-head/style stripping, app stylesheet/hash, completion suffix, bounded suppression и foreign/self-closing cases; новый local exact-binary Firefox readable inline HTML/CSP visual | controlled malicious-document network observation ещё не записано |
 | Frontend | ESLint/typecheck, 17 files / 197 tests/build; left-tree parent/child, inline Sheet, direct dual/single upload, stable retry, later attach и сквозной keyboard-only flow; local exact-binary desktop/mobile Firefox | дополнительный native-key walkthrough на отдельном managed client |
-| Browser cache / derived views | 42 cache tests и полный frontend gate покрывают aligned chunks, upload `File` source, online-first/offline fallback, version/principal separation, oversized no-raw-cache, poisoned analysis, bounded budgets, logout late-write/crash recovery, no-Cache/no-Web-Locks/read-only-LS, progress contract, Tool Table parser, Worker errors и keyboard tabs/line jump | production browser/deployment evidence ещё не записано |
+| Browser cache / derived views | 42 cache tests и полный frontend gate покрывают aligned chunks, upload `File` source, online-first/offline fallback, version/principal separation, oversized no-raw-cache, poisoned analysis, bounded budgets, logout late-write/crash recovery, no-Cache/no-Web-Locks/read-only-LS, progress contract, Tool Table parser, Worker errors и keyboard tabs/line jump; production clean-profile smoke подтвердил exact cache/progress/Toolpath/Tool Table | дополнительный quota/offline drill на отдельном LAN client |
 | No execution | catalog-only route gate, exact target publication/root binding и live LinuxCNC snapshot unchanged | дополнительный ручной visual confirmation в QtDragon |
 | Migration | automated 0/1/N/restart/collision suites плюс live manifest/hash/count/restart verification | legacy cleanup только отдельным будущим решением |
-| Authentication | PAM/session/CSRF/throttle, conditional stale revoke и server-side provisional activation; tests покрывают durable-seal failure, reload recovery, late A vs B, out-of-order exact activation, remembered Store/server restart, proof snapshot/finalize и no-Web-Locks per-key journal; прежний production Firefox PAM login/session/logout, Bearer unset | полный новый gate и production stale-continuation/reload smoke ещё не записаны |
-| Production | full gates, backup/restore, release, integrity/hash/ready и desktop/mobile BiDi visual evidence | LAN client, DHCP reservation, target performance, manual QtDragon |
+| Authentication | PAM/session/CSRF/throttle, conditional stale revoke и server-side provisional activation; tests покрывают durable-seal failure, reload recovery, late A vs B, out-of-order exact activation, remembered Store/server restart, proof snapshot/finalize и no-Web-Locks per-key journal; новый production Firefox PAM login/session/logout прошёл, Bearer unset | отдельный forced crash в середине browser continuation |
+| Production | full gates, cold backup, versioned release, exact binary/index hash, migration backup, health/ready и desktop/mobile BiDi cache/tabs/HTML evidence | LAN client, DHCP reservation, target performance, manual QtDragon |
 
 ## Матрица CAT-P0
 
@@ -308,9 +315,9 @@ browser/live шаг, `D` — процедура документирована, 
 | `CAT-P0-022` | startup/readiness order, root replacement and INI mismatch tests | V |
 | `CAT-P0-023` | three-root cold generation; four archive hashes and full extract/diff `RESTORE_CHECK_OK` | V |
 | `CAT-P0-024` | 0/1/N no-delete migration, provenance, manifest/hash, restart and manual-review tests | V |
-| `CAT-P0-025` | Cache Storage/localStorage targeted tests cover exact chunks, identity/version isolation, upload source, complete online/offline copy, cache failure, oversized no-raw-cache, TTL/poison handling, bounded concurrent budget, logout late-write и interrupted-cleanup recovery | P — implementation/tests present; full gate and browser evidence pending |
-| `CAT-P0-026` | Workbench/App tests assert one header progress path, 100%/completion distinction and terminal Worker/error states | P — implementation/tests present; full gate and browser evidence pending |
-| `CAT-P0-027` | bounded parser/core tests plus App keyboard Toolpath/Tool Table/optional Sheet navigation and line return | P — implementation/tests present; full gate and browser evidence pending |
+| `CAT-P0-025` | Cache Storage/localStorage targeted tests cover exact chunks, identity/version isolation, upload source, complete online/offline copy, cache failure, oversized no-raw-cache, TTL/poison handling, bounded concurrent budget, logout late-write и interrupted-cleanup recovery; production clean-profile PAM smoke observed 2 chunks, 1 analysis and 1 complete manifest | V |
+| `CAT-P0-026` | Workbench/App tests assert one header progress path, 100%/completion distinction and terminal Worker/error states; production visual observed `Индекс 100%` in the editor header | V |
+| `CAT-P0-027` | bounded parser/core tests plus App keyboard Toolpath/Tool Table/optional Sheet navigation and line return; production smoke observed empty Toolpath and T1/T8/T10 Tool Table | V |
 
 ## Матрица CAT-AC
 
@@ -328,9 +335,9 @@ browser/live шаг, `D` — процедура документирована, 
 | `CAT-AC-10` | V — external same-content/substitution/version conflict suites passed |
 | `CAT-AC-11` | V — one integration scenario uses keyboard-only login→left tree/child Sheet→native picker trigger→preview search/line jump→logout; focused suites verify roving tree, editor tabs, modal trap/return and visible focus |
 | `CAT-AC-12` | V — production build, Go unit/integration/race/vet, frontend lint/typecheck/tests, path-security, local health/ready and real production PAM smoke all passed |
-| `CAT-AC-13` | P — targeted cache tests cover exact version/principal, online-first/offline fallback, upload source, poisoned entry and logout race; full gate/browser evidence pending |
-| `CAT-AC-14` | P — component/App coverage asserts the header progress contract and error/completion separation; visual browser evidence pending |
-| `CAT-AC-15` | P — parser limits and keyboard tab/first-line return are covered in targeted tests; full gate/browser evidence pending |
+| `CAT-AC-13` | V — targeted cache tests cover exact version/principal, online-first/offline fallback, upload source, poisoned entry/logout race; clean-profile production browser confirmed complete exact raw/analysis/manifest persistence and logout |
+| `CAT-AC-14` | V — component/App coverage plus production visual assert one header progress path, `Индекс 100%` and terminal completion |
+| `CAT-AC-15` | V — parser/keyboard coverage plus production browser confirmed empty Toolpath, generated T1/T8/T10 Tool Table and isolated inline Sheet |
 
 ## Историческая implementation/evidence matrix (до 2026-08-21)
 
