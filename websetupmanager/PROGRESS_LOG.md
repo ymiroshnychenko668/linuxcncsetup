@@ -339,7 +339,21 @@ evidence новой catalog-модели. Актуальные требован�
   `4ee4e5ff0181ab93aacf66a7275566efad6daac0c8c6e732b1aacdeb986f405a` /
   `d96dd3bab04d32da70859a66cfa293c6ab9469d01d822b64cea3d338b8c1aba1` /
   `f12169f4c2fc133290cb827a7b0fafb01b37e19142ba7e2d34bd85d73cac2a20`.
-- Production host и работающий LinuxCNC этой feature branch не изменялись.
+- Exact release `/opt/websetupmanager/releases/adb6c8fff012` развёрнута из
+  commit `adb6c8fff01210a37e005ddf8493453110e7e9b6`; binary SHA-256
+  `54c68a994a49b5d88e20dc9ed0d3bef59aa3ac0f4de1950c3a64f6af70ffafa6`.
+  Перед atomic switch создана и checksum-проверена cold generation
+  `/var/backups/websetupmanager/pre-mui-adb6c8fff012-20260822T154615Z` со
+  state/library/program-root/config; SQLite quick/FK и live count comparison
+  прошли. Предыдущий release сохранён для быстрого rollback.
+- После switch unit active с `NRestarts=0`, exact MUI index отдан по direct
+  HTTPS, `/healthz=200`, `/readyz=200`, guest/auth boundary — 200/401, TCP/80
+  отсутствует. LinuxCNC остался в E-stop/manual/idle, без загруженного файла.
+- Fresh-profile production Firefox прошёл guest-only smoke без writes, затем
+  реальный PAM login/activation, MUI Workbench, существующие G-code и HTML
+  Setup Sheet, dialog focus trap/Tab/Escape/focus return и logout. Network
+  audit разрешал только auth operations и подтвердил отсутствие catalog
+  mutations; временный browser profile удалён.
 - `npm audit` до и после MUI идентичен (8 старых advisories); MUI/Emotion в них
   отсутствуют. Отдельный major PDF.js/Node и Vite/Vitest security upgrade
   описан в `D-037`, текущая миграция не выдаёт audit за зелёный.

@@ -6,11 +6,11 @@
 произвольный доступ к остальной filesystem. Исторические managed `objects` и
 SQLite нельзя изменять вручную во время migration/rollback window.
 
-Статус на 2026-08-22: catalog release
-`/opt/websetupmanager/releases/393ddb68a550` развёрнут из source commit
-`393ddb68a550eeb5e65cc607032d23d9ab8cc0a1`; binary SHA-256 —
-`294549740ffc2255720403c474beae5be01c652a8fddad93d020d4ec7b37bd48`.
-Automated suites, frontend 17 files / 197 tests/build, cold backup/restore check,
+Статус на 2026-08-22: MUI catalog release
+`/opt/websetupmanager/releases/adb6c8fff012` развёрнут из source commit
+`adb6c8fff01210a37e005ddf8493453110e7e9b6`; binary SHA-256 —
+`54c68a994a49b5d88e20dc9ed0d3bef59aa3ac0f4de1950c3a64f6af70ffafa6`.
+Automated suites, frontend 17 files / 198 tests/build, cold backup/restore check,
 live migration, integrity/hash, restart и HTTPS health/readiness прошли.
 Production headless Firefox desktop/mobile visual и PAM login/logout smoke также
 прошли. Сквозной keyboard-only integration flow закрывает login/tree/upload/
@@ -618,14 +618,14 @@ QtDragon lookup. Readiness не заменяет просмотр програм
 singular components, exact HTTP preconditions, path/race substitution, durable
 catalog journal, настоящий subprocess SIGKILL, sparse 10 GiB metadata/tail Range,
 0/1/N migration, sheet fan-out, completed provenance и collision/manual-review.
-Frontend lint/typecheck, 17 files / 197 tests и Vite production build прошли;
+Frontend lint/typecheck, 17 files / 198 tests и Vite production build прошли;
 полный keyboard-only integration flow и component focus regressions включены.
 Production visual smoke отдельно подтверждает реальный layout.
 
 До смены product direction PAM integration, обычные/PAM-tagged Go suites,
 race/vet прошли; отдельный
 non-PAM remote binary подтвердил fail-closed
-`AUTHENTICATION_UNAVAILABLE`. Frontend lint/typecheck, 17 files/197 tests и Vite
+`AUTHENTICATION_UNAVAILABLE`. Frontend lint/typecheck, 17 files/198 tests и Vite
 production build прошли; baseline `scripts/build.sh` прошёл целиком, а для
 финального focus-only release все gates повторены отдельно и clean detached
 worktree выполнил `npm ci`/Vite/PAM Go build. Production binary
@@ -633,9 +633,9 @@ worktree выполнил `npm ci`/Vite/PAM Go build. Production binary
 catalog `websetupmanager.service` enabled/active от Linux-пользователя `user` и
 слушает `https://microb.int:443`. Live direct-TLS проверка зафиксировала
 health/ready 200 и отсутствие listener на port 80. Установлена release
-`/opt/websetupmanager/releases/393ddb68a550` из commit
-`393ddb68a550eeb5e65cc607032d23d9ab8cc0a1`; SHA-256 binary:
-`294549740ffc2255720403c474beae5be01c652a8fddad93d020d4ec7b37bd48`.
+`/opt/websetupmanager/releases/adb6c8fff012` из commit
+`adb6c8fff01210a37e005ddf8493453110e7e9b6`; SHA-256 binary:
+`54c68a994a49b5d88e20dc9ed0d3bef59aa3ac0f4de1950c3a64f6af70ffafa6`.
 Remote login использует PAM account `user` и текущий системный Linux password;
 его значение нельзя записывать в этот документ, env или командную строку.
 Optional Bearer в production env не задан.
@@ -665,6 +665,14 @@ Workbench release `393ddb68a550` прошла повторный production PAM 
 clean profile сохранил 2 raw chunks, 1 analysis и 1 complete manifest, header
 показал `Индекс 100%`, Toolpath остался пустым, Tool Table построила T1/T8/T10,
 а readable HTML Sheet отрисовалась в sandboxed blob iframe `1028x623`.
+
+MUI release `adb6c8fff012` установлена после official full build и cold backup
+`/var/backups/websetupmanager/pre-mui-adb6c8fff012-20260822T154615Z` с
+проверенными state/library/program-root/config hashes и SQLite integrity/FK.
+Fresh-profile Firefox прошёл guest shell, реальный PAM login/activation,
+существующие G-code и sanitized HTML Sheet, MUI dialog focus trap,
+Escape/focus return и logout; сетевой audit подтвердил отсутствие catalog
+mutations. После switch unit active с `NRestarts=0`, health/ready 200.
 
 Read-only QtDragon audit подтвердил running `g540.ini`, local
 `_CORVUS_FILE_MANAGER`, совпадающий `PROGRAM_PREFIX` и доступную его
@@ -700,13 +708,13 @@ SQLite integrity/FK, exact source/target hashes/sizes, отсутствие temp
 
 | Evidence | Результат 2026-08-22 |
 |---|---|
-| Release | `/opt/websetupmanager/releases/393ddb68a550`; source `393ddb68a550eeb5e65cc607032d23d9ab8cc0a1`; SHA-256 `294549740ffc2255720403c474beae5be01c652a8fddad93d020d4ec7b37bd48` |
-| Cold generation | `/var/backups/websetupmanager/pre-workbench-393ddb68a550-20260822T125008Z`; state/library/program-root archive hashes matched; prior restore-qualified generation retained |
+| Release | `/opt/websetupmanager/releases/adb6c8fff012`; source `adb6c8fff01210a37e005ddf8493453110e7e9b6`; SHA-256 `54c68a994a49b5d88e20dc9ed0d3bef59aa3ac0f4de1950c3a64f6af70ffafa6` |
+| Cold generation | `/var/backups/websetupmanager/pre-mui-adb6c8fff012-20260822T154615Z`; state/library/program-root/config archive hashes matched, SQLite quick/FK passed; prior generations retained |
 | Deployment | enabled/active unit, `User=user`, direct HTTPS `10.0.1.136:443`; TCP/80 absent |
 | Migration | schema v5/completed; migration 005 automatic pre-v5 SQLite backup present; catalog/legacy content retained |
 | Runtime | `/healthz=200`, `/readyz=200`; SQLite `quick_check=ok`, FK violations 0; temp remnants absent |
 | Authentication | Linux/PAM account `user`, current system password (value never recorded); optional Bearer unset |
-| Browser | production Firefox BiDi guest/PAM login/logout; 37 G-code rows; header `Индекс 100%`; Cache Storage 2 chunks + 1 analysis; localStorage 1 complete manifest; empty Toolpath; Tool Table T1/T8/T10; HTML sandboxed blob iframe `1028x623` |
+| Browser | production Firefox BiDi guest/PAM login/activation/logout; MUI Workbench, existing G-code and sanitized HTML Sheet, dialog Tab trap/Escape/focus return; no catalog mutations; earlier cache/Tool Table evidence retained |
 | Screenshot SHA-256 | login desktop/mobile `fbf1e313ec372d6f87473860a8e87263c4682868e0357a4903426088d2087773` / `cdb6610b62b4c4bcd4812efa50d6ebf13e81a278cb8616ecc1cb259db368f0ae`; Tool Table / readable HTML Sheet `9ba5d3a313a7fdf024881e375170687128b85f86828f30cff6c04b4181b62a08` / `dda443d4edd71573740d70c2214cf9ce5d03ab2d2debc6f5d96aa5c0422a30fd` |
 | LinuxCNC | stat unchanged: `file=""`, `state/mode/interp/exec=1/1/1/2`; read-only Qt model shows `1002.ngc`/`1003.ngc` under the configured root; hidden-tab screenshot remains optional |
 | Remaining qualification | LAN client, DHCP reservation, controlled target/browser performance and manual visual QtDragon walkthrough; not part of current `CAT-AC-12` |

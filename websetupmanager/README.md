@@ -92,13 +92,13 @@ walkthrough остаются дополнительной qualification. Точ�
 
 Production generation от 2026-08-22:
 
-- release `/opt/websetupmanager/releases/393ddb68a550`, source commit
-  `393ddb68a550eeb5e65cc607032d23d9ab8cc0a1`, binary SHA-256
-  `294549740ffc2255720403c474beae5be01c652a8fddad93d020d4ec7b37bd48`;
+- release `/opt/websetupmanager/releases/adb6c8fff012`, source commit
+  `adb6c8fff01210a37e005ddf8493453110e7e9b6`, binary SHA-256
+  `54c68a994a49b5d88e20dc9ed0d3bef59aa3ac0f4de1950c3a64f6af70ffafa6`;
 - cold backup
-  `/var/backups/websetupmanager/pre-workbench-393ddb68a550-20260822T125008Z`;
-  state/library/program-root archive checksum прошли сверку; прежняя полностью
-  restore-проверенная generation сохранена;
+  `/var/backups/websetupmanager/pre-mui-adb6c8fff012-20260822T154615Z`;
+  state/library/program-root/config archive checksum прошли сверку, SQLite
+  `quick_check=ok` и FK violations отсутствуют; прежние generations сохранены;
 - active unit слушает только direct HTTPS `10.0.1.136:443`; TCP/80 отсутствует,
   `/healthz` и `/readyz` возвращают 200;
 - schema v5 и catalog migration completed: 2 folders, 2 setups, 4 files,
@@ -124,6 +124,13 @@ Production generation от 2026-08-22:
   `Индекс 100%`, Cache Storage 2 chunks + 1 analysis, localStorage 1 complete
   manifest, пустой Toolpath, Tool Table T1/T8/T10 и читаемый sandboxed HTML
   Setup Sheet. После deployment `NRestarts=0`, health/ready 200, TCP/80 закрыт.
+- MUI release `adb6c8fff012` собрана официальным `scripts/build.sh` из clean
+  source: frontend lint/typecheck, 17 files / 198 tests, Vite build, обычные и
+  PAM Go tests, PAM vet и embedded production binary прошли. После атомарного
+  switch `/healthz`/`/readyz` вернули 200, `NRestarts=0`, новый index bundle
+  совпал с build. Fresh-profile Firefox подтвердил guest shell, PAM
+  login/activation, существующие G-code/HTML Sheet, MUI dialog focus
+  trap/Escape/return и logout без catalog mutations.
 - read-only QtDragon audit той же `QFileSystemModel` подтвердил доступную
   цепочку `linuxcnc/nc_files/Импортировано/adssad` и строки `1002.ngc`/
   `1003.ngc`; вкладка File и selection работающего LinuxCNC не изменялись.
@@ -239,7 +246,7 @@ CGO_ENABLED=1 go vet -tags pam ./...
 CGO_ENABLED=1 go build -tags "production pam" ./cmd/websetupmanager
 ```
 
-Frontend lint и typecheck прошли; Vitest — 17 files/197 tests; Vite production
+Frontend lint и typecheck прошли; Vitest — 17 files/198 tests; Vite production
 build прошёл и встроен в Go binary. Полный `scripts/build.sh` также прошёл.
 Для финального focus-only release его шаги повторены отдельно; clean detached
 worktree выполнил `npm ci`, Vite build и production PAM Go build.
@@ -247,9 +254,9 @@ worktree выполнил `npm ci`, Vite build и production PAM Go build.
 `AUTHENTICATION_UNAVAILABLE`. Текущий amd64 artifact собран Go 1.26.5 с
 `CGO_ENABLED=1`, tags `production,pam`, использует системный `libpam.so.0` и
 имеет SHA-256
-`294549740ffc2255720403c474beae5be01c652a8fddad93d020d4ec7b37bd48` и установлен
-как `/opt/websetupmanager/releases/393ddb68a550` из source commit
-`393ddb68a550eeb5e65cc607032d23d9ab8cc0a1`.
+`54c68a994a49b5d88e20dc9ed0d3bef59aa3ac0f4de1950c3a64f6af70ffafa6` и установлен
+как `/opt/websetupmanager/releases/adb6c8fff012` из source commit
+`adb6c8fff01210a37e005ddf8493453110e7e9b6`.
 
 Catalog `websetupmanager.service` enabled/active от пользователя `user`, слушает
 `https://microb.int:443`, а `/healthz` и `/readyz` возвращают 200. Listener или
